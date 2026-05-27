@@ -1,0 +1,11 @@
+boss_id,skill_id,skill_name,description,trigger_hp_percent,effect_type,target_type,damage,duration,value,used_flag,embed_message
+final_boss_berserk_rachel,rachel_sk_1,광폭화,광폭화의 영향으로 라켈의 민첩이 상승합니다!,95,buff_self,self,0,999,"{""stat"": ""agility"", ""increase"": 30}",0,
+final_boss_berserk_rachel,rachel_sk_2,광역 할퀴기,라켈의 발톱이 사납게 움직이며 공기를 가릅니다.,70,damage_all,all_players,90,1,{},0,
+final_boss_berserk_rachel,rachel_sk_3,석화의 눈빛,라켈의 눈이 서슬퍼런 초록색으로 빛납니다.... hp가 가장 높은 캐릭터가 석화 상태에 걸립니다! 이번 턴과 다음 턴까지 행동하지 못합니다.,50,stat_debuff,highest_hp_player,0,2,{},0,
+final_boss_berserk_rachel,rachel_sk_4,포식 본능,라켈이 본능에 따라 가장 약한 먹이를 물어뜯습니다!,20,lifesteal,lowest_hp_player,120,1,"{""heal_percent"": 60}",0,
+mid_boss_prototype,prototype_sk_1,실패작 소환,실험체가 알 수 없는 울음소리를 냅니다! 배양 포드에서 2개의 그림자가 움직이기 시작합니다....,80,summon,all_enemies,0,1,"{""monster_ids"": [""failed_clone_one"", ""failed_clone_two""]}",0,
+mid_boss_prototype,prototype_sk_2,마황 흡수,실험체가 허기진 눈으로 일행을 바라봅니다. 랜덤한 대상의 mp가 흡수됩니다!,50,damage_mp_drain,single_player,70,1,"{""mp_drain_percent"": 50}",0,
+mid_boss_mother_flora,mother_sk_1,뿌리 채찍,거대한 뿌리가 지면을 뚫고 나와 모두를 공격한다!,70,damage_all,all_players,60,1,{},0,
+mid_boss_mother_flora,mother_sk_2,광합성,모체가 연구소의 빛을 양분으로 바꾸기 시작했다! 모체의 hp와 마법이 상승했다.,40,buff_self,self,0,6,"{""stat"": ""magic"", ""increase"": 25}",0,
+mid_boss_mother_flora,mother_sk_3,마비 포자,포자가 터지며 근육을 마비시키기 시작했다! 3턴간 근력이 감소한다.,20,stat_debuff,all_players,0,4,"{""stat"": ""physics"", ""decrease"": 2}",0,
+mid_boss_mother_flora,mother_sk_4,공생 식물,테스트,90,summon,self,0,1,"{""monster_ids"": [""spore_spreader_one"", ""spore_spreader_two""]}",0,
