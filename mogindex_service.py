@@ -539,7 +539,18 @@ class MogIndexService:
 
         state.last_result_kind = "recap"
         state.last_result_ids = []
-        return self._slice_lines("날짜 요약", lines, state, "이 기간에 요약할 색인 활동이 없습니다.")
+        page = self._slice_lines("날짜 요약", lines, state, "이 기간에 요약할 색인 활동이 없습니다.")
+        logger.info(
+            "mogindex recap session=%s scope=%s sources=%s date=%s..%s total=%s page=%s",
+            state.session_id,
+            state.source_scope,
+            state.source_ids,
+            date_bounds(state)[0],
+            date_bounds(state)[1],
+            page.total,
+            page.page,
+        )
+        return page
 
     def run_topic_search(self, state: SearchPanelState) -> TextPage:
         query = normalize_text(state.query or "")
@@ -589,7 +600,19 @@ class MogIndexService:
         ]
         state.last_result_kind = "topic"
         state.last_result_ids = [topic.topic_id for topic in topics]
-        return self._slice_lines("토픽 검색", lines, state, "조건에 맞는 수동 토픽이 없습니다.")
+        page = self._slice_lines("토픽 검색", lines, state, "조건에 맞는 수동 토픽이 없습니다.")
+        logger.info(
+            "mogindex topic session=%s query=%r scope=%s sources=%s date=%s..%s total=%s page=%s",
+            state.session_id,
+            state.query,
+            state.source_scope,
+            state.source_ids,
+            date_bounds(state)[0],
+            date_bounds(state)[1],
+            page.total,
+            page.page,
+        )
+        return page
 
     def run_recent(self, state: SearchPanelState) -> ResultPage:
         with self.open() as conn:

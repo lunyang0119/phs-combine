@@ -402,12 +402,6 @@ class MogIndexCommandsCog(commands.Cog):
                     self.service.set_date_preset(state, "all")
             state.page = 0
             embed, view, _page = self.render_panel(state)
-            if matching_sources == 0:
-                embed.add_field(
-                    name="범위 확인",
-                    value="이 ID와 일치하는 색인 source가 아직 없습니다. 먼저 해당 채널/스레드를 backfill했는지 확인해주세요.",
-                    inline=False,
-                )
             self.service.save_session(state)
             await interaction.response.edit_message(embed=embed, view=view)
         except (SearchSessionError, ValueError) as exc:
@@ -486,6 +480,31 @@ class MogIndexCommandsCog(commands.Cog):
             title = f"{title} - {page.title}"
         embed = discord.Embed(title=title, color=discord.Color.dark_teal())
         embed.description = self.make_description(state, page)
+        matching_sources = None
+        if state.source_scope != "all_indexed":
+            try:
+                matching_sources = self.service.count_matching_sources(state)
+                if matching_sources == 0:
+                    embed.add_field(
+                        name="범위 확인",
+                        value="현재 범위와 일치하는 색인 source가 없습니다. 채널/스레드 ID가 맞는지, 해당 범위가 backfill되었는지 확인해주세요.",
+                        inline=False,
+                    )
+            except Exception as exc:
+                logger.warning("mogindex source count failed session=%s error=%s", state.session_id, exc)
+        logger.info(
+            "mogindex render session=%s public=%s mode=%s scope=%s sources=%s preset=%s page_title=%s total=%s page=%s matching_sources=%s",
+            state.session_id,
+            public,
+            state.mode,
+            state.source_scope,
+            state.source_ids,
+            state.date_preset,
+            getattr(page, "title", None),
+            getattr(page, "total", None),
+            getattr(page, "page", None),
+            matching_sources,
+        )
         embed.set_footer(text=self.make_footer(state, page))
         view = None if public else SearchPanelView(self, state, page)
         return embed, view, page
