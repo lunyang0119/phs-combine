@@ -534,10 +534,13 @@ class MogIndexCommandsCog(commands.Cog):
             lines = self.format_search_results(page)
         else:
             lines = page.lines
+        note = ""
+        if state.mode == "recent":
+            note = "\n이 모드는 검색어를 사용하지 않고 현재 기간/범위의 색인 메시지를 보여줍니다."
         if not lines:
-            return f"{header}\n\n{page.empty_message}"
+            return f"{header}{note}\n\n{page.empty_message}"
         body = "\n".join(lines)
-        return clip(f"{header}\n\n{body}", 3900)
+        return clip(f"{header}{note}\n\n{body}", 3900)
 
     def format_search_results(self, page: ResultPage) -> list[str]:
         start = page.page * page.page_size
@@ -565,10 +568,21 @@ class MogIndexCommandsCog(commands.Cog):
         scope_text = {
             "all_indexed": "전체 색인",
             "current_channel": "현재 채널",
-            "selected_sources": "선택한 스레드",
+            "selected_sources": "선택한 채널/스레드",
         }.get(state.source_scope, state.source_scope)
-        query_text = f"`{state.query}`" if state.query else "없음"
-        return f"조건: 기간 {date_text} / 범위 {scope_text} / 검색어 {query_text}"
+        mode_text = {
+            "hub": "기능 선택",
+            "keyword": "단어 검색",
+            "topic": "토픽 검색",
+            "recap": "날짜 요약",
+            "participants": "참여자 보기",
+            "recent": "채널 보기",
+        }.get(state.mode, state.mode)
+        if state.mode in ("keyword", "topic"):
+            query_text = f"`{state.query}`" if state.query else "없음"
+        else:
+            query_text = "사용 안 함"
+        return f"조건: 모드 {mode_text} / 기간 {date_text} / 범위 {scope_text} / 검색어 {query_text}"
 
     def service_date_bounds(self, state: SearchPanelState) -> tuple[str | None, str | None]:
         from mogindex_service import date_bounds

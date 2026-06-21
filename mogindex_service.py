@@ -408,6 +408,15 @@ class MogIndexService:
         if not query:
             state.last_result_kind = "keyword"
             state.last_result_ids = []
+            logger.info(
+                "mogindex keyword session=%s query=%r scope=%s sources=%s date=%s..%s total=0 reason=empty_query",
+                state.session_id,
+                query,
+                state.source_scope,
+                state.source_ids,
+                date_bounds(state)[0],
+                date_bounds(state)[1],
+            )
             return ResultPage("단어 검색", [], state.page, state.page_size, 0, "검색어를 입력해주세요.")
 
         with self.open() as conn:
@@ -415,6 +424,15 @@ class MogIndexService:
             if not ranked:
                 state.last_result_kind = "keyword"
                 state.last_result_ids = []
+                logger.info(
+                    "mogindex keyword session=%s query=%r scope=%s sources=%s date=%s..%s total=0 reason=no_ranked_terms",
+                    state.session_id,
+                    query,
+                    state.source_scope,
+                    state.source_ids,
+                    date_bounds(state)[0],
+                    date_bounds(state)[1],
+                )
                 return ResultPage("단어 검색", [], state.page, state.page_size, 0, "현재 기간/범위에서 색인된 결과가 없습니다. 기간을 전체로 넓히거나 직접 기간을 지정해보세요.")
 
             filters, params = make_filter_sql(
