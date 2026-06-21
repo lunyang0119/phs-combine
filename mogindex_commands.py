@@ -104,6 +104,27 @@ class DateRangeModal(discord.ui.Modal):
         )
 
 
+
+class SourceIdModal(discord.ui.Modal):
+    def __init__(self, cog: "MogIndexCommandsCog", state: SearchPanelState):
+        super().__init__(
+            title="채널/스레드 ID 지정",
+            custom_id=f"mogsearch:{state.session_id}:source_modal",
+        )
+        self.cog = cog
+        self.session_id = state.session_id
+        self.source_id = discord.ui.TextInput(
+            label="채널 또는 스레드 ID",
+            placeholder="예: 1485663318000799744",
+            required=True,
+            max_length=32,
+        )
+        self.add_item(self.source_id)
+
+    async def on_submit(self, interaction: discord.Interaction) -> None:
+        await self.cog.handle_source_modal(interaction, self.session_id, self.source_id.value)
+
+
 class SearchPanelView(discord.ui.View):
     def __init__(
         self,
@@ -115,6 +136,7 @@ class SearchPanelView(discord.ui.View):
         self.cog = cog
         self.session_id = state.session_id
         self._add_button("단어 검색", "keyword", discord.ButtonStyle.primary, row=0)
+        self._add_button("채널 보기", "recent", discord.ButtonStyle.primary, row=0)
         self._add_button("날짜 요약", "recap", discord.ButtonStyle.secondary, row=0)
         self._add_button("토픽 검색", "topic", discord.ButtonStyle.secondary, row=0)
         self._add_button("참여자 보기", "participants", discord.ButtonStyle.secondary, row=0)
@@ -127,6 +149,7 @@ class SearchPanelView(discord.ui.View):
 
         self._add_button("전체 범위", "scope_all", discord.ButtonStyle.secondary, row=2)
         self._add_button("현재 채널", "scope_current", discord.ButtonStyle.secondary, row=2)
+        self._add_button("채널 ID", "scope_source_id", discord.ButtonStyle.secondary, row=2)
         if isinstance(page, ResultPage) and page.results:
             self._add_button(
                 "이 스레드로 좁히기",
@@ -219,6 +242,9 @@ class MogIndexCommandsCog(commands.Cog):
         if action == "date_custom":
             await interaction.response.send_modal(DateRangeModal(self, state))
             return
+        if action == "scope_source_id":
+            await interaction.response.send_modal(SourceIdModal(self, state))
+            return
         if action == "share":
             await self.share_current_page(interaction, state)
             return
@@ -245,6 +271,9 @@ class MogIndexCommandsCog(commands.Cog):
         elif action == "participants":
             state.mode = "participants"
             state.page = 0
+        elif action == "recent":
+            state.mode = "recent"
+            state.page = 0
         elif action.startswith("date_"):
             preset = {
                 "date_today": "today",
@@ -257,8 +286,12 @@ class MogIndexCommandsCog(commands.Cog):
             self.service.set_date_preset(state, preset)  # type: ignore[arg-type]
         elif action == "scope_all":
             self.service.set_scope(state, "all_indexed")
+            if state.mode == "hub":
+                state.mode = "recent"
         elif action == "scope_current":
             self.service.set_scope(state, "current_channel")
+            if state.mode == "hub":
+                state.mode = "recent"
         elif action == "scope_first_result":
             source_id = str(extra.get("source_id") or "")
             if not source_id:
@@ -291,6 +324,30 @@ class MogIndexCommandsCog(commands.Cog):
         except Exception as exc:
             logger.error("검색 modal 처리 실패: %s", exc, exc_info=True)
             await interaction.response.send_message("검색어를 처리하는 중 오류가 발생했습니다.", ephemeral=True)
+
+
+    async def handle_source_modal(
+        self,
+        interaction: discord.Interaction,
+        session_id: str,
+        source_id: str,
+    ) -> None:
+        try:
+            clean_source_id = source_id.strip()
+            if not clean_source_id.isdigit():
+                raise ValueError("채널/스레드 ID는 숫자로 입력해주세요.")
+            state = self.service.load_session(session_id, str(interaction.user.id))
+            self.service.set_scope(state, "selected_sources", [clean_source_id])
+            state.mode = "recent"
+            state.page = 0
+            embed, view, _page = self.render_panel(state)
+            self.service.save_session(state)
+            await interaction.response.edit_message(embed=embed, view=view)
+        except (SearchSessionError, ValueError) as exc:
+            await self.send_session_error(interaction, exc)
+        except Exception as exc:
+            logger.error("검색 채널 ID modal 처리 실패: %s", exc, exc_info=True)
+            await interaction.response.send_message("채널 ID를 처리하는 중 오류가 발생했습니다.", ephemeral=True)
 
     async def handle_date_modal(
         self,
@@ -361,6 +418,8 @@ class MogIndexCommandsCog(commands.Cog):
             return self.service.run_topic_search(state)
         if state.mode == "participants":
             return self.service.run_participants(state)
+        if state.mode == "recent":
+            return self.service.run_recent(state)
         return None
 
     def make_description(self, state: SearchPanelState, page: ResultPage | TextPage | None) -> str:

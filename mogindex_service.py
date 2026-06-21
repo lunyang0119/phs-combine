@@ -214,6 +214,7 @@ def make_filter_sql(
     *,
     date_column: str,
     source_column: str,
+    source_parent_column: str | None = None,
     author_column: str | None = None,
 ) -> tuple[list[str], list[Any]]:
     filters: list[str] = []
@@ -227,8 +228,16 @@ def make_filter_sql(
         params.append(end_date)
     source_ids = scope_source_ids(state)
     if source_ids:
-        filters.append(f"{source_column} IN ({','.join('?' for _ in source_ids)})")
-        params.extend(source_ids)
+        placeholders = ",".join("?" for _ in source_ids)
+        if source_parent_column:
+            filters.append(
+                f"({source_column} IN ({placeholders}) OR {source_parent_column} IN ({placeholders}))"
+            )
+            params.extend(source_ids)
+            params.extend(source_ids)
+        else:
+            filters.append(f"{source_column} IN ({placeholders})")
+            params.extend(source_ids)
     if author_column and state.author_ids:
         filters.append(f"{author_column} IN ({','.join('?' for _ in state.author_ids)})")
         params.extend(state.author_ids)
@@ -382,12 +391,13 @@ class MogIndexService:
             if not ranked:
                 state.last_result_kind = "keyword"
                 state.last_result_ids = []
-                return ResultPage("단어 검색", [], state.page, state.page_size, 0)
+                return ResultPage("단어 검색", [], state.page, state.page_size, 0, "현재 기간/범위에서 색인된 결과가 없습니다. 기간을 전체로 넓히거나 직접 기간을 지정해보세요.")
 
             filters, params = make_filter_sql(
                 state,
                 date_column="m.message_date",
                 source_column="m.source_id",
+                source_parent_column="s.parent_channel_id",
                 author_column="m.author_id",
             )
             placeholders = ",".join("?" for _ in ranked)
@@ -443,11 +453,13 @@ class MogIndexService:
                 state,
                 date_column="mt.topic_date",
                 source_column="mt.source_id",
+                source_parent_column="s.parent_channel_id",
             )
             term_filters, term_params = make_filter_sql(
                 state,
                 date_column="d.message_date",
                 source_column="d.source_id",
+                source_parent_column="s.parent_channel_id",
             )
             topics = conn.execute(
                 f"""
@@ -501,6 +513,7 @@ class MogIndexService:
                 state,
                 date_column="mt.topic_date",
                 source_column="mt.source_id",
+                source_parent_column="s.parent_channel_id",
             )
             rows = conn.execute(
                 f"""
@@ -542,12 +555,57 @@ class MogIndexService:
         state.last_result_ids = [topic.topic_id for topic in topics]
         return self._slice_lines("토픽 검색", lines, state, "조건에 맞는 수동 토픽이 없습니다.")
 
+    def run_recent(self, state: SearchPanelState) -> ResultPage:
+        with self.open() as conn:
+            filters, params = make_filter_sql(
+                state,
+                date_column="m.message_date",
+                source_column="m.source_id",
+                source_parent_column="s.parent_channel_id",
+                author_column="m.author_id",
+            )
+            order_sql = "m.created_at ASC" if state.sort == "oldest" else "m.created_at DESC"
+            rows = conn.execute(
+                f"""
+                SELECT
+                    m.message_pk, m.source_id, s.name AS source_name,
+                    m.author_id, m.author_name, m.message_date, m.created_at, m.jump_url
+                FROM messages m
+                JOIN sources s ON s.source_id = m.source_id
+                WHERE {" AND ".join(filters) if filters else "1 = 1"}
+                ORDER BY {order_sql}
+                LIMIT 300
+                """,
+                tuple(params),
+            ).fetchall()
+
+        results = [
+            SearchResult(
+                message_pk=int(row["message_pk"]),
+                source_id=row["source_id"],
+                source_name=row["source_name"],
+                author_id=row["author_id"],
+                author_name=row["author_name"],
+                message_date=row["message_date"],
+                created_at=row["created_at"],
+                jump_url=row["jump_url"],
+                score=0,
+            )
+            for row in rows
+        ]
+        state.last_result_kind = "recent"
+        state.last_result_ids = [item.message_pk for item in results]
+        page = self._slice_results("채널 보기", results, state)
+        page.empty_message = "현재 기간/범위에 표시할 색인 메시지가 없습니다. 기간을 전체로 넓히거나 다른 채널을 선택해보세요."
+        return page
+
     def run_participants(self, state: SearchPanelState) -> TextPage:
         with self.open() as conn:
             filters, params = make_filter_sql(
                 state,
                 date_column="m.message_date",
                 source_column="m.source_id",
+                source_parent_column="s.parent_channel_id",
                 author_column="m.author_id",
             )
             rows = conn.execute(
