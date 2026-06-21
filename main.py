@@ -11,7 +11,7 @@ from google_sheets_handler import SheetsHandler
 logging.basicConfig(level=logging.INFO, format='%(asctime)s:%(levelname)s:%(name)s: %(message)s')
 
 load_dotenv()
-DISCORD_TOKEN = os.getenv("PHS_TOKEN")
+DISCORD_TOKEN = os.getenv("MOG_TOKEN")
 GSPREAD_SHEET_NAME = "Discord_Bot"
 
 intents = discord.Intents.default()
@@ -28,7 +28,7 @@ class BattleManager(commands.Bot):
     async def setup_hook(self):
         """봇이 시작될 때 Cogs를 로드하고 슬래시 커맨드를 동기화함"""
         # cogs 폴더 내의 모든 .py 파일을 Cog로 로드
-        cogs_to_load = ['character_commands', 'combat_commands', 'utility_commands', 'shop_commands', 'archive']
+        cogs_to_load = ['character_commands', 'combat_commands', 'utility_commands', 'shop_commands', 'archive', 'mogindex_commands']
         for cog_name in cogs_to_load:
             try:
                 await self.load_extension(cog_name)

@@ -1,3 +1,8 @@
 /.env
 /dogwood-method-448216-f4-4023cd31106c.json
 /__pycache__
+/.tmp/
+/mogindex/*.db
+/mogindex/*.db-*
+/mogindex/*.sqlite3
+/mogindex/*.sqlite3-*

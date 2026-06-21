@@ -9,7 +9,7 @@ python main.py
 ```
 
 **Required environment variables** (`.env` file):
-- `PHS_TOKEN` — Discord bot token
+- `MOG_TOKEN` — Discord bot token
 - Google Sheets name is hardcoded as `"Discord_Bot"` in `main.py`
 
 **Required credential file:** `dogwood-method-448216-f4-4023cd31106c.json` (Google Service Account)
