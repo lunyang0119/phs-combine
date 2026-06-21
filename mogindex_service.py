@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import logging
 import os
 import sqlite3
 import uuid
@@ -20,6 +21,7 @@ DEFAULT_DB_PATH = Path(
 )
 SESSION_TTL_MINUTES = 30
 KST = ZoneInfo("Asia/Seoul")
+logger = logging.getLogger(__name__)
 
 Mode = Literal["hub", "keyword", "recap", "topic", "participants", "recent"]
 Visibility = Literal["private", "shared"]
@@ -346,7 +348,29 @@ class MogIndexService:
         state.source_scope = scope
         state.source_ids = list(dict.fromkeys(str(source_id) for source_id in source_ids if source_id))
         state.page = 0
+        logger.info(
+            "mogindex scope updated session=%s scope=%s source_ids=%s",
+            state.session_id,
+            state.source_scope,
+            state.source_ids,
+        )
         return state
+
+    def count_matching_sources(self, state: SearchPanelState) -> int:
+        source_ids = scope_source_ids(state)
+        if not source_ids:
+            return 0
+        placeholders = ",".join("?" for _ in source_ids)
+        with self.open() as conn:
+            row = conn.execute(
+                f"""
+                SELECT COUNT(*) AS count
+                FROM sources
+                WHERE source_id IN ({placeholders}) OR parent_channel_id IN ({placeholders})
+                """,
+                tuple(source_ids) + tuple(source_ids),
+            ).fetchone()
+        return int(row["count"] if row else 0)
 
     def _keyword_rankings(self, conn: sqlite3.Connection, query: str) -> Counter[int]:
         normalized = normalize_text(query)
@@ -437,7 +461,19 @@ class MogIndexService:
 
         state.last_result_kind = "keyword"
         state.last_result_ids = [item.message_pk for item in results]
-        return self._slice_results("단어 검색", results, state)
+        page = self._slice_results("단어 검색", results, state)
+        logger.info(
+            "mogindex keyword session=%s query=%r scope=%s sources=%s date=%s..%s total=%s page=%s",
+            state.session_id,
+            query,
+            state.source_scope,
+            state.source_ids,
+            date_bounds(state)[0],
+            date_bounds(state)[1],
+            page.total,
+            page.page,
+        )
+        return page
 
     def _slice_results(self, title: str, results: list[SearchResult], state: SearchPanelState) -> ResultPage:
         total = len(results)
@@ -597,6 +633,16 @@ class MogIndexService:
         state.last_result_ids = [item.message_pk for item in results]
         page = self._slice_results("채널 보기", results, state)
         page.empty_message = "현재 기간/범위에 표시할 색인 메시지가 없습니다. 기간을 전체로 넓히거나 다른 채널을 선택해보세요."
+        logger.info(
+            "mogindex recent session=%s scope=%s sources=%s date=%s..%s total=%s page=%s",
+            state.session_id,
+            state.source_scope,
+            state.source_ids,
+            date_bounds(state)[0],
+            date_bounds(state)[1],
+            page.total,
+            page.page,
+        )
         return page
 
     def run_participants(self, state: SearchPanelState) -> TextPage:
@@ -639,7 +685,18 @@ class MogIndexService:
         ]
         state.last_result_kind = "participants"
         state.last_result_ids = []
-        return self._slice_lines("참여자 보기", lines, state, "이 기간에 참여자 기록이 없습니다.")
+        page = self._slice_lines("참여자 보기", lines, state, "이 기간에 참여자 기록이 없습니다.")
+        logger.info(
+            "mogindex participants session=%s scope=%s sources=%s date=%s..%s total=%s page=%s",
+            state.session_id,
+            state.source_scope,
+            state.source_ids,
+            date_bounds(state)[0],
+            date_bounds(state)[1],
+            page.total,
+            page.page,
+        )
+        return page
 
     def _slice_lines(
         self,

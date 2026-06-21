@@ -1,12 +1,22 @@
 from __future__ import annotations
 
+import asyncio
 import logging
+from datetime import date, timedelta
 from typing import Any
 
 import discord
 from discord import app_commands
 from discord.ext import commands
 
+from mogindex_debug import connect as index_connect, initialize_schema
+from mogindex_discord_debug import (
+    CATEGORY_ID,
+    DEFAULT_PARENT_CHANNEL_IDS,
+    collect_source,
+    date_bounds as discord_date_bounds,
+    gather_targets,
+)
 from mogindex_service import (
     DatePreset,
     MogIndexService,
@@ -16,6 +26,7 @@ from mogindex_service import (
     SearchSessionExpired,
     SourceScope,
     TextPage,
+    now_kst,
 )
 
 
@@ -210,6 +221,7 @@ class MogIndexCommandsCog(commands.Cog):
     def __init__(self, bot: commands.Bot):
         self.bot = bot
         self.service = MogIndexService()
+        self.full_index_task: asyncio.Task | None = None
 
     @app_commands.command(name="검색", description="색인된 커뮤 로그를 검색합니다.")
     async def search_panel(self, interaction: discord.Interaction) -> None:
@@ -217,6 +229,13 @@ class MogIndexCommandsCog(commands.Cog):
             await interaction.response.send_message("서버 안에서만 사용할 수 있습니다.", ephemeral=True)
             return
         state = self.service.create_session(interaction)
+        logger.info(
+            "mogindex panel opened session=%s user=%s guild=%s channel=%s",
+            state.session_id,
+            state.owner_user_id,
+            state.guild_id,
+            state.origin_channel_id,
+        )
         embed, view, _page = self.render_panel(state)
         await interaction.response.send_message(embed=embed, view=view, ephemeral=True)
 
@@ -229,6 +248,18 @@ class MogIndexCommandsCog(commands.Cog):
     ) -> None:
         try:
             state = self.service.load_session(session_id, str(interaction.user.id))
+            logger.info(
+                "mogindex action user=%s session=%s action=%s mode=%s scope=%s sources=%s preset=%s page=%s extra=%s",
+                interaction.user.id,
+                session_id,
+                action,
+                state.mode,
+                state.source_scope,
+                state.source_ids,
+                state.date_preset,
+                state.page,
+                extra,
+            )
         except SearchSessionError as exc:
             await self.send_session_error(interaction, exc)
             return
@@ -257,6 +288,16 @@ class MogIndexCommandsCog(commands.Cog):
             self.apply_action(state, action, extra)
             embed, view, _page = self.render_panel(state)
             self.service.save_session(state)
+            logger.info(
+                "mogindex action applied session=%s action=%s mode=%s scope=%s sources=%s preset=%s page=%s",
+                state.session_id,
+                action,
+                state.mode,
+                state.source_scope,
+                state.source_ids,
+                state.date_preset,
+                state.page,
+            )
             await interaction.response.edit_message(embed=embed, view=view)
         except ValueError as exc:
             await interaction.response.send_message(str(exc), ephemeral=True)
@@ -314,6 +355,13 @@ class MogIndexCommandsCog(commands.Cog):
         try:
             state = self.service.load_session(session_id, str(interaction.user.id))
             state.query = query.strip()
+            logger.info(
+                "mogindex modal query user=%s session=%s mode=%s query=%r",
+                interaction.user.id,
+                session_id,
+                mode,
+                state.query,
+            )
             state.mode = "keyword" if mode == "keyword" else "topic"
             state.page = 0
             embed, view, _page = self.render_panel(state)
@@ -337,10 +385,29 @@ class MogIndexCommandsCog(commands.Cog):
             if not clean_source_id.isdigit():
                 raise ValueError("채널/스레드 ID는 숫자로 입력해주세요.")
             state = self.service.load_session(session_id, str(interaction.user.id))
+            previous_mode = state.mode
             self.service.set_scope(state, "selected_sources", [clean_source_id])
-            state.mode = "recent"
+            matching_sources = self.service.count_matching_sources(state)
+            logger.info(
+                "mogindex source modal user=%s session=%s source_id=%s matching_sources=%s previous_mode=%s",
+                interaction.user.id,
+                session_id,
+                clean_source_id,
+                matching_sources,
+                previous_mode,
+            )
+            if previous_mode == "hub":
+                state.mode = "recent"
+                if state.date_preset == "30d":
+                    self.service.set_date_preset(state, "all")
             state.page = 0
             embed, view, _page = self.render_panel(state)
+            if matching_sources == 0:
+                embed.add_field(
+                    name="범위 확인",
+                    value="이 ID와 일치하는 색인 source가 아직 없습니다. 먼저 해당 채널/스레드를 backfill했는지 확인해주세요.",
+                    inline=False,
+                )
             self.service.save_session(state)
             await interaction.response.edit_message(embed=embed, view=view)
         except (SearchSessionError, ValueError) as exc:
@@ -359,6 +426,13 @@ class MogIndexCommandsCog(commands.Cog):
         try:
             state = self.service.load_session(session_id, str(interaction.user.id))
             self.service.set_custom_dates(state, start_date, end_date)
+            logger.info(
+                "mogindex date modal user=%s session=%s start=%s end=%s",
+                interaction.user.id,
+                session_id,
+                state.start_date,
+                state.end_date,
+            )
             embed, view, _page = self.render_panel(state)
             self.service.save_session(state)
             await interaction.response.edit_message(embed=embed, view=view)
@@ -382,6 +456,13 @@ class MogIndexCommandsCog(commands.Cog):
             await interaction.followup.send("이 채널에는 공개 메시지를 보낼 수 없습니다.", ephemeral=True)
             return
         await channel.send(embed=embed)
+        logger.info(
+            "mogindex shared session=%s user=%s mode=%s channel=%s",
+            state.session_id,
+            interaction.user.id,
+            state.mode,
+            getattr(channel, "id", None),
+        )
         await interaction.followup.send("현재 결과 페이지를 공개로 공유했습니다.", ephemeral=True)
 
     async def send_session_error(self, interaction: discord.Interaction, exc: Exception) -> None:
@@ -482,6 +563,101 @@ class MogIndexCommandsCog(commands.Cog):
             return "0 results"
         page_count = (page.total - 1) // page.page_size + 1
         return f"{page.page + 1}/{page_count} page, {page.total} results"
+
+    @app_commands.command(name="전체색인", description="[관리자] 오늘부터 2024-06-13까지 하루씩 천천히 색인합니다.")
+    @app_commands.default_permissions(manage_roles=True)
+    async def full_index(self, interaction: discord.Interaction) -> None:
+        if self.full_index_task and not self.full_index_task.done():
+            await interaction.response.send_message("전체색인이 이미 실행 중입니다. 서버 로그를 확인해주세요.", ephemeral=True)
+            return
+        if not interaction.guild_id:
+            await interaction.response.send_message("서버 안에서만 사용할 수 있습니다.", ephemeral=True)
+            return
+        start_date = now_kst().date()
+        end_date = date(2024, 6, 13)
+        parent_ids = list(DEFAULT_PARENT_CHANNEL_IDS)
+        self.full_index_task = asyncio.create_task(
+            self.run_full_index_job(
+                guild_id=str(interaction.guild_id),
+                requested_by=str(interaction.user.id),
+                start_date=start_date,
+                end_date=end_date,
+                parent_ids=parent_ids,
+            )
+        )
+        logger.info(
+            "mogindex full-index command started by=%s guild=%s start=%s end=%s parents=%s",
+            interaction.user.id,
+            interaction.guild_id,
+            start_date,
+            end_date,
+            parent_ids,
+        )
+        await interaction.response.send_message(
+            f"전체색인을 백그라운드에서 시작했습니다. {start_date}부터 {end_date}까지 10분에 하루씩 진행합니다.",
+            ephemeral=True,
+        )
+
+    async def run_full_index_job(
+        self,
+        *,
+        guild_id: str,
+        requested_by: str,
+        start_date: date,
+        end_date: date,
+        parent_ids: list[str],
+    ) -> None:
+        current = start_date
+        while current >= end_date:
+            try:
+                after, before = discord_date_bounds(current, current, "Asia/Seoul")
+                targets = await gather_targets(
+                    self.bot,
+                    parent_ids,
+                    category_id=CATEGORY_ID,
+                    include_threads=True,
+                    include_private_archived=False,
+                    thread_after=after,
+                    thread_before=before,
+                )
+                conn = self.service.connect()
+                try:
+                    initialize_schema(conn)
+                    total_scanned = 0
+                    total_indexed = 0
+                    for target in targets:
+                        scanned, indexed = await collect_source(
+                            conn,
+                            target,
+                            guild_id=guild_id,
+                            category_id=CATEGORY_ID,
+                            after=after,
+                            before=before,
+                            limit=None,
+                            dry_run=False,
+                        )
+                        total_scanned += scanned
+                        total_indexed += indexed
+                    logger.info(
+                        "mogindex full-index day=%s targets=%s scanned=%s indexed=%s requested_by=%s",
+                        current,
+                        len(targets),
+                        total_scanned,
+                        total_indexed,
+                        requested_by,
+                    )
+                finally:
+                    conn.close()
+            except asyncio.CancelledError:
+                logger.warning("mogindex full-index cancelled day=%s requested_by=%s", current, requested_by)
+                raise
+            except Exception as exc:
+                logger.error("mogindex full-index day failed day=%s error=%s", current, exc, exc_info=True)
+            if current == end_date:
+                break
+            current -= timedelta(days=1)
+            await asyncio.sleep(600)
+        logger.info("mogindex full-index finished requested_by=%s", requested_by)
 
 
 async def setup(bot: commands.Bot):
