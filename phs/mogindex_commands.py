@@ -5,6 +5,7 @@ import logging
 import os
 import time
 import traceback
+import uuid
 from datetime import date, timedelta
 from typing import Any
 
@@ -756,20 +757,58 @@ class MogIndexCommandsCog(commands.Cog):
         page_count = (page.total - 1) // page.page_size + 1
         return f"{page.page + 1}/{page_count} page, {page.total} results"
 
-    @app_commands.command(name="전체색인", description="[관리자] 오늘부터 2024-06-13까지 하루씩 천천히 색인합니다.")
+    @app_commands.command(name="전체색인", description="[관리자] 전체색인 상태를 확인하거나 천천히 이어서 실행합니다.")
     @app_commands.default_permissions(manage_roles=True)
-    async def full_index(self, interaction: discord.Interaction) -> None:
-        if self.full_index_task and not self.full_index_task.done():
-            await interaction.response.send_message("전체색인이 이미 실행 중입니다. 서버 로그를 확인해주세요.", ephemeral=True)
-            return
+    @app_commands.describe(action="전체색인 작업")
+    @app_commands.rename(action="작업")
+    @app_commands.choices(
+        action=[
+            app_commands.Choice(name="상태확인", value="status"),
+            app_commands.Choice(name="새로시작", value="start"),
+            app_commands.Choice(name="이어하기", value="resume"),
+        ]
+    )
+    async def full_index(
+        self,
+        interaction: discord.Interaction,
+        action: app_commands.Choice[str] = None,
+    ) -> None:
         if not interaction.guild_id:
             await interaction.response.send_message("서버 안에서만 사용할 수 있습니다.", ephemeral=True)
             return
-        start_date = now_kst().date()
-        end_date = date(2024, 6, 13)
+
+        action_value = action.value if action else "status"
+        if self.full_index_task and not self.full_index_task.done():
+            if action_value == "status":
+                await interaction.response.send_message(self.format_full_index_status(), ephemeral=True)
+                return
+            await interaction.response.send_message("전체색인이 이미 실행 중입니다. 상태확인을 사용해주세요.", ephemeral=True)
+            return
+
+        self.mark_interrupted_full_index_runs()
+        if action_value == "status":
+            await interaction.response.send_message(self.format_full_index_status(), ephemeral=True)
+            return
+        if action_value == "resume":
+            await self.start_full_index_resume(interaction)
+            return
+        await self.start_full_index_new(interaction)
+
+    async def start_full_index_new(self, interaction: discord.Interaction) -> None:
+        start_date = date(2025, 11, 10)
+        end_date = date(2025, 10, 20)
         parent_ids = list(DEFAULT_PARENT_CHANNEL_IDS)
+        run_id = self.create_full_index_run(
+            guild_id=str(interaction.guild_id),
+            requested_by=str(interaction.user.id),
+            start_date=start_date,
+            end_date=end_date,
+            notify_channel_id=str(interaction.channel_id),
+            notify_user_id=str(interaction.user.id),
+        )
         self.full_index_task = asyncio.create_task(
             self.run_full_index_job(
+                run_id=run_id,
                 guild_id=str(interaction.guild_id),
                 requested_by=str(interaction.user.id),
                 start_date=start_date,
@@ -780,7 +819,8 @@ class MogIndexCommandsCog(commands.Cog):
             )
         )
         logger.info(
-            "mogindex full-index command started by=%s guild=%s start=%s end=%s parents=%s",
+            "mogindex full-index command started run=%s by=%s guild=%s start=%s end=%s parents=%s",
+            run_id,
             interaction.user.id,
             interaction.guild_id,
             start_date,
@@ -788,15 +828,357 @@ class MogIndexCommandsCog(commands.Cog):
             parent_ids,
         )
         await interaction.response.send_message(
-            f"전체색인을 백그라운드에서 시작했습니다. {start_date}부터 {end_date}까지 진행합니다. "
+            f"전체색인을 백그라운드에서 새로 시작했습니다. run={run_id[:8]} / {start_date}부터 {end_date}까지 진행합니다. "
             f"하루 처리 시간이 {format_duration(FULL_INDEX_SLOW_DAY_SECONDS)} 이상이면 "
             f"{format_duration(FULL_INDEX_REST_SECONDS)} 쉬고, 더 빠르면 바로 다음 날짜로 넘어갑니다.",
             ephemeral=True,
         )
 
+    async def start_full_index_resume(self, interaction: discord.Interaction) -> None:
+        resume = self.get_full_index_resume_plan(
+            requested_by=str(interaction.user.id),
+            notify_channel_id=str(interaction.channel_id),
+            notify_user_id=str(interaction.user.id),
+        )
+        if resume is None:
+            await interaction.response.send_message("이어갈 전체색인 기록이 없습니다.", ephemeral=True)
+            return
+        run_id, start_date, end_date, guild_id, requested_by, notify_channel_id, notify_user_id = resume
+        if start_date < end_date:
+            await interaction.response.send_message("이미 완료된 색인입니다.", ephemeral=True)
+            return
+        parent_ids = list(DEFAULT_PARENT_CHANNEL_IDS)
+        self.full_index_task = asyncio.create_task(
+            self.run_full_index_job(
+                run_id=run_id,
+                guild_id=guild_id,
+                requested_by=requested_by,
+                start_date=start_date,
+                end_date=end_date,
+                parent_ids=parent_ids,
+                notify_channel_id=notify_channel_id,
+                notify_user_id=notify_user_id,
+            )
+        )
+        logger.info(
+            "mogindex full-index command resumed run=%s by=%s guild=%s start=%s end=%s parents=%s",
+            run_id,
+            interaction.user.id,
+            guild_id,
+            start_date,
+            end_date,
+            parent_ids,
+        )
+        await interaction.response.send_message(
+            f"전체색인을 이어서 시작했습니다. run={run_id[:8]} / {start_date}부터 {end_date}까지 진행합니다.",
+            ephemeral=True,
+        )
+
+    def create_full_index_run(
+        self,
+        *,
+        guild_id: str,
+        requested_by: str,
+        start_date: date,
+        end_date: date,
+        notify_channel_id: str | None,
+        notify_user_id: str | None,
+    ) -> str:
+        run_id = uuid.uuid4().hex
+        now = now_kst().isoformat()
+        with self.service.open() as conn:
+            conn.execute(
+                """
+                INSERT INTO full_index_runs (
+                    run_id, guild_id, requested_by, status, start_date, end_date,
+                    current_date, last_completed_date, notify_channel_id, notify_user_id,
+                    created_at, updated_at, finished_at
+                )
+                VALUES (?, ?, ?, 'running', ?, ?, ?, NULL, ?, ?, ?, ?, NULL)
+                """,
+                (
+                    run_id,
+                    guild_id,
+                    requested_by,
+                    start_date.isoformat(),
+                    end_date.isoformat(),
+                    start_date.isoformat(),
+                    notify_channel_id,
+                    notify_user_id,
+                    now,
+                    now,
+                ),
+            )
+            conn.commit()
+        return run_id
+
+    def mark_interrupted_full_index_runs(self) -> None:
+        now = now_kst().isoformat()
+        with self.service.open() as conn:
+            conn.execute(
+                """
+                UPDATE full_index_days
+                SET status = 'interrupted', finished_at = ?,
+                    error_text = COALESCE(error_text, 'bot stopped before completion')
+                WHERE status = 'running'
+                """,
+                (now,),
+            )
+            conn.execute(
+                """
+                UPDATE full_index_runs
+                SET status = 'interrupted', updated_at = ?
+                WHERE status = 'running'
+                """,
+                (now,),
+            )
+            conn.commit()
+
+    def get_latest_full_index_run(self, *, incomplete_only: bool = False) -> dict[str, Any] | None:
+        with self.service.open() as conn:
+            where = "WHERE status IN ('running', 'interrupted', 'failed')" if incomplete_only else ""
+            row = conn.execute(
+                f"""
+                SELECT *
+                FROM full_index_runs
+                {where}
+                ORDER BY created_at DESC
+                LIMIT 1
+                """
+            ).fetchone()
+            return dict(row) if row else None
+
+    def get_full_index_resume_plan(
+        self,
+        *,
+        requested_by: str,
+        notify_channel_id: str | None,
+        notify_user_id: str | None,
+    ) -> tuple[str, date, date, str, str, str | None, str | None] | None:
+        now = now_kst().isoformat()
+        with self.service.open() as conn:
+            row = conn.execute(
+                """
+                SELECT *
+                FROM full_index_runs
+                WHERE status IN ('running', 'interrupted', 'failed')
+                ORDER BY created_at DESC
+                LIMIT 1
+                """
+            ).fetchone()
+            if row is None:
+                return None
+            resume_date = self.resolve_full_index_resume_date(conn, row)
+            if resume_date is None:
+                return None
+            end_date = date.fromisoformat(row["end_date"])
+            conn.execute(
+                """
+                UPDATE full_index_runs
+                SET status = 'running', requested_by = ?, current_date = ?,
+                    notify_channel_id = ?, notify_user_id = ?, updated_at = ?, finished_at = NULL
+                WHERE run_id = ?
+                """,
+                (requested_by, resume_date.isoformat(), notify_channel_id, notify_user_id, now, row["run_id"]),
+            )
+            conn.commit()
+            return (
+                row["run_id"],
+                resume_date,
+                end_date,
+                row["guild_id"],
+                requested_by,
+                notify_channel_id,
+                notify_user_id,
+            )
+
+    def resolve_full_index_resume_date(self, conn: Any, run_row: Any) -> date | None:
+        if run_row["status"] == "completed":
+            return None
+        blocked = conn.execute(
+            """
+            SELECT index_date
+            FROM full_index_days
+            WHERE run_id = ? AND status IN ('failed', 'interrupted', 'running')
+            ORDER BY index_date DESC
+            LIMIT 1
+            """,
+            (run_row["run_id"],),
+        ).fetchone()
+        if blocked:
+            return date.fromisoformat(blocked["index_date"])
+        if run_row["last_completed_date"]:
+            return date.fromisoformat(run_row["last_completed_date"]) - timedelta(days=1)
+        if run_row["current_date"]:
+            return date.fromisoformat(run_row["current_date"])
+        return date.fromisoformat(run_row["start_date"])
+
+    def format_full_index_status(self) -> str:
+        with self.service.open() as conn:
+            row = conn.execute(
+                """
+                SELECT *
+                FROM full_index_runs
+                ORDER BY created_at DESC
+                LIMIT 1
+                """
+            ).fetchone()
+            if row is None:
+                return "이어갈 전체색인 기록이 없습니다. 새로 시작하려면 `/전체색인 작업:새로시작`을 사용해주세요."
+            counts = conn.execute(
+                """
+                SELECT status, COUNT(*) AS count
+                FROM full_index_days
+                WHERE run_id = ?
+                GROUP BY status
+                """,
+                (row["run_id"],),
+            ).fetchall()
+            resume_date = self.resolve_full_index_resume_date(conn, row)
+        count_map = {item["status"]: item["count"] for item in counts}
+        status_names = {
+            "running": "실행 중",
+            "interrupted": "중단됨",
+            "failed": "실패",
+            "completed": "완료",
+        }
+        next_text = resume_date.isoformat() if resume_date else "완료 또는 이어갈 날짜 없음"
+        count_text = ", ".join(
+            f"{status_names.get(status, status)} {count}일" for status, count in sorted(count_map.items())
+        ) or "처리 기록 없음"
+        return (
+            "전체색인 상태\n"
+            f"run: {row['run_id'][:8]}\n"
+            f"상태: {status_names.get(row['status'], row['status'])}\n"
+            f"범위: {row['start_date']} .. {row['end_date']}\n"
+            f"현재 날짜: {row['current_date'] or '-'}\n"
+            f"마지막 완료: {row['last_completed_date'] or '-'}\n"
+            f"다음 이어하기: {next_text}\n"
+            f"일자 기록: {count_text}"
+        )
+
+    def mark_full_index_day_started(self, run_id: str, index_date: date) -> None:
+        now = now_kst().isoformat()
+        with self.service.open() as conn:
+            conn.execute(
+                """
+                INSERT INTO full_index_days (
+                    run_id, index_date, status, targets, scanned, indexed,
+                    elapsed_seconds, error_text, started_at, finished_at
+                )
+                VALUES (?, ?, 'running', 0, 0, 0, 0, NULL, ?, NULL)
+                ON CONFLICT(run_id, index_date) DO UPDATE SET
+                    status = 'running', targets = 0, scanned = 0, indexed = 0,
+                    elapsed_seconds = 0, error_text = NULL,
+                    started_at = excluded.started_at, finished_at = NULL
+                """,
+                (run_id, index_date.isoformat(), now),
+            )
+            conn.execute(
+                """
+                UPDATE full_index_runs
+                SET status = 'running', current_date = ?, updated_at = ?, finished_at = NULL
+                WHERE run_id = ?
+                """,
+                (index_date.isoformat(), now, run_id),
+            )
+            conn.commit()
+
+    def mark_full_index_day_completed(
+        self,
+        run_id: str,
+        index_date: date,
+        *,
+        next_date: date | None,
+        targets: int,
+        scanned: int,
+        indexed: int,
+        elapsed_seconds: float,
+    ) -> None:
+        now = now_kst().isoformat()
+        with self.service.open() as conn:
+            conn.execute(
+                """
+                INSERT INTO full_index_days (
+                    run_id, index_date, status, targets, scanned, indexed,
+                    elapsed_seconds, error_text, started_at, finished_at
+                )
+                VALUES (?, ?, 'completed', ?, ?, ?, ?, NULL, ?, ?)
+                ON CONFLICT(run_id, index_date) DO UPDATE SET
+                    status = 'completed', targets = excluded.targets,
+                    scanned = excluded.scanned, indexed = excluded.indexed,
+                    elapsed_seconds = excluded.elapsed_seconds, error_text = NULL,
+                    finished_at = excluded.finished_at
+                """,
+                (run_id, index_date.isoformat(), targets, scanned, indexed, elapsed_seconds, now, now),
+            )
+            conn.execute(
+                """
+                UPDATE full_index_runs
+                SET status = 'running', last_completed_date = ?, current_date = ?, updated_at = ?
+                WHERE run_id = ?
+                """,
+                (index_date.isoformat(), next_date.isoformat() if next_date else None, now, run_id),
+            )
+            conn.commit()
+
+    def mark_full_index_day_failed(
+        self,
+        run_id: str,
+        index_date: date,
+        *,
+        status: str,
+        targets: int,
+        scanned: int,
+        indexed: int,
+        elapsed_seconds: float,
+        error_text: str,
+    ) -> None:
+        now = now_kst().isoformat()
+        error_text = error_text[:1000]
+        with self.service.open() as conn:
+            conn.execute(
+                """
+                INSERT INTO full_index_days (
+                    run_id, index_date, status, targets, scanned, indexed,
+                    elapsed_seconds, error_text, started_at, finished_at
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(run_id, index_date) DO UPDATE SET
+                    status = excluded.status, targets = excluded.targets,
+                    scanned = excluded.scanned, indexed = excluded.indexed,
+                    elapsed_seconds = excluded.elapsed_seconds,
+                    error_text = excluded.error_text, finished_at = excluded.finished_at
+                """,
+                (run_id, index_date.isoformat(), status, targets, scanned, indexed, elapsed_seconds, error_text, now, now),
+            )
+            conn.execute(
+                """
+                UPDATE full_index_runs
+                SET status = ?, current_date = ?, updated_at = ?, finished_at = ?
+                WHERE run_id = ?
+                """,
+                (status, index_date.isoformat(), now, now, run_id),
+            )
+            conn.commit()
+
+    def mark_full_index_run_completed(self, run_id: str) -> None:
+        now = now_kst().isoformat()
+        with self.service.open() as conn:
+            conn.execute(
+                """
+                UPDATE full_index_runs
+                SET status = 'completed', current_date = NULL, updated_at = ?, finished_at = ?
+                WHERE run_id = ?
+                """,
+                (now, now, run_id),
+            )
+            conn.commit()
+
     async def run_full_index_job(
         self,
         *,
+        run_id: str,
         guild_id: str,
         requested_by: str,
         start_date: date,
@@ -809,6 +1191,11 @@ class MogIndexCommandsCog(commands.Cog):
         while current >= end_date:
             day_started = time.perf_counter()
             day_elapsed = 0.0
+            total_scanned = 0
+            total_indexed = 0
+            target_elapsed_total = 0.0
+            targets_count = 0
+            self.mark_full_index_day_started(run_id, current)
             try:
                 after, before = discord_date_bounds(current, current, "Asia/Seoul")
                 targets = await gather_targets(
@@ -820,9 +1207,7 @@ class MogIndexCommandsCog(commands.Cog):
                     thread_after=after,
                     thread_before=before,
                 )
-                total_scanned = 0
-                total_indexed = 0
-                target_elapsed_total = 0.0
+                targets_count = len(targets)
                 for target in targets:
                     target_started = time.perf_counter()
                     conn = self.service.connect()
@@ -844,7 +1229,8 @@ class MogIndexCommandsCog(commands.Cog):
                     total_scanned += scanned
                     total_indexed += indexed
                     logger.info(
-                        "mogindex full-index target day=%s source=%s name=%s scanned=%s indexed=%s elapsed=%.2fs",
+                        "mogindex full-index target run=%s day=%s source=%s name=%s scanned=%s indexed=%s elapsed=%.2fs",
+                        run_id,
                         current,
                         getattr(target, "id", None),
                         getattr(target, "name", None),
@@ -854,11 +1240,12 @@ class MogIndexCommandsCog(commands.Cog):
                     )
                     await asyncio.sleep(0)
                 day_elapsed = time.perf_counter() - day_started
-                avg_target_elapsed = target_elapsed_total / len(targets) if targets else 0.0
+                avg_target_elapsed = target_elapsed_total / targets_count if targets_count else 0.0
                 logger.info(
-                    "mogindex full-index day=%s targets=%s scanned=%s indexed=%s elapsed=%.2fs avg_target=%.2fs requested_by=%s",
+                    "mogindex full-index day run=%s day=%s targets=%s scanned=%s indexed=%s elapsed=%.2fs avg_target=%.2fs requested_by=%s",
+                    run_id,
                     current,
-                    len(targets),
+                    targets_count,
                     total_scanned,
                     total_indexed,
                     day_elapsed,
@@ -866,23 +1253,57 @@ class MogIndexCommandsCog(commands.Cog):
                     requested_by,
                 )
             except asyncio.CancelledError:
-                logger.warning("mogindex full-index cancelled day=%s requested_by=%s", current, requested_by)
+                day_elapsed = time.perf_counter() - day_started
+                self.mark_full_index_day_failed(
+                    run_id,
+                    current,
+                    status="interrupted",
+                    targets=targets_count,
+                    scanned=total_scanned,
+                    indexed=total_indexed,
+                    elapsed_seconds=day_elapsed,
+                    error_text="task cancelled",
+                )
+                logger.warning("mogindex full-index cancelled run=%s day=%s requested_by=%s", run_id, current, requested_by)
                 raise
             except Exception as exc:
                 day_elapsed = time.perf_counter() - day_started
-                logger.error("mogindex full-index day failed day=%s elapsed=%.2fs error=%s", current, day_elapsed, exc, exc_info=True)
+                self.mark_full_index_day_failed(
+                    run_id,
+                    current,
+                    status="failed",
+                    targets=targets_count,
+                    scanned=total_scanned,
+                    indexed=total_indexed,
+                    elapsed_seconds=day_elapsed,
+                    error_text=f"{type(exc).__name__}: {exc}",
+                )
+                logger.error("mogindex full-index day failed run=%s day=%s elapsed=%.2fs error=%s", run_id, current, day_elapsed, exc, exc_info=True)
                 await self.report_exception(
                     "전체색인 하루 처리 실패",
                     exc,
-                    details={"day": str(current), "elapsed_seconds": round(day_elapsed, 2), "requested_by": requested_by},
+                    details={"run_id": run_id, "day": str(current), "elapsed_seconds": round(day_elapsed, 2), "requested_by": requested_by},
                 )
+                return
+
+            next_date = None if current == end_date else current - timedelta(days=1)
+            self.mark_full_index_day_completed(
+                run_id,
+                current,
+                next_date=next_date,
+                targets=targets_count,
+                scanned=total_scanned,
+                indexed=total_indexed,
+                elapsed_seconds=day_elapsed,
+            )
             if current == end_date:
                 break
             completed_day = current
-            current -= timedelta(days=1)
+            current = next_date
             rest_seconds = FULL_INDEX_REST_SECONDS if day_elapsed >= FULL_INDEX_SLOW_DAY_SECONDS else 0
             logger.info(
-                "mogindex full-index pacing completed_day=%s next_day=%s elapsed=%.2fs threshold=%ss rest=%ss",
+                "mogindex full-index pacing run=%s completed_day=%s next_day=%s elapsed=%.2fs threshold=%ss rest=%ss",
+                run_id,
                 completed_day,
                 current,
                 day_elapsed,
@@ -891,13 +1312,14 @@ class MogIndexCommandsCog(commands.Cog):
             )
             if rest_seconds > 0:
                 await asyncio.sleep(rest_seconds)
+        self.mark_full_index_run_completed(run_id)
         await self.send_full_index_completion_notice(
             notify_channel_id=notify_channel_id,
             notify_user_id=notify_user_id,
             start_date=start_date,
             end_date=end_date,
         )
-        logger.info("mogindex full-index finished requested_by=%s", requested_by)
+        logger.info("mogindex full-index finished run=%s requested_by=%s", run_id, requested_by)
 
     async def send_full_index_completion_notice(
         self,

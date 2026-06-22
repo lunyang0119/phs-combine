@@ -15,7 +15,7 @@ from pathlib import Path
 from typing import Any, Iterable, Iterator, Literal
 from zoneinfo import ZoneInfo
 
-from mogindex_debug import STOP_TERMS, connect, extract_terms, initialize_schema, normalize_text
+from mogindex_debug import INDEX_EXCLUDED_TERMS, connect, extract_terms, initialize_schema, normalize_text
 
 
 DEFAULT_DB_PATH = Path(
@@ -201,6 +201,50 @@ def initialize_service_schema(conn: sqlite3.Connection) -> None:
     )
     conn.execute(
         "CREATE INDEX IF NOT EXISTS idx_search_sessions_expires_at ON search_sessions(expires_at)"
+    )
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS full_index_runs (
+            run_id TEXT PRIMARY KEY,
+            guild_id TEXT NOT NULL,
+            requested_by TEXT NOT NULL,
+            status TEXT NOT NULL,
+            start_date TEXT NOT NULL,
+            end_date TEXT NOT NULL,
+            current_date TEXT,
+            last_completed_date TEXT,
+            notify_channel_id TEXT,
+            notify_user_id TEXT,
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL,
+            finished_at TEXT
+        )
+        """
+    )
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_full_index_runs_status_created "
+        "ON full_index_runs(status, created_at DESC)"
+    )
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS full_index_days (
+            run_id TEXT NOT NULL,
+            index_date TEXT NOT NULL,
+            status TEXT NOT NULL,
+            targets INTEGER NOT NULL DEFAULT 0,
+            scanned INTEGER NOT NULL DEFAULT 0,
+            indexed INTEGER NOT NULL DEFAULT 0,
+            elapsed_seconds REAL NOT NULL DEFAULT 0,
+            error_text TEXT,
+            started_at TEXT,
+            finished_at TEXT,
+            PRIMARY KEY(run_id, index_date)
+        )
+        """
+    )
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_full_index_days_status "
+        "ON full_index_days(run_id, status, index_date DESC)"
     )
     conn.commit()
 
@@ -475,6 +519,8 @@ class MogIndexService:
         normalized = normalize_text(query)
         query_terms = extract_terms(query)
         ranked: Counter[int] = Counter()
+        if not query_terms:
+            return ranked
         if len(normalized.replace(" ", "")) >= 3:
             for row in conn.execute(
                 """
@@ -633,11 +679,11 @@ class MogIndexService:
                 JOIN sources s ON s.source_id = d.source_id
                 WHERE {" AND ".join(term_filters) if term_filters else "1 = 1"}
                   AND LENGTH(d.term) BETWEEN 2 AND 8
-                  AND d.term NOT IN ({",".join("?" for _ in STOP_TERMS)})
+                  AND d.term NOT IN ({",".join("?" for _ in INDEX_EXCLUDED_TERMS)})
                 ORDER BY d.message_date DESC, d.source_id, d.count DESC, d.term
                 LIMIT 300
                 """,
-                tuple(term_params) + tuple(STOP_TERMS),
+                tuple(term_params) + tuple(INDEX_EXCLUDED_TERMS),
             ).fetchall()
 
         lines: list[str] = []
