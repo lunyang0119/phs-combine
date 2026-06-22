@@ -2,6 +2,9 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os
+import time
+import traceback
 from datetime import date, timedelta
 from typing import Any
 
@@ -31,6 +34,7 @@ from mogindex_service import (
 
 
 logger = logging.getLogger(__name__)
+ERROR_REPORT_THREAD_ID = int(os.getenv("MOGINDEX_ERROR_THREAD_ID", "1518240031532122282") or "1518240031532122282")
 
 
 def clip(text: str, limit: int) -> str:
@@ -136,6 +140,26 @@ class SourceIdModal(discord.ui.Modal):
         await self.cog.handle_source_modal(interaction, self.session_id, self.source_id.value)
 
 
+class SourceNameModal(discord.ui.Modal):
+    def __init__(self, cog: "MogIndexCommandsCog", state: SearchPanelState):
+        super().__init__(
+            title="채널 이름 지정",
+            custom_id=f"mogsearch:{state.session_id}:source_name_modal",
+        )
+        self.cog = cog
+        self.session_id = state.session_id
+        self.query = discord.ui.TextInput(
+            label="채널 또는 스레드 이름",
+            placeholder="예: 차원의 틈새, 차원의-틈새, 카페테리아",
+            required=True,
+            max_length=80,
+        )
+        self.add_item(self.query)
+
+    async def on_submit(self, interaction: discord.Interaction) -> None:
+        await self.cog.handle_source_name_modal(interaction, self.session_id, self.query.value)
+
+
 class SearchPanelView(discord.ui.View):
     def __init__(
         self,
@@ -146,27 +170,30 @@ class SearchPanelView(discord.ui.View):
         super().__init__(timeout=30 * 60)
         self.cog = cog
         self.session_id = state.session_id
-        self._add_button("단어 검색", "keyword", discord.ButtonStyle.primary, row=0)
-        self._add_button("채널 보기", "recent", discord.ButtonStyle.primary, row=0)
-        self._add_button("날짜 요약", "recap", discord.ButtonStyle.secondary, row=0)
-        self._add_button("토픽 검색", "topic", discord.ButtonStyle.secondary, row=0)
-        self._add_button("참여자 보기", "participants", discord.ButtonStyle.secondary, row=0)
+        self._add_button("단어 검색", "keyword", discord.ButtonStyle.primary, row=0, active=state.mode == "keyword")
+        self._add_button("날짜 요약", "recap", discord.ButtonStyle.secondary, row=0, active=state.mode == "recap")
+        self._add_button("토픽 검색", "topic", discord.ButtonStyle.secondary, row=0, active=state.mode == "topic")
+        self._add_button("참여자 보기", "participants", discord.ButtonStyle.secondary, row=0, active=state.mode == "participants")
 
-        self._add_button("오늘", "date_today", discord.ButtonStyle.secondary, row=1)
-        self._add_button("7일", "date_7d", discord.ButtonStyle.secondary, row=1)
-        self._add_button("30일", "date_30d", discord.ButtonStyle.secondary, row=1)
-        self._add_button("전체", "date_all", discord.ButtonStyle.secondary, row=1)
-        self._add_button("직접 기간", "date_custom", discord.ButtonStyle.secondary, row=1)
+        self._add_button("오늘", "date_today", discord.ButtonStyle.secondary, row=1, active=state.date_preset == "today")
+        self._add_button("7일", "date_7d", discord.ButtonStyle.secondary, row=1, active=state.date_preset == "7d")
+        self._add_button("30일", "date_30d", discord.ButtonStyle.secondary, row=1, active=state.date_preset == "30d")
+        self._add_button("전체", "date_all", discord.ButtonStyle.secondary, row=1, active=state.date_preset == "all")
+        self._add_button("직접 기간", "date_custom", discord.ButtonStyle.secondary, row=1, active=state.date_preset == "custom")
 
-        self._add_button("전체 범위", "scope_all", discord.ButtonStyle.secondary, row=2)
-        self._add_button("현재 채널", "scope_current", discord.ButtonStyle.secondary, row=2)
-        self._add_button("채널 ID", "scope_source_id", discord.ButtonStyle.secondary, row=2)
+        self._add_button("채널 보기", "recent_current", discord.ButtonStyle.primary, row=2, active=state.mode == "recent" and state.source_scope == "current_channel")
+        self._add_button("전체 범위", "scope_all", discord.ButtonStyle.secondary, row=2, active=state.source_scope == "all_indexed")
+        self._add_button("현재 채널", "scope_current", discord.ButtonStyle.secondary, row=2, active=state.source_scope == "current_channel")
+        self._add_button("채널 ID", "scope_source_id", discord.ButtonStyle.secondary, row=2, active=state.source_scope == "selected_sources" and state.source_selector == "id")
+        self._add_button("채널 이름", "scope_source_name", discord.ButtonStyle.secondary, row=2, active=state.source_scope == "selected_sources" and state.source_selector == "name")
+
         if isinstance(page, ResultPage) and page.results:
             self._add_button(
                 "이 스레드로 좁히기",
                 "scope_first_result",
                 discord.ButtonStyle.secondary,
-                row=2,
+                row=3,
+                active=state.source_scope == "selected_sources" and state.source_selector == "result",
                 extra={"source_id": page.results[0].source_id},
             )
         self._add_button(
@@ -183,6 +210,7 @@ class SearchPanelView(discord.ui.View):
             row=3,
             disabled=not (page and page.has_next),
         )
+        self._add_button("필터 리셋", "reset_filters", discord.ButtonStyle.secondary, row=4)
         self._add_button(
             "공개로 공유",
             "share",
@@ -200,11 +228,12 @@ class SearchPanelView(discord.ui.View):
         *,
         row: int,
         disabled: bool = False,
+        active: bool = False,
         extra: dict[str, Any] | None = None,
     ) -> None:
         button = discord.ui.Button(
             label=label,
-            style=style,
+            style=discord.ButtonStyle.success if active and not disabled else style,
             custom_id=f"mogsearch:{self.session_id}:{action}",
             row=row,
             disabled=disabled,
@@ -215,6 +244,7 @@ class SearchPanelView(discord.ui.View):
 
         button.callback = callback
         self.add_item(button)
+
 
 
 class MogIndexCommandsCog(commands.Cog):
@@ -276,15 +306,20 @@ class MogIndexCommandsCog(commands.Cog):
         if action == "scope_source_id":
             await interaction.response.send_modal(SourceIdModal(self, state))
             return
+        if action == "scope_source_name":
+            await interaction.response.send_modal(SourceNameModal(self, state))
+            return
         if action == "share":
             await self.share_current_page(interaction, state)
             return
-        if action == "close":
-            self.service.close_session(state)
-            await interaction.response.edit_message(content="검색 패널을 닫았습니다.", embed=None, view=None)
-            return
 
         try:
+            await self.defer_panel_update(interaction)
+            if action == "close":
+                self.service.close_session(state)
+                await interaction.edit_original_response(content="검색 패널을 닫았습니다.", embed=None, view=None)
+                return
+
             self.apply_action(state, action, extra)
             embed, view, _page = self.render_panel(state)
             self.service.save_session(state)
@@ -298,12 +333,13 @@ class MogIndexCommandsCog(commands.Cog):
                 state.date_preset,
                 state.page,
             )
-            await interaction.response.edit_message(embed=embed, view=view)
+            await interaction.edit_original_response(embed=embed, view=view)
         except ValueError as exc:
-            await interaction.response.send_message(str(exc), ephemeral=True)
+            await self.send_session_error(interaction, exc)
         except Exception as exc:
             logger.error("검색 패널 action 처리 실패: %s", exc, exc_info=True)
-            await interaction.response.send_message("검색 패널을 갱신하는 중 오류가 발생했습니다.", ephemeral=True)
+            await self.report_exception("검색 패널 action 처리 실패", exc, interaction=interaction, state=state, details={"action": action})
+            await self.send_user_message(interaction, "검색 패널을 갱신하는 중 오류가 발생했습니다.")
 
     def apply_action(self, state: SearchPanelState, action: str, extra: dict[str, Any]) -> None:
         if action == "recap":
@@ -312,9 +348,13 @@ class MogIndexCommandsCog(commands.Cog):
         elif action == "participants":
             state.mode = "participants"
             state.page = 0
-        elif action == "recent":
+        elif action in ("recent", "recent_current"):
+            if action == "recent_current":
+                self.service.set_scope(state, "current_channel")
             state.mode = "recent"
             state.page = 0
+        elif action == "reset_filters":
+            self.service.reset_filters(state)
         elif action.startswith("date_"):
             preset = {
                 "date_today": "today",
@@ -338,6 +378,7 @@ class MogIndexCommandsCog(commands.Cog):
             if not source_id:
                 raise ValueError("좁힐 스레드 정보를 찾지 못했습니다.")
             self.service.set_scope(state, "selected_sources", [source_id])
+            state.source_selector = "result"
         elif action == "prev":
             state.page = max(0, state.page - 1)
         elif action == "next":
@@ -353,6 +394,7 @@ class MogIndexCommandsCog(commands.Cog):
         query: str,
     ) -> None:
         try:
+            await self.defer_panel_update(interaction)
             state = self.service.load_session(session_id, str(interaction.user.id))
             state.query = query.strip()
             logger.info(
@@ -366,13 +408,13 @@ class MogIndexCommandsCog(commands.Cog):
             state.page = 0
             embed, view, _page = self.render_panel(state)
             self.service.save_session(state)
-            await interaction.response.edit_message(embed=embed, view=view)
+            await interaction.edit_original_response(embed=embed, view=view)
         except SearchSessionError as exc:
             await self.send_session_error(interaction, exc)
         except Exception as exc:
             logger.error("검색 modal 처리 실패: %s", exc, exc_info=True)
-            await interaction.response.send_message("검색어를 처리하는 중 오류가 발생했습니다.", ephemeral=True)
-
+            await self.report_exception("검색 modal 처리 실패", exc, interaction=interaction, details={"mode": mode})
+            await self.send_user_message(interaction, "검색어를 처리하는 중 오류가 발생했습니다.")
 
     async def handle_source_modal(
         self,
@@ -381,12 +423,14 @@ class MogIndexCommandsCog(commands.Cog):
         source_id: str,
     ) -> None:
         try:
+            await self.defer_panel_update(interaction)
             clean_source_id = source_id.strip()
             if not clean_source_id.isdigit():
                 raise ValueError("채널/스레드 ID는 숫자로 입력해주세요.")
             state = self.service.load_session(session_id, str(interaction.user.id))
             previous_mode = state.mode
             self.service.set_scope(state, "selected_sources", [clean_source_id])
+            state.source_selector = "id"
             matching_sources = self.service.count_matching_sources(state)
             logger.info(
                 "mogindex source modal user=%s session=%s source_id=%s matching_sources=%s previous_mode=%s",
@@ -403,12 +447,60 @@ class MogIndexCommandsCog(commands.Cog):
             state.page = 0
             embed, view, _page = self.render_panel(state)
             self.service.save_session(state)
-            await interaction.response.edit_message(embed=embed, view=view)
+            await interaction.edit_original_response(embed=embed, view=view)
         except (SearchSessionError, ValueError) as exc:
             await self.send_session_error(interaction, exc)
         except Exception as exc:
             logger.error("검색 채널 ID modal 처리 실패: %s", exc, exc_info=True)
-            await interaction.response.send_message("채널 ID를 처리하는 중 오류가 발생했습니다.", ephemeral=True)
+            await self.report_exception("검색 채널 ID modal 처리 실패", exc, interaction=interaction, details={"source_id": source_id})
+            await self.send_user_message(interaction, "채널 ID를 처리하는 중 오류가 발생했습니다.")
+
+    async def handle_source_name_modal(
+        self,
+        interaction: discord.Interaction,
+        session_id: str,
+        query: str,
+    ) -> None:
+        try:
+            await self.defer_panel_update(interaction)
+            clean_query = query.strip()
+            state = self.service.load_session(session_id, str(interaction.user.id))
+            matches = self.service.find_sources_by_name(clean_query)
+            if not matches:
+                raise ValueError(f"'{clean_query}'와 일치하는 색인 채널/스레드를 찾지 못했습니다.")
+            previous_mode = state.mode
+            source_ids = [match.source_id for match in matches]
+            self.service.set_scope(state, "selected_sources", source_ids)
+            state.source_selector = "name"
+            logger.info(
+                "mogindex source name modal user=%s session=%s query=%r matches=%s names=%s previous_mode=%s",
+                interaction.user.id,
+                session_id,
+                clean_query,
+                len(matches),
+                [match.name for match in matches[:5]],
+                previous_mode,
+            )
+            if previous_mode == "hub":
+                state.mode = "recent"
+                if state.date_preset == "30d":
+                    self.service.set_date_preset(state, "all")
+            state.page = 0
+            embed, view, _page = self.render_panel(state)
+            if len(matches) > 1:
+                embed.add_field(
+                    name="채널 이름 매칭",
+                    value=f"{len(matches)}개 source를 범위로 선택했습니다. 너무 넓으면 더 긴 이름으로 다시 지정해주세요.",
+                    inline=False,
+                )
+            self.service.save_session(state)
+            await interaction.edit_original_response(embed=embed, view=view)
+        except (SearchSessionError, ValueError) as exc:
+            await self.send_session_error(interaction, exc)
+        except Exception as exc:
+            logger.error("검색 채널 이름 modal 처리 실패: %s", exc, exc_info=True)
+            await self.report_exception("검색 채널 이름 modal 처리 실패", exc, interaction=interaction, details={"query": query})
+            await self.send_user_message(interaction, "채널 이름을 처리하는 중 오류가 발생했습니다.")
 
     async def handle_date_modal(
         self,
@@ -418,6 +510,7 @@ class MogIndexCommandsCog(commands.Cog):
         end_date: str,
     ) -> None:
         try:
+            await self.defer_panel_update(interaction)
             state = self.service.load_session(session_id, str(interaction.user.id))
             self.service.set_custom_dates(state, start_date, end_date)
             logger.info(
@@ -429,44 +522,99 @@ class MogIndexCommandsCog(commands.Cog):
             )
             embed, view, _page = self.render_panel(state)
             self.service.save_session(state)
-            await interaction.response.edit_message(embed=embed, view=view)
+            await interaction.edit_original_response(embed=embed, view=view)
         except (SearchSessionError, ValueError) as exc:
             await self.send_session_error(interaction, exc)
         except Exception as exc:
             logger.error("검색 기간 modal 처리 실패: %s", exc, exc_info=True)
-            await interaction.response.send_message("기간을 처리하는 중 오류가 발생했습니다.", ephemeral=True)
+            await self.report_exception("검색 기간 modal 처리 실패", exc, interaction=interaction, details={"start_date": start_date, "end_date": end_date})
+            await self.send_user_message(interaction, "기간을 처리하는 중 오류가 발생했습니다.")
 
     async def share_current_page(self, interaction: discord.Interaction, state: SearchPanelState) -> None:
         if state.mode == "hub":
-            await interaction.response.send_message("공유할 검색 결과가 없습니다.", ephemeral=True)
+            await self.send_user_message(interaction, "공유할 검색 결과가 없습니다.")
             return
         await interaction.response.defer(ephemeral=True, thinking=True)
-        embed, _view, page = self.render_panel(state, public=True)
-        if page is None:
-            await interaction.followup.send("공유할 검색 결과가 없습니다.", ephemeral=True)
-            return
-        channel = interaction.channel
-        if channel is None or not hasattr(channel, "send"):
-            await interaction.followup.send("이 채널에는 공개 메시지를 보낼 수 없습니다.", ephemeral=True)
-            return
-        await channel.send(embed=embed)
-        logger.info(
-            "mogindex shared session=%s user=%s mode=%s channel=%s",
-            state.session_id,
-            interaction.user.id,
-            state.mode,
-            getattr(channel, "id", None),
-        )
-        await interaction.followup.send("현재 결과 페이지를 공개로 공유했습니다.", ephemeral=True)
+        try:
+            embed, _view, page = self.render_panel(state, public=True)
+            if page is None:
+                await interaction.followup.send("공유할 검색 결과가 없습니다.", ephemeral=True)
+                return
+            channel = interaction.channel
+            if channel is None or not hasattr(channel, "send"):
+                await interaction.followup.send("이 채널에는 공개 메시지를 보낼 수 없습니다.", ephemeral=True)
+                return
+            await channel.send(embed=embed)
+            logger.info(
+                "mogindex shared session=%s user=%s mode=%s channel=%s",
+                state.session_id,
+                interaction.user.id,
+                state.mode,
+                getattr(channel, "id", None),
+            )
+            await interaction.followup.send("현재 결과 페이지를 공개로 공유했습니다.", ephemeral=True)
+        except Exception as exc:
+            logger.error("검색 결과 공유 실패: %s", exc, exc_info=True)
+            await self.report_exception("검색 결과 공유 실패", exc, interaction=interaction, state=state)
+            await self.send_user_message(interaction, "검색 결과를 공유하는 중 오류가 발생했습니다.")
+
+    async def defer_panel_update(self, interaction: discord.Interaction) -> None:
+        if not interaction.response.is_done():
+            await interaction.response.defer(thinking=False)
+
+    async def send_user_message(self, interaction: discord.Interaction, message: str) -> None:
+        try:
+            if interaction.response.is_done():
+                await interaction.followup.send(message, ephemeral=True)
+            else:
+                await interaction.response.send_message(message, ephemeral=True)
+        except discord.NotFound:
+            logger.warning("mogindex interaction response expired while sending message=%r", message)
 
     async def send_session_error(self, interaction: discord.Interaction, exc: Exception) -> None:
         message = str(exc)
         if isinstance(exc, SearchSessionExpired):
             message = "검색 패널이 만료되었습니다. `/검색`으로 다시 열어주세요."
-        if interaction.response.is_done():
-            await interaction.followup.send(message, ephemeral=True)
-        else:
-            await interaction.response.send_message(message, ephemeral=True)
+        await self.send_user_message(interaction, message)
+
+    async def report_exception(
+        self,
+        title: str,
+        exc: Exception,
+        *,
+        interaction: discord.Interaction | None = None,
+        state: SearchPanelState | None = None,
+        details: dict[str, Any] | None = None,
+    ) -> None:
+        if not ERROR_REPORT_THREAD_ID:
+            return
+        try:
+            target = self.bot.get_channel(ERROR_REPORT_THREAD_ID)
+            if target is None:
+                target = await self.bot.fetch_channel(ERROR_REPORT_THREAD_ID)
+            if target is None or not hasattr(target, "send"):
+                logger.warning("mogindex error report target unavailable thread_id=%s", ERROR_REPORT_THREAD_ID)
+                return
+
+            context_lines = [f"title={title}", f"error={type(exc).__name__}: {exc}"]
+            if interaction is not None:
+                context_lines.append(f"user={getattr(interaction.user, 'id', None)}")
+                context_lines.append(f"channel={interaction.channel_id}")
+                context_lines.append(f"guild={interaction.guild_id}")
+            if state is not None:
+                context_lines.append(
+                    "state="
+                    f"session={state.session_id} mode={state.mode} scope={state.source_scope} "
+                    f"sources={state.source_ids} preset={state.date_preset} page={state.page}"
+                )
+            if details:
+                context_lines.append(f"details={details}")
+            trace = "".join(traceback.format_exception(type(exc), exc, exc.__traceback__))
+            content = "**mogindex 오류 보고**\n" + "\n".join(context_lines)
+            content += "\n```py\n" + clip(trace, 1300) + "\n```"
+            await target.send(clip(content, 1900))
+        except Exception:
+            logger.error("mogindex error report failed", exc_info=True)
 
     def render_panel(
         self,
@@ -642,6 +790,7 @@ class MogIndexCommandsCog(commands.Cog):
     ) -> None:
         current = start_date
         while current >= end_date:
+            day_started = time.perf_counter()
             try:
                 after, before = discord_date_bounds(current, current, "Asia/Seoul")
                 targets = await gather_targets(
@@ -653,12 +802,13 @@ class MogIndexCommandsCog(commands.Cog):
                     thread_after=after,
                     thread_before=before,
                 )
-                conn = self.service.connect()
-                try:
-                    initialize_schema(conn)
-                    total_scanned = 0
-                    total_indexed = 0
-                    for target in targets:
+                total_scanned = 0
+                total_indexed = 0
+                target_elapsed_total = 0.0
+                for target in targets:
+                    target_started = time.perf_counter()
+                    conn = self.service.connect()
+                    try:
                         scanned, indexed = await collect_source(
                             conn,
                             target,
@@ -669,23 +819,45 @@ class MogIndexCommandsCog(commands.Cog):
                             limit=None,
                             dry_run=False,
                         )
-                        total_scanned += scanned
-                        total_indexed += indexed
+                    finally:
+                        conn.close()
+                    target_elapsed = time.perf_counter() - target_started
+                    target_elapsed_total += target_elapsed
+                    total_scanned += scanned
+                    total_indexed += indexed
                     logger.info(
-                        "mogindex full-index day=%s targets=%s scanned=%s indexed=%s requested_by=%s",
+                        "mogindex full-index target day=%s source=%s name=%s scanned=%s indexed=%s elapsed=%.2fs",
                         current,
-                        len(targets),
-                        total_scanned,
-                        total_indexed,
-                        requested_by,
+                        getattr(target, "id", None),
+                        getattr(target, "name", None),
+                        scanned,
+                        indexed,
+                        target_elapsed,
                     )
-                finally:
-                    conn.close()
+                    await asyncio.sleep(0)
+                day_elapsed = time.perf_counter() - day_started
+                avg_target_elapsed = target_elapsed_total / len(targets) if targets else 0.0
+                logger.info(
+                    "mogindex full-index day=%s targets=%s scanned=%s indexed=%s elapsed=%.2fs avg_target=%.2fs requested_by=%s",
+                    current,
+                    len(targets),
+                    total_scanned,
+                    total_indexed,
+                    day_elapsed,
+                    avg_target_elapsed,
+                    requested_by,
+                )
             except asyncio.CancelledError:
                 logger.warning("mogindex full-index cancelled day=%s requested_by=%s", current, requested_by)
                 raise
             except Exception as exc:
-                logger.error("mogindex full-index day failed day=%s error=%s", current, exc, exc_info=True)
+                day_elapsed = time.perf_counter() - day_started
+                logger.error("mogindex full-index day failed day=%s elapsed=%.2fs error=%s", current, day_elapsed, exc, exc_info=True)
+                await self.report_exception(
+                    "전체색인 하루 처리 실패",
+                    exc,
+                    details={"day": str(current), "elapsed_seconds": round(day_elapsed, 2), "requested_by": requested_by},
+                )
             if current == end_date:
                 break
             current -= timedelta(days=1)

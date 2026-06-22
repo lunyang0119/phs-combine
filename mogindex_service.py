@@ -3,7 +3,9 @@ from __future__ import annotations
 import json
 import logging
 import os
+import re
 import sqlite3
+import time
 import uuid
 from collections import Counter, defaultdict
 from contextlib import contextmanager
@@ -22,6 +24,7 @@ DEFAULT_DB_PATH = Path(
 SESSION_TTL_MINUTES = 30
 KST = ZoneInfo("Asia/Seoul")
 logger = logging.getLogger(__name__)
+LOCK_RETRY_DELAYS = (0.0, 0.1, 0.25, 0.5)
 
 Mode = Literal["hub", "keyword", "recap", "topic", "participants", "recent"]
 Visibility = Literal["private", "shared"]
@@ -60,6 +63,7 @@ class SearchPanelState:
     date_preset: DatePreset = "30d"
     source_scope: SourceScope = "all_indexed"
     source_ids: list[str] = field(default_factory=list)
+    source_selector: str | None = None
     author_ids: list[str] = field(default_factory=list)
     sort: SortMode = "relevance"
     page: int = 0
@@ -110,6 +114,14 @@ class ParticipantsResult:
     author_id: str
     author_name: str
     message_count: int
+
+
+@dataclass
+class SourceMatch:
+    source_id: str
+    source_kind: str
+    parent_channel_id: str | None
+    name: str
 
 
 @dataclass
@@ -165,6 +177,10 @@ def validate_date(raw: str) -> str:
         return date.fromisoformat(raw.strip()).isoformat()
     except ValueError as exc:
         raise ValueError("날짜는 YYYY-MM-DD 형식으로 입력해주세요.") from exc
+
+
+def source_lookup_key(text: str) -> str:
+    return re.sub(r"\s+", "", normalize_text(text))
 
 
 def initialize_service_schema(conn: sqlite3.Connection) -> None:
@@ -252,8 +268,13 @@ class MogIndexService:
 
     def connect(self) -> sqlite3.Connection:
         conn = connect(self.db_path)
-        initialize_service_schema(conn)
-        return conn
+        try:
+            conn.execute("PRAGMA busy_timeout = 5000")
+            initialize_service_schema(conn)
+            return conn
+        except Exception:
+            conn.close()
+            raise
 
     @contextmanager
     def open(self) -> Iterator[sqlite3.Connection]:
@@ -277,9 +298,34 @@ class MogIndexService:
         self.save_session(state)
         return state
 
+    def _write_with_retry(self, label: str, callback: Any) -> Any:
+        last_exc: sqlite3.OperationalError | None = None
+        for attempt, delay in enumerate(LOCK_RETRY_DELAYS, start=1):
+            if delay:
+                time.sleep(delay)
+            try:
+                with self.open() as conn:
+                    result = callback(conn)
+                    conn.commit()
+                    return result
+            except sqlite3.OperationalError as exc:
+                if "locked" not in str(exc).lower():
+                    raise
+                last_exc = exc
+                logger.warning(
+                    "mogindex db locked during %s attempt=%s/%s",
+                    label,
+                    attempt,
+                    len(LOCK_RETRY_DELAYS),
+                )
+        if last_exc:
+            raise last_exc
+        return None
+
     def save_session(self, state: SearchPanelState) -> None:
         state.updated_at = now_iso()
-        with self.open() as conn:
+
+        def write(conn: sqlite3.Connection) -> None:
             conn.execute(
                 """
                 INSERT INTO search_sessions (
@@ -303,7 +349,8 @@ class MogIndexService:
                     state.expires_at,
                 ),
             )
-            conn.commit()
+
+        self._write_with_retry("save_session", write)
 
     def load_session(self, session_id: str, user_id: str) -> SearchPanelState:
         with self.open() as conn:
@@ -321,9 +368,27 @@ class MogIndexService:
         return state
 
     def close_session(self, state: SearchPanelState) -> None:
-        with self.open() as conn:
+        def write(conn: sqlite3.Connection) -> None:
             conn.execute("DELETE FROM search_sessions WHERE session_id = ?", (state.session_id,))
-            conn.commit()
+
+        self._write_with_retry("close_session", write)
+
+    def reset_filters(self, state: SearchPanelState) -> SearchPanelState:
+        state.mode = "hub"
+        state.visibility = "private"
+        state.query = None
+        state.start_date = None
+        state.end_date = None
+        state.date_preset = "30d"
+        state.source_scope = "all_indexed"
+        state.source_ids = []
+        state.source_selector = None
+        state.author_ids = []
+        state.sort = "relevance"
+        state.page = 0
+        state.last_result_kind = None
+        state.last_result_ids = []
+        return state
 
     def set_date_preset(self, state: SearchPanelState, preset: DatePreset) -> SearchPanelState:
         state.date_preset = preset
@@ -347,6 +412,8 @@ class MogIndexService:
     def set_scope(self, state: SearchPanelState, scope: SourceScope, source_ids: Iterable[str] = ()) -> SearchPanelState:
         state.source_scope = scope
         state.source_ids = list(dict.fromkeys(str(source_id) for source_id in source_ids if source_id))
+        if scope != "selected_sources":
+            state.source_selector = None
         state.page = 0
         logger.info(
             "mogindex scope updated session=%s scope=%s source_ids=%s",
@@ -371,6 +438,38 @@ class MogIndexService:
                 tuple(source_ids) + tuple(source_ids),
             ).fetchone()
         return int(row["count"] if row else 0)
+
+    def find_sources_by_name(self, query: str, *, limit: int = 25) -> list[SourceMatch]:
+        needle = source_lookup_key(query)
+        if not needle:
+            return []
+        with self.open() as conn:
+            rows = conn.execute(
+                """
+                SELECT source_id, source_kind, parent_channel_id, name
+                FROM sources
+                WHERE active = 1
+                ORDER BY
+                    CASE source_kind WHEN 'channel' THEN 0 ELSE 1 END,
+                    updated_at DESC,
+                    name
+                """
+            ).fetchall()
+        matches: list[SourceMatch] = []
+        for row in rows:
+            if needle not in source_lookup_key(row["name"]):
+                continue
+            matches.append(
+                SourceMatch(
+                    source_id=row["source_id"],
+                    source_kind=row["source_kind"],
+                    parent_channel_id=row["parent_channel_id"],
+                    name=row["name"],
+                )
+            )
+            if len(matches) >= limit:
+                break
+        return matches
 
     def _keyword_rankings(self, conn: sqlite3.Connection, query: str) -> Counter[int]:
         normalized = normalize_text(query)
