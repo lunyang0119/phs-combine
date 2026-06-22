@@ -47,6 +47,10 @@ def env_int(name: str, default: int) -> int:
 FULL_INDEX_SLOW_DAY_SECONDS = env_int("FULL_INDEX_SLOW_DAY_SECONDS", 180)
 # Rest duration after a slow full-index day.
 FULL_INDEX_REST_SECONDS = env_int("FULL_INDEX_REST_SECONDS", 120)
+# Retry transient Discord 5xx/network failures while indexing a single source.
+FULL_INDEX_DISCORD_RETRY_ATTEMPTS = env_int("FULL_INDEX_DISCORD_RETRY_ATTEMPTS", 4)
+# Base delay; actual delay is this value multiplied by the retry number.
+FULL_INDEX_DISCORD_RETRY_SECONDS = env_int("FULL_INDEX_DISCORD_RETRY_SECONDS", 15)
 
 
 DEBUG_GUILD_ID = os.getenv("PHS_GUILD_ID")

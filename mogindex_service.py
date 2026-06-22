@@ -254,6 +254,8 @@ def initialize_service_schema(conn: sqlite3.Connection) -> None:
     ensure_column(conn, "full_index_runs", "category_id", "category_id TEXT")
     ensure_column(conn, "full_index_runs", "category_name", "category_name TEXT")
     ensure_column(conn, "full_index_runs", "target_config_json", "target_config_json TEXT")
+    ensure_column(conn, "full_index_runs", "run_kind", "run_kind TEXT")
+    ensure_column(conn, "full_index_runs", "schedule_key", "schedule_key TEXT")
     conn.execute(
         "CREATE INDEX IF NOT EXISTS idx_full_index_runs_status_created "
         "ON full_index_runs(status, created_at DESC)"
@@ -683,6 +685,28 @@ class MogIndexService:
                 ranked[int(row["message_pk"])] += int(row["score"] or 0)
         return ranked
 
+    def _filtered_message_rankings(self, conn: sqlite3.Connection, state: SearchPanelState) -> Counter[int]:
+        filters, params = make_filter_sql(
+            state,
+            date_column="m.message_date",
+            source_column="m.source_id",
+            source_parent_column="s.parent_channel_id",
+            author_column="m.author_id",
+            result_column="m.message_pk",
+        )
+        where_sql = " AND ".join(filters) if filters else "1 = 1"
+        rows = conn.execute(
+            f"""
+            SELECT m.message_pk
+            FROM messages m
+            JOIN sources s ON s.source_id = m.source_id
+            WHERE {where_sql}
+            LIMIT 5000
+            """,
+            tuple(params),
+        ).fetchall()
+        return Counter({int(row["message_pk"]): 0 for row in rows})
+
     def _combined_keyword_rankings(self, conn: sqlite3.Connection, state: SearchPanelState) -> tuple[str, Counter[int]]:
         all_parts = split_query_parts(state.keyword_all)
         any_parts = split_query_parts(state.keyword_any)
@@ -697,6 +721,14 @@ class MogIndexService:
             ) if part
         ) or (state.query or "")
         if not all_parts and not any_parts:
+            if not_parts:
+                ranked = self._filtered_message_rankings(conn, state)
+                excluded_ids: set[int] = set()
+                for part in not_parts:
+                    excluded_ids.update(self._keyword_rankings(conn, part))
+                for message_pk in excluded_ids:
+                    ranked.pop(message_pk, None)
+                return display_query, ranked
             return display_query, Counter()
 
         ranked: Counter[int] = Counter()
@@ -769,6 +801,9 @@ class MogIndexService:
                 tuple(ranked.keys()) + tuple(params),
             ).fetchall()
 
+        positive_query_parts = split_query_parts(state.keyword_all) or split_query_parts(state.keyword_any)
+        if not positive_query_parts and state.query:
+            positive_query_parts = [state.query]
         results = [
             SearchResult(
                 message_pk=int(row["message_pk"]),
@@ -783,7 +818,7 @@ class MogIndexService:
             )
             for row in rows
         ]
-        if state.sort == "newest":
+        if state.sort == "newest" or not positive_query_parts:
             results.sort(key=lambda item: item.created_at, reverse=True)
         elif state.sort == "oldest":
             results.sort(key=lambda item: item.created_at)

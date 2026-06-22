@@ -17,6 +17,8 @@ from discord import app_commands
 from discord.ext import commands
 
 from mogindex_debug import (
+    FULL_INDEX_DISCORD_RETRY_ATTEMPTS,
+    FULL_INDEX_DISCORD_RETRY_SECONDS,
     FULL_INDEX_REST_SECONDS,
     FULL_INDEX_SLOW_DAY_SECONDS,
     connect as index_connect,
@@ -43,8 +45,43 @@ from mogindex_service import (
 
 
 logger = logging.getLogger(__name__)
+
+
+def env_bool(name: str, default: bool) -> bool:
+    raw = os.getenv(name)
+    if raw is None:
+        return default
+    return raw.strip().lower() not in {"0", "false", "no", "off"}
+
+
+def env_int(name: str, default: int) -> int:
+    raw = os.getenv(name)
+    if raw is None or not raw.strip():
+        return default
+    try:
+        return int(raw.strip())
+    except ValueError:
+        logger.warning("mogindex invalid integer env %s=%r; using %s", name, raw, default)
+        return default
+
+
+def env_csv(name: str, default: tuple[str, ...]) -> tuple[str, ...]:
+    raw = os.getenv(name)
+    if raw is None:
+        return default
+    values = tuple(part.strip() for part in raw.split(",") if part.strip())
+    return values or default
+
+
 ERROR_REPORT_THREAD_ID = os.getenv("PHS_INDEX_ERROR_THREAD_ID")
 INDEX_CATEGORY_ENV = "PHS_INDEX_CATEGORIES_JSON"
+DAILY_INDEX_ENABLED = env_bool("PHS_INDEX_DAILY_ENABLED", True)
+DAILY_INDEX_HOUR = max(0, min(23, env_int("PHS_INDEX_DAILY_HOUR", 23)))
+DAILY_INDEX_MINUTE = max(0, min(59, env_int("PHS_INDEX_DAILY_MINUTE", 59)))
+DAILY_INDEX_CATEGORY_NAMES = env_csv("PHS_INDEX_DAILY_CATEGORIES", ("메인 메뉴", "월드 맵", "커스텀 모드"))
+DAILY_INDEX_GUILD_ID = os.getenv("PHS_GUILD_ID")
+DAILY_INDEX_RUN_KIND = "daily"
+DAILY_INDEX_SCHEDULE_KEY = "daily-2359"
 FULL_INDEX_DEFAULT_OLDEST_DATE = date(2025, 10, 20)
 
 
@@ -132,6 +169,12 @@ def parse_full_index_date(raw: str, default: date) -> date:
     raise ValueError("날짜는 YY.M.D, YY.MM.DD 또는 YYYY-MM-DD 형식으로 입력해주세요.")
 
 
+
+def parse_optional_search_date(raw: str | None) -> str | None:
+    value = (raw or "").strip()
+    if not value:
+        return None
+    return parse_full_index_date(value, now_kst().date()).isoformat()
 class KeywordSearchModal(discord.ui.Modal):
     def __init__(self, cog: "MogIndexCommandsCog", state: SearchPanelState):
         super().__init__(
@@ -487,6 +530,7 @@ class MogIndexCommandsCog(commands.Cog):
         self.bot = bot
         self.service = MogIndexService()
         self.full_index_task: asyncio.Task | None = None
+        self.daily_index_task: asyncio.Task | None = None
         self.index_categories = parse_index_categories()
         self.category_by_key = {category.key: category for category in self.index_categories}
         logger.info(
@@ -494,6 +538,24 @@ class MogIndexCommandsCog(commands.Cog):
             INDEX_CATEGORY_ENV,
             [(category.key, category.name, category.category_id, len(category.parent_channel_ids)) for category in self.index_categories],
         )
+
+    async def cog_load(self) -> None:
+        if DAILY_INDEX_ENABLED:
+            self.daily_index_task = asyncio.create_task(self.daily_index_scheduler())
+            logger.info(
+                "mogindex daily index scheduler enabled time=%02d:%02d categories=%s",
+                DAILY_INDEX_HOUR,
+                DAILY_INDEX_MINUTE,
+                DAILY_INDEX_CATEGORY_NAMES,
+            )
+        else:
+            logger.info("mogindex daily index scheduler disabled")
+
+    def cog_unload(self) -> None:
+        if self.daily_index_task and not self.daily_index_task.done():
+            self.daily_index_task.cancel()
+        if self.full_index_task and not self.full_index_task.done():
+            self.full_index_task.cancel()
 
     def get_category(self, key: str | None) -> IndexCategoryConfig | None:
         if not key or key == "all":
@@ -505,6 +567,29 @@ class MogIndexCommandsCog(commands.Cog):
         if category:
             return [category]
         return list(self.index_categories)
+
+    def category_match_key(self, value: str) -> str:
+        return re.sub(r"[\s\-_]+", "", value).lower()
+
+    def daily_index_categories(self) -> list[IndexCategoryConfig]:
+        wanted = {self.category_match_key(name) for name in DAILY_INDEX_CATEGORY_NAMES}
+        selected = []
+        for category in self.index_categories:
+            keys = {
+                self.category_match_key(category.key),
+                self.category_match_key(category.name),
+                self.category_match_key(category.category_id),
+            }
+            if keys & wanted:
+                selected.append(category)
+        return selected
+
+    def scheduler_guild_id(self) -> str | None:
+        if DAILY_INDEX_GUILD_ID:
+            return DAILY_INDEX_GUILD_ID
+        if len(self.bot.guilds) == 1:
+            return str(self.bot.guilds[0].id)
+        return None
 
     def target_config_json(self, categories: list[IndexCategoryConfig]) -> str:
         return json.dumps([category.to_dict() for category in categories], ensure_ascii=False, separators=(",", ":"))
@@ -547,6 +632,131 @@ class MogIndexCommandsCog(commands.Cog):
         )
         embed, view, _page = self.render_panel(state)
         await interaction.response.send_message(embed=embed, view=view, ephemeral=True)
+
+    @app_commands.command(name="고오급검색", description="옵션을 직접 입력해 색인 검색을 실행합니다.")
+    @app_commands.describe(
+        keyword="하나라도 포함할 검색어",
+        all_terms="반드시 모두 포함할 검색어",
+        not_terms="결과에서 제외할 검색어",
+        location="채널/스레드 ID 또는 이름",
+        category="카테고리 key, 이름 또는 ID",
+        period="검색 기간 preset",
+        start_date="시작일: YY.M.D, YY.MM.DD, YYYY-MM-DD",
+        end_date="종료일: YY.M.D, YY.MM.DD, YYYY-MM-DD",
+        sort="정렬 방식",
+        result_set="검색 결과 안 검색 세션 ID",
+        public="결과를 공개 메시지로 표시할지 여부",
+    )
+    @app_commands.rename(
+        keyword="키워드",
+        all_terms="반드시포함",
+        not_terms="제외",
+        location="위치",
+        category="카테고리",
+        period="기간",
+        start_date="시작일",
+        end_date="종료일",
+        sort="정렬",
+        result_set="결과세트",
+        public="공개",
+    )
+    @app_commands.choices(
+        period=[
+            app_commands.Choice(name="오늘", value="today"),
+            app_commands.Choice(name="7일", value="7d"),
+            app_commands.Choice(name="30일", value="30d"),
+            app_commands.Choice(name="전체", value="all"),
+        ],
+        sort=[
+            app_commands.Choice(name="관련도", value="relevance"),
+            app_commands.Choice(name="최신순", value="newest"),
+            app_commands.Choice(name="오래된순", value="oldest"),
+        ],
+    )
+    async def advanced_search(
+        self,
+        interaction: discord.Interaction,
+        keyword: str | None = None,
+        all_terms: str | None = None,
+        not_terms: str | None = None,
+        location: str | None = None,
+        category: str | None = None,
+        period: app_commands.Choice[str] | None = None,
+        start_date: str | None = None,
+        end_date: str | None = None,
+        sort: app_commands.Choice[str] | None = None,
+        result_set: str | None = None,
+        public: bool = False,
+    ) -> None:
+        if not interaction.guild_id:
+            await interaction.response.send_message("서버 안에서만 사용할 수 있습니다.", ephemeral=True)
+            return
+        await interaction.response.defer(ephemeral=not public, thinking=True)
+        state: SearchPanelState | None = None
+        try:
+            state = self.service.create_session(interaction)
+            state.worldmap_category_ids = [category_config.category_id for category_config in self.index_categories if category_config.worldmap]
+
+            has_keyword = bool((keyword or "").strip() or (all_terms or "").strip() or (not_terms or "").strip())
+            if has_keyword:
+                self.service.set_keywords(state, all_terms=all_terms, any_terms=keyword, not_terms=not_terms)
+            else:
+                state.mode = "recent"
+
+            base_result_ids = self.resolve_result_set_ids(result_set, str(interaction.user.id))
+            if base_result_ids:
+                state.panel_kind = "detail"
+                self.service.set_scope(state, "result_set", base_result_ids=base_result_ids)
+
+            category_ids = self.resolve_search_category_ids(category)
+            source_ids = self.resolve_search_source_ids(location)
+            if source_ids:
+                state.source_ids = source_ids
+                state.source_selector = "advanced"
+                if state.source_scope != "result_set":
+                    self.service.set_scope(state, "selected_sources", source_ids)
+            elif category_ids:
+                state.category_ids = category_ids
+                if state.source_scope != "result_set":
+                    self.service.set_scope(state, "selected_categories", category_ids=category_ids)
+
+            parsed_start = parse_optional_search_date(start_date)
+            parsed_end = parse_optional_search_date(end_date)
+            if parsed_start or parsed_end:
+                if parsed_start and parsed_end and parsed_start > parsed_end:
+                    raise ValueError("시작일은 종료일보다 늦을 수 없습니다.")
+                state.date_preset = "custom"
+                state.start_date = parsed_start
+                state.end_date = parsed_end
+                state.page = 0
+            elif period:
+                self.service.set_date_preset(state, period.value)  # type: ignore[arg-type]
+
+            if sort:
+                state.sort = sort.value  # type: ignore[assignment]
+            state.page = 0
+            self.service.save_session(state)
+
+            embed, view, page = self.render_panel(state, public=public)
+            await interaction.followup.send(embed=embed, view=None if public else view, ephemeral=not public)
+            logger.info(
+                "mogindex advanced search user=%s session=%s mode=%s category_ids=%s source_ids=%s period=%s sort=%s public=%s total=%s",
+                interaction.user.id,
+                state.session_id,
+                state.mode,
+                state.category_ids,
+                state.source_ids,
+                state.date_preset,
+                state.sort,
+                public,
+                getattr(page, "total", None),
+            )
+        except ValueError as exc:
+            await interaction.followup.send(str(exc), ephemeral=True)
+        except Exception as exc:
+            logger.error("고오급검색 처리 실패: %s", exc, exc_info=True)
+            await self.report_exception("고오급검색 처리 실패", exc, interaction=interaction, state=state)
+            await interaction.followup.send("고오급검색을 처리하는 중 오류가 발생했습니다.", ephemeral=True)
 
     async def handle_action(
         self,
@@ -1015,8 +1225,25 @@ class MogIndexCommandsCog(commands.Cog):
             options.append(discord.SelectOption(label=str(getattr(thread, "name", thread.id))[:100], value=str(thread.id)))
         return options
 
+    def export_period_label(self, preset: str) -> str:
+        return {
+            "today": "오늘",
+            "7d": "7일",
+            "30d": "30일",
+            "all": "전체",
+        }.get(preset, preset)
+
+    def export_sort_label(self, sort: str) -> str:
+        return {
+            "relevance": "관련도",
+            "newest": "최신순",
+            "oldest": "오래된순",
+        }.get(sort, sort)
+
     def export_search_command(self, state: SearchPanelState) -> str:
         parts = ["/고오급검색"]
+        if state.source_scope == "result_set" and state.base_result_ids:
+            parts.append(f"결과세트:{state.session_id}")
         if state.keyword_all:
             parts.append(f"반드시포함:{state.keyword_all}")
         if state.keyword_any or state.query:
@@ -1031,11 +1258,74 @@ class MogIndexCommandsCog(commands.Cog):
             parts.append(f"시작일:{state.start_date or ''}")
             parts.append(f"종료일:{state.end_date or ''}")
         elif state.date_preset:
-            parts.append(f"기간:{state.date_preset}")
-        parts.append(f"정렬:{state.sort}")
+            parts.append(f"기간:{self.export_period_label(state.date_preset)}")
+        parts.append(f"정렬:{self.export_sort_label(state.sort)}")
         newline = chr(10)
         fence = chr(96) * 3
         return "검색 명령어 내보내기" + newline + fence + newline + " ".join(parts) + newline + fence
+
+    def resolve_result_set_ids(self, raw: str | None, user_id: str) -> list[int]:
+        value = (raw or "").strip()
+        if not value:
+            return []
+        try:
+            source_state = self.service.load_session(value, user_id)
+        except SearchSessionError as exc:
+            raise ValueError("결과세트가 만료되었거나 접근할 수 없습니다. `/검색`으로 다시 결과 안 검색을 열어주세요.") from exc
+        result_ids = source_state.base_result_ids if source_state.source_scope == "result_set" else source_state.last_result_ids
+        if not result_ids:
+            raise ValueError("결과세트에 저장된 검색 결과가 없습니다. 결과가 있는 패널에서 명령어를 다시 내보내주세요.")
+        return result_ids
+
+    def resolve_search_category_ids(self, raw: str | None) -> list[str]:
+        value = (raw or "").strip()
+        if not value or value in ("전체", "전체 카테고리", "all"):
+            return []
+        resolved: list[str] = []
+        missing: list[str] = []
+        parts = [part.strip() for part in value.split(",") if part.strip()] or [value]
+        for part in parts:
+            matched = None
+            if part in self.category_by_key:
+                matched = self.category_by_key[part]
+            else:
+                for category in self.index_categories:
+                    if category.name == part or category.category_id == part:
+                        matched = category
+                        break
+            if matched:
+                resolved.append(matched.category_id)
+            elif part.isdigit():
+                resolved.append(part)
+            else:
+                missing.append(part)
+        if missing:
+            raise ValueError("카테고리를 찾지 못했습니다: " + ", ".join(missing))
+        return list(dict.fromkeys(resolved))
+
+    def resolve_search_source_ids(self, raw: str | None) -> list[str]:
+        value = (raw or "").strip()
+        if not value:
+            return []
+        id_parts = [part.strip() for part in re.split(r"[,\s]+", value) if part.strip()]
+        if id_parts and all(part.isdigit() for part in id_parts):
+            return list(dict.fromkeys(id_parts))
+
+        resolved: list[str] = []
+        missing: list[str] = []
+        parts = [part.strip() for part in value.split(",") if part.strip()] or [value]
+        for part in parts:
+            if part.isdigit():
+                resolved.append(part)
+                continue
+            matches = self.service.find_sources_by_name(part)
+            if not matches:
+                missing.append(part)
+                continue
+            resolved.extend(match.source_id for match in matches)
+        if missing:
+            raise ValueError("위치와 일치하는 색인 채널/스레드를 찾지 못했습니다: " + ", ".join(missing))
+        return list(dict.fromkeys(resolved))
 
     async def share_current_page(self, interaction: discord.Interaction, state: SearchPanelState) -> None:
         if state.mode == "hub":
@@ -1151,7 +1441,7 @@ class MogIndexCommandsCog(commands.Cog):
         embed = discord.Embed(title=title, color=discord.Color.dark_teal())
         embed.description = self.make_description(state, page)
         matching_sources = None
-        if state.source_scope != "all_indexed":
+        if state.source_scope not in ("all_indexed", "result_set"):
             try:
                 matching_sources = self.service.count_matching_sources(state)
                 if matching_sources == 0:
@@ -1454,6 +1744,8 @@ class MogIndexCommandsCog(commands.Cog):
         notify_channel_id: str | None,
         notify_user_id: str | None,
         categories: list[IndexCategoryConfig],
+        run_kind: str = "manual",
+        schedule_key: str | None = None,
     ) -> str:
         run_id = uuid.uuid4().hex
         now = now_kst().isoformat()
@@ -1464,9 +1756,9 @@ class MogIndexCommandsCog(commands.Cog):
                     run_id, guild_id, requested_by, status, start_date, end_date,
                     current_date, last_completed_date, notify_channel_id, notify_user_id,
                     category_key, category_id, category_name, target_config_json,
-                    created_at, updated_at, finished_at
+                    run_kind, schedule_key, created_at, updated_at, finished_at
                 )
-                VALUES (?, ?, ?, 'running', ?, ?, ?, NULL, ?, ?, ?, ?, ?, ?, ?, ?, NULL)
+                VALUES (?, ?, ?, 'running', ?, ?, ?, NULL, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL)
                 """,
                 (
                     run_id,
@@ -1481,6 +1773,8 @@ class MogIndexCommandsCog(commands.Cog):
                     None if len(categories) != 1 else categories[0].category_id,
                     "전체 카테고리" if len(categories) != 1 else categories[0].name,
                     self.target_config_json(categories),
+                    run_kind,
+                    schedule_key,
                     now,
                     now,
                 ),
@@ -1530,17 +1824,25 @@ class MogIndexCommandsCog(commands.Cog):
         requested_by: str,
         notify_channel_id: str | None,
         notify_user_id: str | None,
+        run_kind: str = "manual",
+        schedule_key: str | None = None,
     ) -> tuple[str, date, date, str, str, str | None, str | None, list[IndexCategoryConfig]] | None:
         now = now_kst().isoformat()
+        where = ["status IN ('running', 'interrupted', 'failed')", "COALESCE(run_kind, 'manual') = ?"]
+        params: list[Any] = [run_kind]
+        if schedule_key is not None:
+            where.append("schedule_key = ?")
+            params.append(schedule_key)
         with self.service.open() as conn:
             row = conn.execute(
-                """
+                f"""
                 SELECT *
                 FROM full_index_runs
-                WHERE status IN ('running', 'interrupted', 'failed')
+                WHERE {' AND '.join(where)}
                 ORDER BY created_at DESC
                 LIMIT 1
-                """
+                """,
+                params,
             ).fetchone()
             if row is None:
                 return None
@@ -1753,6 +2055,159 @@ class MogIndexCommandsCog(commands.Cog):
             )
             conn.commit()
 
+    def is_transient_discord_error(self, exc: Exception) -> bool:
+        if isinstance(exc, (asyncio.TimeoutError, TimeoutError, ConnectionError)):
+            return True
+        if isinstance(exc, discord.HTTPException):
+            status = getattr(exc, "status", None)
+            code = getattr(exc, "code", None)
+            return code == 0 or status in {500, 502, 503, 504}
+        return False
+
+    async def collect_source_with_retry(
+        self,
+        target: Any,
+        *,
+        guild_id: str,
+        category_id: str,
+        after: Any,
+        before: Any,
+    ) -> tuple[int, int]:
+        attempts = max(1, FULL_INDEX_DISCORD_RETRY_ATTEMPTS)
+        for attempt in range(1, attempts + 1):
+            conn = None
+            try:
+                conn = self.service.connect()
+                return await collect_source(
+                    conn,
+                    target,
+                    guild_id=guild_id,
+                    category_id=category_id,
+                    after=after,
+                    before=before,
+                    limit=None,
+                    dry_run=False,
+                )
+            except Exception as exc:
+                if not self.is_transient_discord_error(exc) or attempt >= attempts:
+                    raise
+                delay = FULL_INDEX_DISCORD_RETRY_SECONDS * attempt
+                logger.warning(
+                    "mogindex full-index transient Discord error; retrying source=%s name=%s attempt=%s/%s delay=%ss error=%s",
+                    getattr(target, "source_id", None),
+                    getattr(target, "name", None),
+                    attempt,
+                    attempts,
+                    delay,
+                    exc,
+                    exc_info=True,
+                )
+                if conn is not None:
+                    conn.close()
+                    conn = None
+                await asyncio.sleep(delay)
+            finally:
+                if conn is not None:
+                    conn.close()
+        raise RuntimeError("unreachable full-index retry state")
+
+    def seconds_until_daily_index(self) -> float:
+        now = now_kst()
+        target = now.replace(hour=DAILY_INDEX_HOUR, minute=DAILY_INDEX_MINUTE, second=0, microsecond=0)
+        if target <= now:
+            target += timedelta(days=1)
+        return max(1.0, (target - now).total_seconds())
+
+    async def daily_index_scheduler(self) -> None:
+        await self.bot.wait_until_ready()
+        while not self.bot.is_closed():
+            delay = self.seconds_until_daily_index()
+            logger.info("mogindex daily index scheduler sleeping %.0fs", delay)
+            try:
+                await asyncio.sleep(delay)
+                await self.start_daily_index_if_possible()
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                logger.error("mogindex daily index scheduler failed: %s", exc, exc_info=True)
+                await self.report_exception("자동 일일 색인 스케줄러 실패", exc)
+
+    async def start_daily_index_if_possible(self) -> None:
+        if self.full_index_task and not self.full_index_task.done():
+            logger.info("mogindex daily index skipped because full-index task is already running")
+            return
+        target_categories = self.daily_index_categories()
+        if not target_categories:
+            logger.warning("mogindex daily index skipped because no configured categories matched %s", DAILY_INDEX_CATEGORY_NAMES)
+            return
+        guild_id = self.scheduler_guild_id()
+        if not guild_id:
+            logger.warning("mogindex daily index skipped because guild id is unavailable")
+            return
+
+        self.mark_interrupted_full_index_runs()
+        resume = self.get_full_index_resume_plan(
+            requested_by="auto-daily",
+            notify_channel_id=None,
+            notify_user_id=None,
+            run_kind=DAILY_INDEX_RUN_KIND,
+            schedule_key=DAILY_INDEX_SCHEDULE_KEY,
+        )
+        if resume is not None:
+            run_id, start_date, end_date, resume_guild_id, requested_by, notify_channel_id, notify_user_id, resume_categories = resume
+            if start_date >= end_date:
+                self.full_index_task = asyncio.create_task(
+                    self.run_full_index_job(
+                        run_id=run_id,
+                        guild_id=resume_guild_id,
+                        requested_by=requested_by,
+                        start_date=start_date,
+                        end_date=end_date,
+                        target_categories=resume_categories,
+                        notify_channel_id=notify_channel_id,
+                        notify_user_id=notify_user_id,
+                    )
+                )
+                logger.info(
+                    "mogindex daily index resumed run=%s start=%s end=%s categories=%s",
+                    run_id,
+                    start_date,
+                    end_date,
+                    [category.key for category in resume_categories],
+                )
+                return
+
+        index_date = now_kst().date()
+        run_id = self.create_full_index_run(
+            guild_id=guild_id,
+            requested_by="auto-daily",
+            start_date=index_date,
+            end_date=index_date,
+            notify_channel_id=None,
+            notify_user_id=None,
+            categories=target_categories,
+            run_kind=DAILY_INDEX_RUN_KIND,
+            schedule_key=DAILY_INDEX_SCHEDULE_KEY,
+        )
+        self.full_index_task = asyncio.create_task(
+            self.run_full_index_job(
+                run_id=run_id,
+                guild_id=guild_id,
+                requested_by="auto-daily",
+                start_date=index_date,
+                end_date=index_date,
+                target_categories=target_categories,
+                notify_channel_id=None,
+                notify_user_id=None,
+            )
+        )
+        logger.info(
+            "mogindex daily index started run=%s date=%s categories=%s",
+            run_id,
+            index_date,
+            [category.key for category in target_categories],
+        )
+
     async def run_full_index_job(
         self,
         *,
@@ -1789,20 +2244,13 @@ class MogIndexCommandsCog(commands.Cog):
                     targets_count += len(targets)
                     for target in targets:
                         target_started = time.perf_counter()
-                        conn = self.service.connect()
-                        try:
-                            scanned, indexed = await collect_source(
-                                conn,
-                                target,
-                                guild_id=guild_id,
-                                category_id=category.category_id,
-                                after=after,
-                                before=before,
-                                limit=None,
-                                dry_run=False,
-                            )
-                        finally:
-                            conn.close()
+                        scanned, indexed = await self.collect_source_with_retry(
+                            target,
+                            guild_id=guild_id,
+                            category_id=category.category_id,
+                            after=after,
+                            before=before,
+                        )
                         target_elapsed = time.perf_counter() - target_started
                         target_elapsed_total += target_elapsed
                         total_scanned += scanned
