@@ -39,7 +39,7 @@ from mogindex_service import (
 
 
 logger = logging.getLogger(__name__)
-ERROR_REPORT_THREAD_ID = os.getenv("MOGINDEX_ERROR_THREAD_ID")
+ERROR_REPORT_THREAD_ID = os.getenv("PHS_INDEX_ERROR_THREAD_ID")
 
 
 def clip(text: str, limit: int) -> str:

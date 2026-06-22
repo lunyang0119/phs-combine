@@ -7,3 +7,4 @@
 /mogindex/*.sqlite3
 /mogindex/*.sqlite3-*
 reference_codes
+phs/__pycache__

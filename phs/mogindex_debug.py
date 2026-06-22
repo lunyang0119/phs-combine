@@ -6,10 +6,10 @@ indexing, topic-list parsing, and return-recap query shape before wiring the
 feature into bot commands.
 
 Examples:
-    python mogindex_debug.py --db .tmp/mogindex_debug.sqlite3 seed --reset
-    python mogindex_debug.py --db .tmp/mogindex_debug.sqlite3 search 유죄
-    python mogindex_debug.py --db .tmp/mogindex_debug.sqlite3 search 아저씨
-    python mogindex_debug.py --db .tmp/mogindex_debug.sqlite3 recap --user-id 1001
+    python mogindex_debug.py --db .tmp/mogindex_debug_phs.sqlite3 seed --reset
+    python mogindex_debug.py --db .tmp/mogindex_debug_phs.sqlite3 search 유죄
+    python mogindex_debug.py --db .tmp/mogindex_debug_phs.sqlite3 search 아저씨
+    python mogindex_debug.py --db .tmp/mogindex_debug_phs.sqlite3 recap --user-id 1001
 """
 
 from __future__ import annotations
