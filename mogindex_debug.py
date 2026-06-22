@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import argparse
 import hashlib
+import os
 import re
 import sqlite3
 import unicodedata
@@ -28,6 +29,23 @@ from typing import Iterable
 
 DISCORD_EPOCH_MS = 1420070400000
 DEFAULT_DB_PATH = Path("/home/ubuntu/mogtel/mogindex/search_index_debug.sqlite3")
+
+
+def env_int(name: str, default: int) -> int:
+    raw = os.getenv(name)
+    if raw is None or raw.strip() == "":
+        return default
+    try:
+        return int(raw)
+    except ValueError:
+        return default
+
+
+# Full-index pacing knobs. Override from .env/environment when needed.
+# If a single day takes at least this many seconds, rest before the next day.
+FULL_INDEX_SLOW_DAY_SECONDS = env_int("MOGINDEX_FULL_INDEX_SLOW_DAY_SECONDS", 180)
+# Rest duration after a slow full-index day.
+FULL_INDEX_REST_SECONDS = env_int("MOGINDEX_FULL_INDEX_REST_SECONDS", 120)
 
 DEBUG_GUILD_ID = "123456789012345678"
 CATEGORY_ID = "1239564368342024234"

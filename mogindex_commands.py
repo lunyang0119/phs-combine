@@ -12,7 +12,12 @@ import discord
 from discord import app_commands
 from discord.ext import commands
 
-from mogindex_debug import connect as index_connect, initialize_schema
+from mogindex_debug import (
+    FULL_INDEX_REST_SECONDS,
+    FULL_INDEX_SLOW_DAY_SECONDS,
+    connect as index_connect,
+    initialize_schema,
+)
 from mogindex_discord_debug import (
     CATEGORY_ID,
     DEFAULT_PARENT_CHANNEL_IDS,
@@ -41,6 +46,12 @@ def clip(text: str, limit: int) -> str:
     if len(text) <= limit:
         return text
     return text[: max(0, limit - 1)] + "..."
+
+
+def format_duration(seconds: int) -> str:
+    if seconds % 60 == 0:
+        return f"{seconds // 60}분"
+    return f"{seconds}초"
 
 
 class KeywordSearchModal(discord.ui.Modal):
@@ -775,7 +786,9 @@ class MogIndexCommandsCog(commands.Cog):
             parent_ids,
         )
         await interaction.response.send_message(
-            f"전체색인을 백그라운드에서 시작했습니다. {start_date}부터 {end_date}까지 10분에 하루씩 진행합니다.",
+            f"전체색인을 백그라운드에서 시작했습니다. {start_date}부터 {end_date}까지 진행합니다. "
+            f"하루 처리 시간이 {format_duration(FULL_INDEX_SLOW_DAY_SECONDS)} 이상이면 "
+            f"{format_duration(FULL_INDEX_REST_SECONDS)} 쉬고, 더 빠르면 바로 다음 날짜로 넘어갑니다.",
             ephemeral=True,
         )
 
@@ -791,6 +804,7 @@ class MogIndexCommandsCog(commands.Cog):
         current = start_date
         while current >= end_date:
             day_started = time.perf_counter()
+            day_elapsed = 0.0
             try:
                 after, before = discord_date_bounds(current, current, "Asia/Seoul")
                 targets = await gather_targets(
@@ -860,8 +874,19 @@ class MogIndexCommandsCog(commands.Cog):
                 )
             if current == end_date:
                 break
+            completed_day = current
             current -= timedelta(days=1)
-            await asyncio.sleep(600)
+            rest_seconds = FULL_INDEX_REST_SECONDS if day_elapsed >= FULL_INDEX_SLOW_DAY_SECONDS else 0
+            logger.info(
+                "mogindex full-index pacing completed_day=%s next_day=%s elapsed=%.2fs threshold=%ss rest=%ss",
+                completed_day,
+                current,
+                day_elapsed,
+                FULL_INDEX_SLOW_DAY_SECONDS,
+                rest_seconds,
+            )
+            if rest_seconds > 0:
+                await asyncio.sleep(rest_seconds)
         logger.info("mogindex full-index finished requested_by=%s", requested_by)
 
 
