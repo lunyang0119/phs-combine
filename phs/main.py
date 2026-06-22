@@ -13,6 +13,7 @@ logging.basicConfig(level=logging.INFO, format='%(asctime)s:%(levelname)s:%(name
 load_dotenv()
 DISCORD_TOKEN = os.getenv("PHS_TOKEN")
 GSPREAD_SHEET_NAME = os.getenv("GSPREAD_SHEET_NAME")
+GUILD_ID = os.getenv("PHS_GUILD_ID")
 
 intents = discord.Intents.default()
 intents.members = True
@@ -37,8 +38,16 @@ class BattleManager(commands.Bot):
                 logging.error(f"Cog '{cog_name}' 로드 실패: {e}")
         # 슬래시 명령어 동기화
         try:
-            await self.tree.sync()
-            logging.info("✅ 슬래시 명령어 동기화 성공")
+            local_commands = [command.name for command in self.tree.get_commands()]
+            logging.info("슬래시 명령어 로컬 등록 목록: %s", local_commands)
+            if GUILD_ID:
+                guild = discord.Object(id=int(GUILD_ID))
+                self.tree.copy_global_to(guild=guild)
+                synced = await self.tree.sync(guild=guild)
+                logging.info("✅ 길드 슬래시 명령어 동기화 성공 guild=%s commands=%s", GUILD_ID, [command.name for command in synced])
+            else:
+                synced = await self.tree.sync()
+                logging.info("✅ 전역 슬래시 명령어 동기화 성공 commands=%s", [command.name for command in synced])
         except Exception as e:
             logging.error(f"슬래시 명령어 동기화 실패: {e}")
 

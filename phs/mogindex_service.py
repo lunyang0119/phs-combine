@@ -26,11 +26,21 @@ KST = ZoneInfo("Asia/Seoul")
 logger = logging.getLogger(__name__)
 LOCK_RETRY_DELAYS = (0.0, 0.1, 0.25, 0.5)
 
-Mode = Literal["hub", "keyword", "recap", "topic", "participants", "recent"]
+Mode = Literal["hub", "keyword", "recap", "topic", "participants", "recent", "returnee"]
 Visibility = Literal["private", "shared"]
 DatePreset = Literal["today", "7d", "30d", "custom", "all"]
-SourceScope = Literal["all_indexed", "current_channel", "selected_sources"]
+SourceScope = Literal[
+    "all_indexed",
+    "current_category",
+    "current_channel",
+    "selected_categories",
+    "selected_sources",
+    "result_set",
+]
 SortMode = Literal["relevance", "newest", "oldest"]
+PanelKind = Literal["main", "detail"]
+MAX_RESULT_ID_CACHE = 1000
+RETURNEE_DEFAULT_START_DATE = "2025-10-20"
 
 
 class SearchSessionError(Exception):
@@ -55,13 +65,21 @@ class SearchPanelState:
     owner_user_id: str
     guild_id: str
     origin_channel_id: str
+    origin_category_id: str | None = None
+    origin_parent_channel_id: str | None = None
+    panel_kind: PanelKind = "main"
+    parent_session_id: str | None = None
     mode: Mode = "hub"
     visibility: Visibility = "private"
     query: str | None = None
+    keyword_all: str | None = None
+    keyword_any: str | None = None
+    keyword_not: str | None = None
     start_date: str | None = None
     end_date: str | None = None
     date_preset: DatePreset = "30d"
     source_scope: SourceScope = "all_indexed"
+    category_ids: list[str] = field(default_factory=list)
     source_ids: list[str] = field(default_factory=list)
     source_selector: str | None = None
     author_ids: list[str] = field(default_factory=list)
@@ -70,6 +88,9 @@ class SearchPanelState:
     page_size: int = 5
     last_result_kind: str | None = None
     last_result_ids: list[int] = field(default_factory=list)
+    base_result_ids: list[int] = field(default_factory=list)
+    returnee_limit: int = 5
+    worldmap_category_ids: list[str] = field(default_factory=list)
     created_at: str = ""
     updated_at: str = ""
     expires_at: str = ""
@@ -80,7 +101,8 @@ class SearchPanelState:
     @classmethod
     def from_json(cls, raw: str) -> "SearchPanelState":
         data = json.loads(raw)
-        return cls(**data)
+        allowed = set(cls.__dataclass_fields__)
+        return cls(**{key: value for key, value in data.items() if key in allowed})
 
 
 @dataclass
@@ -120,6 +142,7 @@ class ParticipantsResult:
 class SourceMatch:
     source_id: str
     source_kind: str
+    category_id: str | None
     parent_channel_id: str | None
     name: str
 
@@ -180,7 +203,13 @@ def validate_date(raw: str) -> str:
 
 
 def source_lookup_key(text: str) -> str:
-    return re.sub(r"\s+", "", normalize_text(text))
+    return re.sub(r"[\s\-_]+", "", normalize_text(text))
+
+
+def ensure_column(conn: sqlite3.Connection, table: str, column: str, ddl: str) -> None:
+    columns = {row["name"] for row in conn.execute(f"PRAGMA table_info({table})")}
+    if column not in columns:
+        conn.execute(f"ALTER TABLE {table} ADD COLUMN {ddl}")
 
 
 def initialize_service_schema(conn: sqlite3.Connection) -> None:
@@ -221,6 +250,10 @@ def initialize_service_schema(conn: sqlite3.Connection) -> None:
         )
         """
     )
+    ensure_column(conn, "full_index_runs", "category_key", "category_key TEXT")
+    ensure_column(conn, "full_index_runs", "category_id", "category_id TEXT")
+    ensure_column(conn, "full_index_runs", "category_name", "category_name TEXT")
+    ensure_column(conn, "full_index_runs", "target_config_json", "target_config_json TEXT")
     conn.execute(
         "CREATE INDEX IF NOT EXISTS idx_full_index_runs_status_created "
         "ON full_index_runs(status, created_at DESC)"
@@ -264,11 +297,29 @@ def date_bounds(state: SearchPanelState) -> tuple[str | None, str | None]:
 
 
 def scope_source_ids(state: SearchPanelState) -> list[str]:
-    if state.source_scope == "all_indexed":
+    if state.source_scope in ("all_indexed", "current_category", "selected_categories", "result_set"):
         return []
     if state.source_scope == "current_channel":
-        return [state.origin_channel_id]
+        return [state.origin_parent_channel_id or state.origin_channel_id]
     return list(dict.fromkeys(state.source_ids))
+
+
+def scope_category_ids(state: SearchPanelState) -> list[str]:
+    if state.source_scope == "current_category" and state.origin_category_id:
+        return [state.origin_category_id]
+    if state.source_scope == "selected_categories":
+        return list(dict.fromkeys(state.category_ids))
+    return []
+
+
+def cached_result_ids(ids: Iterable[int]) -> list[int]:
+    return list(dict.fromkeys(int(item) for item in ids))[:MAX_RESULT_ID_CACHE]
+
+
+def split_query_parts(raw: str | None) -> list[str]:
+    if not raw:
+        return []
+    return [part for part in re.split(r"[,\s]+", raw.strip()) if part.strip()]
 
 
 def make_filter_sql(
@@ -278,6 +329,8 @@ def make_filter_sql(
     source_column: str,
     source_parent_column: str | None = None,
     author_column: str | None = None,
+    category_column: str | None = "s.category_id",
+    result_column: str | None = None,
 ) -> tuple[list[str], list[Any]]:
     filters: list[str] = []
     params: list[Any] = []
@@ -288,6 +341,10 @@ def make_filter_sql(
     if end_date:
         filters.append(f"{date_column} <= ?")
         params.append(end_date)
+    category_ids = scope_category_ids(state)
+    if category_column and category_ids:
+        filters.append(f"{category_column} IN ({','.join('?' for _ in category_ids)})")
+        params.extend(category_ids)
     source_ids = scope_source_ids(state)
     if source_ids:
         placeholders = ",".join("?" for _ in source_ids)
@@ -303,6 +360,10 @@ def make_filter_sql(
     if author_column and state.author_ids:
         filters.append(f"{author_column} IN ({','.join('?' for _ in state.author_ids)})")
         params.extend(state.author_ids)
+    if result_column and state.source_scope == "result_set" and state.base_result_ids:
+        result_ids = cached_result_ids(state.base_result_ids)
+        filters.append(f"{result_column} IN ({','.join('?' for _ in result_ids)})")
+        params.extend(result_ids)
     return filters, params
 
 
@@ -330,11 +391,22 @@ class MogIndexService:
 
     def create_session(self, interaction: Any) -> SearchPanelState:
         current = now_kst()
+        channel = getattr(interaction, "channel", None)
+        channel_type = type(channel).__name__.lower() if channel is not None else ""
+        is_thread = "thread" in channel_type
+        origin_category_id = getattr(channel, "category_id", None)
+        origin_parent_channel_id = None
+        if is_thread:
+            origin_parent_channel_id = getattr(channel, "parent_id", None)
+            parent = getattr(channel, "parent", None)
+            origin_category_id = origin_category_id or getattr(parent, "category_id", None)
         state = SearchPanelState(
             session_id=uuid.uuid4().hex[:16],
             owner_user_id=str(interaction.user.id),
             guild_id=str(interaction.guild_id or ""),
             origin_channel_id=str(interaction.channel_id),
+            origin_category_id=str(origin_category_id) if origin_category_id else None,
+            origin_parent_channel_id=str(origin_parent_channel_id) if origin_parent_channel_id else None,
             created_at=current.isoformat(timespec="seconds"),
             updated_at=current.isoformat(timespec="seconds"),
             expires_at=(current + timedelta(minutes=SESSION_TTL_MINUTES)).isoformat(timespec="seconds"),
@@ -421,10 +493,14 @@ class MogIndexService:
         state.mode = "hub"
         state.visibility = "private"
         state.query = None
+        state.keyword_all = None
+        state.keyword_any = None
+        state.keyword_not = None
         state.start_date = None
         state.end_date = None
         state.date_preset = "30d"
         state.source_scope = "all_indexed"
+        state.category_ids = []
         state.source_ids = []
         state.source_selector = None
         state.author_ids = []
@@ -432,6 +508,10 @@ class MogIndexService:
         state.page = 0
         state.last_result_kind = None
         state.last_result_ids = []
+        state.base_result_ids = []
+        state.parent_session_id = None
+        state.panel_kind = "main"
+        state.returnee_limit = 5
         return state
 
     def set_date_preset(self, state: SearchPanelState, preset: DatePreset) -> SearchPanelState:
@@ -453,33 +533,87 @@ class MogIndexService:
         state.page = 0
         return state
 
-    def set_scope(self, state: SearchPanelState, scope: SourceScope, source_ids: Iterable[str] = ()) -> SearchPanelState:
+    def set_scope(
+        self,
+        state: SearchPanelState,
+        scope: SourceScope,
+        source_ids: Iterable[str] = (),
+        *,
+        category_ids: Iterable[str] = (),
+        base_result_ids: Iterable[int] = (),
+    ) -> SearchPanelState:
         state.source_scope = scope
         state.source_ids = list(dict.fromkeys(str(source_id) for source_id in source_ids if source_id))
+        state.category_ids = list(dict.fromkeys(str(category_id) for category_id in category_ids if category_id))
+        if scope == "result_set":
+            state.base_result_ids = cached_result_ids(base_result_ids or state.last_result_ids)
+        elif scope != "result_set" and state.panel_kind != "detail":
+            state.base_result_ids = []
         if scope != "selected_sources":
             state.source_selector = None
         state.page = 0
         logger.info(
-            "mogindex scope updated session=%s scope=%s source_ids=%s",
+            "mogindex scope updated session=%s scope=%s category_ids=%s source_ids=%s base_results=%s",
             state.session_id,
             state.source_scope,
+            state.category_ids,
             state.source_ids,
+            len(state.base_result_ids),
         )
+        return state
+
+    def set_keywords(
+        self,
+        state: SearchPanelState,
+        *,
+        all_terms: str | None = None,
+        any_terms: str | None = None,
+        not_terms: str | None = None,
+    ) -> SearchPanelState:
+        state.keyword_all = (all_terms or "").strip() or None
+        state.keyword_any = (any_terms or "").strip() or None
+        state.keyword_not = (not_terms or "").strip() or None
+        state.query = " ".join(part for part in (state.keyword_all, state.keyword_any) if part) or None
+        state.mode = "keyword"
+        state.page = 0
+        return state
+
+    def create_detail_session(self, parent: SearchPanelState) -> SearchPanelState:
+        current = now_kst()
+        state = SearchPanelState.from_json(parent.to_json())
+        state.session_id = uuid.uuid4().hex[:16]
+        state.parent_session_id = parent.session_id
+        state.panel_kind = "detail"
+        state.source_scope = "result_set"
+        state.base_result_ids = cached_result_ids(parent.last_result_ids)
+        state.last_result_ids = []
+        state.last_result_kind = None
+        state.page = 0
+        state.created_at = current.isoformat(timespec="seconds")
+        state.updated_at = current.isoformat(timespec="seconds")
+        state.expires_at = (current + timedelta(minutes=SESSION_TTL_MINUTES)).isoformat(timespec="seconds")
+        self.save_session(state)
         return state
 
     def count_matching_sources(self, state: SearchPanelState) -> int:
         source_ids = scope_source_ids(state)
-        if not source_ids:
+        category_ids = scope_category_ids(state)
+        filters: list[str] = ["active = 1"]
+        params: list[Any] = []
+        if source_ids:
+            placeholders = ",".join("?" for _ in source_ids)
+            filters.append(f"(source_id IN ({placeholders}) OR parent_channel_id IN ({placeholders}))")
+            params.extend(source_ids)
+            params.extend(source_ids)
+        if category_ids:
+            filters.append(f"category_id IN ({','.join('?' for _ in category_ids)})")
+            params.extend(category_ids)
+        if not source_ids and not category_ids:
             return 0
-        placeholders = ",".join("?" for _ in source_ids)
         with self.open() as conn:
             row = conn.execute(
-                f"""
-                SELECT COUNT(*) AS count
-                FROM sources
-                WHERE source_id IN ({placeholders}) OR parent_channel_id IN ({placeholders})
-                """,
-                tuple(source_ids) + tuple(source_ids),
+                f"SELECT COUNT(*) AS count FROM sources WHERE {' AND '.join(filters)}",
+                tuple(params),
             ).fetchone()
         return int(row["count"] if row else 0)
 
@@ -490,7 +624,7 @@ class MogIndexService:
         with self.open() as conn:
             rows = conn.execute(
                 """
-                SELECT source_id, source_kind, parent_channel_id, name
+                SELECT source_id, source_kind, category_id, parent_channel_id, name
                 FROM sources
                 WHERE active = 1
                 ORDER BY
@@ -507,6 +641,7 @@ class MogIndexService:
                 SourceMatch(
                     source_id=row["source_id"],
                     source_kind=row["source_kind"],
+                    category_id=row["category_id"],
                     parent_channel_id=row["parent_channel_id"],
                     name=row["name"],
                 )
@@ -548,37 +683,69 @@ class MogIndexService:
                 ranked[int(row["message_pk"])] += int(row["score"] or 0)
         return ranked
 
-    def run_keyword_search(self, state: SearchPanelState) -> ResultPage:
-        query = (state.query or "").strip()
-        if not query:
-            state.last_result_kind = "keyword"
-            state.last_result_ids = []
-            logger.info(
-                "mogindex keyword session=%s query=%r scope=%s sources=%s date=%s..%s total=0 reason=empty_query",
-                state.session_id,
-                query,
-                state.source_scope,
-                state.source_ids,
-                date_bounds(state)[0],
-                date_bounds(state)[1],
-            )
-            return ResultPage("단어 검색", [], state.page, state.page_size, 0, "검색어를 입력해주세요.")
+    def _combined_keyword_rankings(self, conn: sqlite3.Connection, state: SearchPanelState) -> tuple[str, Counter[int]]:
+        all_parts = split_query_parts(state.keyword_all)
+        any_parts = split_query_parts(state.keyword_any)
+        not_parts = split_query_parts(state.keyword_not)
+        if not all_parts and not any_parts and state.query:
+            any_parts = [state.query]
+        display_query = " / ".join(
+            part for part in (
+                f"ALL: {state.keyword_all}" if state.keyword_all else "",
+                f"ANY: {state.keyword_any}" if state.keyword_any else "",
+                f"NOT: {state.keyword_not}" if state.keyword_not else "",
+            ) if part
+        ) or (state.query or "")
+        if not all_parts and not any_parts:
+            return display_query, Counter()
 
+        ranked: Counter[int] = Counter()
+        candidate_ids: set[int] | None = None
+        if any_parts:
+            any_ranked: Counter[int] = Counter()
+            for part in any_parts:
+                any_ranked.update(self._keyword_rankings(conn, part))
+            candidate_ids = set(any_ranked)
+            ranked.update(any_ranked)
+
+        for part in all_parts:
+            part_ranked = self._keyword_rankings(conn, part)
+            part_ids = set(part_ranked)
+            candidate_ids = part_ids if candidate_ids is None else candidate_ids & part_ids
+            ranked.update(part_ranked)
+
+        if candidate_ids is None:
+            candidate_ids = set(ranked)
+
+        excluded_ids: set[int] = set()
+        for part in not_parts:
+            excluded_ids.update(self._keyword_rankings(conn, part))
+        candidate_ids -= excluded_ids
+        ranked = Counter({message_pk: ranked[message_pk] for message_pk in candidate_ids})
+        return display_query, ranked
+
+    def run_keyword_search(self, state: SearchPanelState) -> ResultPage:
+        query, ranked = "", Counter()
         with self.open() as conn:
-            ranked = self._keyword_rankings(conn, query)
+            query, ranked = self._combined_keyword_rankings(conn, state)
+            if not query.strip():
+                state.last_result_kind = "keyword"
+                state.last_result_ids = []
+                return ResultPage("키워드 검색", [], state.page, state.page_size, 0, "검색어를 입력해주세요.")
             if not ranked:
                 state.last_result_kind = "keyword"
                 state.last_result_ids = []
                 logger.info(
-                    "mogindex keyword session=%s query=%r scope=%s sources=%s date=%s..%s total=0 reason=no_ranked_terms",
+                    "mogindex keyword session=%s query=%r scope=%s categories=%s sources=%s date=%s..%s total=0 reason=no_ranked_terms",
                     state.session_id,
                     query,
                     state.source_scope,
+                    state.category_ids,
                     state.source_ids,
                     date_bounds(state)[0],
                     date_bounds(state)[1],
                 )
-                return ResultPage("단어 검색", [], state.page, state.page_size, 0, "현재 기간/범위에서 색인된 결과가 없습니다. 기간을 전체로 넓히거나 직접 기간을 지정해보세요.")
+                return ResultPage("키워드 검색", [], state.page, state.page_size, 0, "현재 기간/범위에서 색인된 결과가 없습니다. 기간을 전체로 넓히거나 직접 기간을 지정해보세요.")
 
             filters, params = make_filter_sql(
                 state,
@@ -586,6 +753,7 @@ class MogIndexService:
                 source_column="m.source_id",
                 source_parent_column="s.parent_channel_id",
                 author_column="m.author_id",
+                result_column="m.message_pk",
             )
             placeholders = ",".join("?" for _ in ranked)
             where_sql = " AND ".join(["m.message_pk IN (" + placeholders + ")"] + filters)
@@ -623,13 +791,14 @@ class MogIndexService:
             results.sort(key=lambda item: (-item.score, item.created_at))
 
         state.last_result_kind = "keyword"
-        state.last_result_ids = [item.message_pk for item in results]
-        page = self._slice_results("단어 검색", results, state)
+        state.last_result_ids = cached_result_ids(item.message_pk for item in results)
+        page = self._slice_results("키워드 검색", results, state)
         logger.info(
-            "mogindex keyword session=%s query=%r scope=%s sources=%s date=%s..%s total=%s page=%s",
+            "mogindex keyword session=%s query=%r scope=%s categories=%s sources=%s date=%s..%s total=%s page=%s",
             state.session_id,
             query,
             state.source_scope,
+            state.category_ids,
             state.source_ids,
             date_bounds(state)[0],
             date_bounds(state)[1],
@@ -715,6 +884,76 @@ class MogIndexService:
         )
         return page
 
+    def run_returnee_keywords(self, state: SearchPanelState) -> TextPage:
+        worldmap_ids = list(dict.fromkeys(state.worldmap_category_ids))
+        if not worldmap_ids:
+            return TextPage("복귀자 키워드", [], state.page, state.page_size, 0, "월드 맵 카테고리 설정이 없습니다.")
+        limit = min(max(int(state.returnee_limit or 5), 1), 100)
+        today = now_kst().date().isoformat()
+        with self.open() as conn:
+            placeholders = ",".join("?" for _ in worldmap_ids)
+            row = conn.execute(
+                f"""
+                SELECT MAX(m.message_date) AS last_seen
+                FROM messages m
+                JOIN sources s ON s.source_id = m.source_id
+                WHERE m.author_id = ? AND s.category_id IN ({placeholders})
+                """,
+                (state.owner_user_id, *worldmap_ids),
+            ).fetchone()
+            last_seen = row["last_seen"] if row else None
+            if last_seen:
+                start = (date.fromisoformat(last_seen) + timedelta(days=1)).isoformat()
+            else:
+                start = RETURNEE_DEFAULT_START_DATE
+
+            filter_state = SearchPanelState.from_json(state.to_json())
+            filter_state.date_preset = "custom"
+            filter_state.start_date = start
+            filter_state.end_date = today
+            term_filters, term_params = make_filter_sql(
+                filter_state,
+                date_column="d.message_date",
+                source_column="d.source_id",
+                source_parent_column="s.parent_channel_id",
+            )
+            rows = conn.execute(
+                f"""
+                SELECT d.term, SUM(d.count) AS total_count
+                FROM daily_terms d
+                JOIN sources s ON s.source_id = d.source_id
+                WHERE {" AND ".join(term_filters) if term_filters else "1 = 1"}
+                  AND LENGTH(d.term) BETWEEN 2 AND 8
+                  AND d.term NOT IN ({",".join("?" for _ in INDEX_EXCLUDED_TERMS)})
+                GROUP BY d.term
+                HAVING SUM(d.count) > 1
+                ORDER BY total_count DESC, d.term
+                LIMIT ?
+                """,
+                tuple(term_params) + tuple(INDEX_EXCLUDED_TERMS) + (limit,),
+            ).fetchall()
+
+        lines = [f"{idx}. {row['term']}({int(row['total_count'])})" for idx, row in enumerate(rows, start=1)]
+        state.last_result_kind = "returnee"
+        state.last_result_ids = []
+        page = self._slice_lines(
+            "복귀자 키워드",
+            [f"기간: {start} .. {today}"] + lines if lines else [],
+            state,
+            "복귀자 키워드로 표시할 색인어가 없습니다.",
+        )
+        logger.info(
+            "mogindex returnee session=%s user=%s start=%s end=%s scope=%s total=%s page=%s",
+            state.session_id,
+            state.owner_user_id,
+            start,
+            today,
+            state.source_scope,
+            page.total,
+            page.page,
+        )
+        return page
+
     def run_topic_search(self, state: SearchPanelState) -> TextPage:
         query = normalize_text(state.query or "")
         query_terms = set(extract_terms(query).keys()) if query else set()
@@ -785,6 +1024,7 @@ class MogIndexService:
                 source_column="m.source_id",
                 source_parent_column="s.parent_channel_id",
                 author_column="m.author_id",
+                result_column="m.message_pk",
             )
             order_sql = "m.created_at ASC" if state.sort == "oldest" else "m.created_at DESC"
             rows = conn.execute(
@@ -816,7 +1056,7 @@ class MogIndexService:
             for row in rows
         ]
         state.last_result_kind = "recent"
-        state.last_result_ids = [item.message_pk for item in results]
+        state.last_result_ids = cached_result_ids(item.message_pk for item in results)
         page = self._slice_results("채널 보기", results, state)
         page.empty_message = "현재 기간/범위에 표시할 색인 메시지가 없습니다. 기간을 전체로 넓히거나 다른 채널을 선택해보세요."
         logger.info(
@@ -839,6 +1079,7 @@ class MogIndexService:
                 source_column="m.source_id",
                 source_parent_column="s.parent_channel_id",
                 author_column="m.author_id",
+                result_column="m.message_pk",
             )
             rows = conn.execute(
                 f"""
