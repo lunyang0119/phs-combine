@@ -12,7 +12,7 @@ logging.basicConfig(level=logging.INFO, format='%(asctime)s:%(levelname)s:%(name
 
 load_dotenv()
 DISCORD_TOKEN = os.getenv("MOG_TOKEN")
-GSPREAD_SHEET_NAME = "Discord_Bot"
+GSPREAD_SHEET_NAME = os.getenv("GSPREAD_SHEET_NAME")
 
 intents = discord.Intents.default()
 intents.members = True
