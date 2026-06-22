@@ -16,7 +16,6 @@ from __future__ import annotations
 
 import argparse
 import hashlib
-import os
 import re
 import sqlite3
 import unicodedata
@@ -28,83 +27,21 @@ from typing import Iterable
 
 
 DISCORD_EPOCH_MS = 1420070400000
-DEFAULT_DB_PATH = Path("/home/ubuntu/mogtel/mogindex/search_index_debug.sqlite3")
+DEFAULT_DB_PATH = Path("/home/ubuntu/mogtel/mogindex/search_index_phs.sqlite3")
 
+DEBUG_GUILD_ID = "1399956076866175100"
+CATEGORY_ID = "1422745022943727727"
 
-def env_int(name: str, default: int) -> int:
-    raw = os.getenv(name)
-    if raw is None or raw.strip() == "":
-        return default
-    try:
-        return int(raw)
-    except ValueError:
-        return default
-
-
-# Full-index pacing knobs. Override from .env/environment when needed.
-# If a single day takes at least this many seconds, rest before the next day.
-FULL_INDEX_SLOW_DAY_SECONDS = env_int("MOGINDEX_FULL_INDEX_SLOW_DAY_SECONDS", 180)
-# Rest duration after a slow full-index day.
-FULL_INDEX_REST_SECONDS = env_int("MOGINDEX_FULL_INDEX_REST_SECONDS", 120)
-
-# Fake guild id used only by local seed/debug data. This is not the live server id.
-DEBUG_GUILD_ID = "123456789012345678"
-# Default category id used by debug seed/backfill helpers.
-CATEGORY_ID = "1239564368342024234"
-
-# Sample sources used by local seed tests without connecting to Discord.
 INDEX_SOURCE_SEEDS = [
-    ("1347082174347874406", "channel", "차원점검열차", None),
-    ("1480185936456188079", "channel", "카페테리아", None),
-    ("1496445431964504064", "channel", "외근", None),
-    ("1322066437409341442", "channel", "환영의 메아리", None),
-    ("1480185936456189001", "thread", "카페테리아 / 폰꾸 회의", "1480185936456188079"),
+    ("1399959589121953875", "channel", "미딜 폐연구소 1층", None),
+    ("1422784351627644968", "channel", "미딜 폐연구소 지하 1층", None),
+    ("1422784292680896534", "channel", "미딜 폐연구소 지하 2층", None),
+    ("1431917788557213726", "channel", "미딜 폐연구소 지하 3층", None),
+    ("1399959232610177047", "channel", "차원점검열차", None),
+    ("1399957143091806239", "chaannel", "라이프 스트림", None)
 ]
 
 PARTICLE_SUFFIXES = (
-    "으로부터",
-    "에게서",
-    "한테서",
-    "께서는",
-    "에서는",
-    "이라도",
-    "이라면",
-    "으로",
-    "로서",
-    "로써",
-    "에게",
-    "한테",
-    "께서",
-    "부터",
-    "까지",
-    "처럼",
-    "보다",
-    "밖에",
-    "마저",
-    "조차",
-    "이나",
-    "라도",
-    "다면",
-    "이며",
-    "은",
-    "는",
-    "이",
-    "가",
-    "을",
-    "를",
-    "와",
-    "과",
-    "도",
-    "만",
-    "에",
-    "의",
-    "로",
-    "랑",
-    "야",
-    "아",
-)
-
-STOP_TERMS = {
     "가",
     "가까스로",
     "가령",
@@ -168,28 +105,6 @@ STOP_TERMS = {
     "그렇지 않으면",
     "그렇지만",
     "그렇지않으면",
-    "그리고",
-    "그리하여",
-    "그만이다",
-    "그에 따르는",
-    "그위에",
-    "그저",
-    "그중에서",
-    "그치지 않다",
-    "근거로",
-    "근거하여",
-    "기대여",
-    "기점으로",
-    "기준으로",
-    "기타",
-    "까닭으로",
-    "까악",
-    "까지",
-    "까지 미치다",
-    "까지도",
-    "꽈당",
-    "끙끙",
-    "끼익",
     "나",
     "나머지는",
     "남들",
@@ -700,15 +615,46 @@ STOP_TERMS = {
     "흐흐",
     "흥",
     "힘입어",
+)
+
+STOP_TERMS = {
+    "그리고",
+    "그리하여",
+    "그만이다",
+    "그에 따르는",
+    "그위에",
+    "그저",
+    "그중에서",
+    "그치지 않다",
+    "근거로",
+    "근거하여",
+    "기대여",
+    "기점으로",
+    "기준으로",
+    "기타",
+    "까닭으로",
+    "까악",
+    "까지",
+    "까지 미치다",
+    "까지도",
+    "꽈당",
+    "끙끙",
+    "끼익",
+    "그런데",
+    "하지만",
+    "그래서",
     "오늘",
     "내일",
     "어제",
     "진짜",
+    "약간",
     "너무",
     "그냥",
     "이거",
     "저거",
     "그거",
+    "여기",
+    "저기",
     "거기",
 }
 
@@ -848,47 +794,10 @@ def normalize_text(text: str) -> str:
     return re.sub(r"\s+", " ", text).strip()
 
 
-JONGSEONG_RIEUL = "\u11af"
-JONGSEONG_REQUIRED_SUFFIXES = {"이", "은", "을", "과", "아", "으로"}
-NO_JONGSEONG_SUFFIXES = {"가", "는", "를", "와", "야"}
-RIEUL_OR_NO_JONGSEONG_SUFFIXES = {"로"}
-
-
-def has_hangul_jongseong(text: str) -> bool:
-    if not text:
-        return False
-    decomposed = unicodedata.normalize("NFD", text[-1])
-    if not decomposed:
-        return False
-    return "JONGSEONG" in unicodedata.name(decomposed[-1], "")
-
-
-def has_final_rieul(text: str) -> bool:
-    if not text:
-        return False
-    decomposed = unicodedata.normalize("NFD", text[-1])
-    return bool(decomposed) and decomposed[-1] == JONGSEONG_RIEUL
-
-
-def should_strip_particle(stem: str, suffix: str) -> bool:
-    if not stem:
-        return False
-    if suffix in JONGSEONG_REQUIRED_SUFFIXES:
-        return has_hangul_jongseong(stem)
-    if suffix in NO_JONGSEONG_SUFFIXES:
-        return not has_hangul_jongseong(stem)
-    if suffix in RIEUL_OR_NO_JONGSEONG_SUFFIXES:
-        return not has_hangul_jongseong(stem) or has_final_rieul(stem)
-    return True
-
-
 def strip_particle(token: str) -> str:
-    for suffix in sorted(PARTICLE_SUFFIXES, key=len, reverse=True):
-        if not token.endswith(suffix):
-            continue
-        stem = token[: -len(suffix)]
-        if should_strip_particle(stem, suffix):
-            return stem
+    for suffix in PARTICLE_SUFFIXES:
+        if token.endswith(suffix) and len(token) - len(suffix) >= 2:
+            return token[: -len(suffix)]
     return token
 
 
@@ -903,10 +812,7 @@ def extract_terms(text: str) -> Counter[str]:
     terms: Counter[str] = Counter()
     for raw_token in TOKEN_RE.findall(normalize_text(text)):
         token = strip_particle(raw_token)
-        stripped_particle = token != raw_token
-        if token.isdigit() or token in STOP_TERMS:
-            continue
-        if len(token) < 2 and not stripped_particle:
+        if len(token) < 2 or token.isdigit() or token in STOP_TERMS:
             continue
         terms[token] += 2
         for ngram in iter_ngrams(token):
