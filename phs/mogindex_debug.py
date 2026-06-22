@@ -24,13 +24,17 @@ from dataclasses import dataclass
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from typing import Iterable
+import os
+from dotenv import load_dotenv
+
+load_dotenv()
 
 
 DISCORD_EPOCH_MS = 1420070400000
 DEFAULT_DB_PATH = Path("/home/ubuntu/mogtel/mogindex/search_index_phs.sqlite3")
 
-DEBUG_GUILD_ID = "1399956076866175100"
-CATEGORY_ID = "1422745022943727727"
+DEBUG_GUILD_ID = os.getenv("PHS_INDEX_ERROR_THREAD_ID")
+CATEGORY_ID = os.getenv("PHS_CATEGORY_ID")
 
 INDEX_SOURCE_SEEDS = [
     ("1399959589121953875", "channel", "미딜 폐연구소 1층", None),

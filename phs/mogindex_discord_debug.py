@@ -9,7 +9,7 @@ Examples on the server:
     python mogindex_discord_debug.py discover
     python mogindex_discord_debug.py backfill --start-date 2026-06-01 --end-date 2026-06-02
     python mogindex_discord_debug.py topic-sync --topic-thread-id 1234567890123456789
-    python mogindex_debug.py --db /home/ubuntu/mogtel/mogindex/search_index_live_debug.sqlite3 search 유죄
+    python mogindex_debug.py --db /home/ubuntu/mogtel/mogindex/search_index_live_phs_debug.sqlite3 search 유죄
 """
 
 from __future__ import annotations
@@ -56,10 +56,12 @@ from mogindex_debug import (
 
 DEFAULT_DB_PATH = Path("/home/ubuntu/mogtel/mogindex/search_index_live_phs_debug.sqlite3")
 DEFAULT_PARENT_CHANNEL_IDS = (
-    "1347082174347874406",
-    "1480185936456188079",
-    "1496445431964504064",
-    "1322066437409341442",
+    "1399959589121953875",
+    "1422784351627644968",
+    "1422784292680896534",
+    "1431917788557213726",
+    "1399959232610177047",
+    "1399957143091806239",
 )
 
 

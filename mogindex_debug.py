@@ -17,6 +17,7 @@ from __future__ import annotations
 import argparse
 import hashlib
 import os
+from dotenv import load_dotenv
 import re
 import sqlite3
 import unicodedata
@@ -26,6 +27,7 @@ from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from typing import Iterable
 
+load_dotenv()
 
 DISCORD_EPOCH_MS = 1420070400000
 DEFAULT_DB_PATH = Path("/home/ubuntu/mogtel/mogindex/search_index_debug.sqlite3")
@@ -48,9 +50,9 @@ FULL_INDEX_SLOW_DAY_SECONDS = env_int("MOGINDEX_FULL_INDEX_SLOW_DAY_SECONDS", 18
 FULL_INDEX_REST_SECONDS = env_int("MOGINDEX_FULL_INDEX_REST_SECONDS", 120)
 
 # Fake guild id used only by local seed/debug data. This is not the live server id.
-DEBUG_GUILD_ID = "123456789012345678"
+DEBUG_GUILD_ID = os.getenv("MOG_INDEX_ERROR_THREAD_ID")
 # Default category id used by debug seed/backfill helpers.
-CATEGORY_ID = "1239564368342024234"
+CATEGORY_ID = os.getenv("MOG_CATEGORY_ID")
 
 # Sample sources used by local seed tests without connecting to Discord.
 INDEX_SOURCE_SEEDS = [
