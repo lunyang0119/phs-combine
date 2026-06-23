@@ -101,6 +101,64 @@ def format_duration(seconds: int) -> str:
     return f"{seconds}초"
 
 
+@dataclass
+class DbWriteRequest:
+    callback: Any
+    args: tuple[Any, ...]
+    kwargs: dict[str, Any]
+    future: asyncio.Future
+
+
+class DbWriteQueue:
+    def __init__(self, label: str):
+        self.label = label
+        self._queue: asyncio.Queue[DbWriteRequest] = asyncio.Queue()
+        self._worker_task: asyncio.Task | None = None
+
+    def ensure_worker(self) -> None:
+        if self._worker_task is None or self._worker_task.done():
+            self._worker_task = asyncio.create_task(self._worker())
+
+    async def run(self, callback: Any, *args: Any, **kwargs: Any) -> Any:
+        self.ensure_worker()
+        loop = asyncio.get_running_loop()
+        future = loop.create_future()
+        await self._queue.put(DbWriteRequest(callback, args, kwargs, future))
+        return await future
+
+    async def _worker(self) -> None:
+        while True:
+            request = await self._queue.get()
+            try:
+                result = await self._run_with_retry(request.callback, *request.args, **request.kwargs)
+                if not request.future.cancelled():
+                    request.future.set_result(result)
+            except Exception as exc:
+                if not request.future.cancelled():
+                    request.future.set_exception(exc)
+            finally:
+                self._queue.task_done()
+
+    async def _run_with_retry(self, callback: Any, *args: Any, **kwargs: Any) -> Any:
+        for attempt in range(6):
+            try:
+                return await asyncio.to_thread(callback, *args, **kwargs)
+            except sqlite3.OperationalError as exc:
+                if "locked" not in str(exc).lower() or attempt >= 5:
+                    raise
+                logger.warning(
+                    "%s locked during write attempt=%s/6 callback=%s",
+                    self.label,
+                    attempt + 1,
+                    getattr(callback, "__name__", repr(callback)),
+                )
+                await asyncio.sleep(0.25 * (attempt + 1))
+
+    def close(self) -> None:
+        if self._worker_task and not self._worker_task.done():
+            self._worker_task.cancel()
+
+
 @dataclass(frozen=True)
 class IndexCategoryConfig:
     key: str
@@ -552,7 +610,7 @@ class MogIndexCommandsCog(commands.Cog):
         self.service = MogIndexService()
         self.full_index_task: asyncio.Task | None = None
         self.daily_index_task: asyncio.Task | None = None
-        self.full_index_db_write_lock = asyncio.Lock()
+        self.db_write_queue = DbWriteQueue("mogindex-db")
         self.index_categories = parse_index_categories()
         self.category_by_key = {category.key: category for category in self.index_categories}
         logger.info(
@@ -562,6 +620,12 @@ class MogIndexCommandsCog(commands.Cog):
         )
 
     async def cog_load(self) -> None:
+        await asyncio.to_thread(self.service.initialize)
+        logger.info(
+            "mogindex DB initialized index=%s state=%s",
+            self.service.index_db_path,
+            self.service.state_db_path,
+        )
         if DAILY_INDEX_ENABLED:
             self.daily_index_task = asyncio.create_task(self.daily_index_scheduler())
             logger.info(
@@ -578,6 +642,7 @@ class MogIndexCommandsCog(commands.Cog):
             self.daily_index_task.cancel()
         if self.full_index_task and not self.full_index_task.done():
             self.full_index_task.cancel()
+        self.db_write_queue.close()
 
     def get_category(self, key: str | None) -> IndexCategoryConfig | None:
         if not key or key == "all":
@@ -642,9 +707,9 @@ class MogIndexCommandsCog(commands.Cog):
         if not interaction.guild_id:
             await interaction.response.send_message("서버 안에서만 사용할 수 있습니다.", ephemeral=True)
             return
-        state = self.service.create_session(interaction)
+        state = self.service.create_session(interaction, persist=False)
         state.worldmap_category_ids = [category.category_id for category in self.index_categories if category.worldmap]
-        self.service.save_session(state)
+        await self.run_full_index_db_write(self.service.save_session, state)
         logger.info(
             "mogindex panel opened session=%s user=%s guild=%s channel=%s",
             state.session_id,
@@ -716,7 +781,7 @@ class MogIndexCommandsCog(commands.Cog):
         await interaction.response.defer(ephemeral=not public, thinking=True)
         state: SearchPanelState | None = None
         try:
-            state = self.service.create_session(interaction)
+            state = self.service.create_session(interaction, persist=False)
             state.worldmap_category_ids = [category_config.category_id for category_config in self.index_categories if category_config.worldmap]
 
             has_keyword = bool((keyword or "").strip() or (all_terms or "").strip() or (not_terms or "").strip())
@@ -757,7 +822,7 @@ class MogIndexCommandsCog(commands.Cog):
             if sort:
                 state.sort = sort.value  # type: ignore[assignment]
             state.page = 0
-            self.service.save_session(state)
+            await self.run_full_index_db_write(self.service.save_session, state)
 
             embed, view, page = self.render_panel(state, public=public)
             await interaction.followup.send(embed=embed, view=None if public else view, ephemeral=not public)
@@ -837,7 +902,7 @@ class MogIndexCommandsCog(commands.Cog):
 
         try:
             if action == "close":
-                self.service.close_session(state)
+                await self.run_full_index_db_write(self.service.close_session, state)
                 await self.safe_edit_original_response(interaction, content="검색 패널을 닫았습니다.", embed=None, view=None)
                 return
             if action == "scope_location":
@@ -849,7 +914,8 @@ class MogIndexCommandsCog(commands.Cog):
                 if not state.last_result_ids:
                     await self.send_user_message(interaction, "검색 결과가 있어야 상세 검색 패널을 열 수 있습니다.")
                     return
-                detail_state = self.service.create_detail_session(state)
+                detail_state = self.service.create_detail_session(state, persist=False)
+                await self.run_full_index_db_write(self.service.save_session, detail_state)
                 embed, view, _page = self.render_panel(detail_state)
                 embed.title = embed.title.replace("검색 패널", "상세 검색 패널")
                 await interaction.followup.send(embed=embed, view=view, ephemeral=True)
@@ -863,7 +929,7 @@ class MogIndexCommandsCog(commands.Cog):
 
             self.apply_action(state, action, extra)
             embed, view, _page = self.render_panel(state)
-            self.service.save_session(state)
+            await self.run_full_index_db_write(self.service.save_session, state)
             logger.info(
                 "mogindex action applied session=%s action=%s mode=%s scope=%s categories=%s sources=%s preset=%s page=%s",
                 state.session_id,
@@ -947,7 +1013,7 @@ class MogIndexCommandsCog(commands.Cog):
                 state.keyword_not,
             )
             embed, view, _page = self.render_panel(state)
-            self.service.save_session(state)
+            await self.run_full_index_db_write(self.service.save_session, state)
             await self.safe_edit_original_response(interaction, embed=embed, view=view)
         except SearchSessionError as exc:
             await self.send_session_error(interaction, exc)
@@ -968,7 +1034,7 @@ class MogIndexCommandsCog(commands.Cog):
                 not_terms=not_terms,
             )
             embed, view, _page = self.render_panel(state)
-            self.service.save_session(state)
+            await self.run_full_index_db_write(self.service.save_session, state)
             await self.safe_edit_original_response(interaction, embed=embed, view=view)
         except SearchSessionError as exc:
             await self.send_session_error(interaction, exc)
@@ -987,7 +1053,7 @@ class MogIndexCommandsCog(commands.Cog):
             state.mode = "returnee"
             state.page = 0
             embed, view, _page = self.render_panel(state)
-            self.service.save_session(state)
+            await self.run_full_index_db_write(self.service.save_session, state)
             await self.safe_edit_original_response(interaction, embed=embed, view=view)
         except ValueError:
             await self.send_user_message(interaction, "표시할 키워드 수는 1부터 100 사이 숫자로 입력해주세요.")
@@ -1020,7 +1086,7 @@ class MogIndexCommandsCog(commands.Cog):
             state.mode = "keyword" if mode == "keyword" else "topic"
             state.page = 0
             embed, view, _page = self.render_panel(state)
-            self.service.save_session(state)
+            await self.run_full_index_db_write(self.service.save_session, state)
             await self.safe_edit_original_response(interaction, embed=embed, view=view)
         except SearchSessionError as exc:
             await self.send_session_error(interaction, exc)
@@ -1060,7 +1126,7 @@ class MogIndexCommandsCog(commands.Cog):
                     self.service.set_date_preset(state, "all")
             state.page = 0
             embed, view, _page = self.render_panel(state)
-            self.service.save_session(state)
+            await self.run_full_index_db_write(self.service.save_session, state)
             await self.safe_edit_original_response(interaction, embed=embed, view=view)
         except (SearchSessionError, ValueError) as exc:
             await self.send_session_error(interaction, exc)
@@ -1108,7 +1174,7 @@ class MogIndexCommandsCog(commands.Cog):
                     value=f"{len(matches)}개 source를 범위로 선택했습니다. 너무 넓으면 더 긴 이름으로 다시 지정해주세요.",
                     inline=False,
                 )
-            self.service.save_session(state)
+            await self.run_full_index_db_write(self.service.save_session, state)
             await self.safe_edit_original_response(interaction, embed=embed, view=view)
         except (SearchSessionError, ValueError) as exc:
             await self.send_session_error(interaction, exc)
@@ -1137,7 +1203,7 @@ class MogIndexCommandsCog(commands.Cog):
                 state.end_date,
             )
             embed, view, _page = self.render_panel(state)
-            self.service.save_session(state)
+            await self.run_full_index_db_write(self.service.save_session, state)
             await self.safe_edit_original_response(interaction, embed=embed, view=view)
         except (SearchSessionError, ValueError) as exc:
             await self.send_session_error(interaction, exc)
@@ -1181,7 +1247,7 @@ class MogIndexCommandsCog(commands.Cog):
                 if state.mode == "hub":
                     state.mode = "recent"
                 embed, view, _page = self.render_panel(state)
-                self.service.save_session(state)
+                await self.run_full_index_db_write(self.service.save_session, state)
                 await self.safe_edit_original_response(interaction, embed=embed, view=view)
                 return
             channel = await self.fetch_channel_for_ui(value)
@@ -1215,7 +1281,7 @@ class MogIndexCommandsCog(commands.Cog):
             if state.mode == "hub":
                 state.mode = "recent"
             embed, view, _page = self.render_panel(state)
-            self.service.save_session(state)
+            await self.run_full_index_db_write(self.service.save_session, state)
             await self.safe_edit_original_response(interaction, embed=embed, view=view)
         except SearchSessionError as exc:
             await self.send_session_error(interaction, exc)
@@ -1778,7 +1844,7 @@ class MogIndexCommandsCog(commands.Cog):
     ) -> str:
         run_id = uuid.uuid4().hex
         now = now_kst().isoformat()
-        with self.service.open() as conn:
+        with self.service.state_open() as conn:
             conn.execute(
                 """
                 INSERT INTO full_index_runs (
@@ -1813,7 +1879,7 @@ class MogIndexCommandsCog(commands.Cog):
 
     def mark_interrupted_full_index_runs(self) -> None:
         now = now_kst().isoformat()
-        with self.service.open() as conn:
+        with self.service.state_open() as conn:
             conn.execute(
                 """
                 UPDATE full_index_days
@@ -1843,7 +1909,7 @@ class MogIndexCommandsCog(commands.Cog):
             conn.commit()
 
     def get_latest_full_index_run(self, *, incomplete_only: bool = False) -> dict[str, Any] | None:
-        with self.service.open() as conn:
+        with self.service.state_open() as conn:
             where = "WHERE status IN ('running', 'interrupted', 'failed')" if incomplete_only else ""
             row = conn.execute(
                 f"""
@@ -1871,7 +1937,7 @@ class MogIndexCommandsCog(commands.Cog):
         if schedule_key is not None:
             where.append("schedule_key = ?")
             params.append(schedule_key)
-        with self.service.open() as conn:
+        with self.service.state_open() as conn:
             row = conn.execute(
                 f"""
                 SELECT *
@@ -1931,7 +1997,7 @@ class MogIndexCommandsCog(commands.Cog):
         return date.fromisoformat(run_row["start_date"])
 
     def format_full_index_status(self) -> str:
-        with self.service.open() as conn:
+        with self.service.state_open() as conn:
             row = conn.execute(
                 """
                 SELECT *
@@ -1996,7 +2062,7 @@ class MogIndexCommandsCog(commands.Cog):
 
     def mark_full_index_day_started(self, run_id: str, index_date: date) -> None:
         now = now_kst().isoformat()
-        with self.service.open() as conn:
+        with self.service.state_open() as conn:
             conn.execute(
                 """
                 INSERT INTO full_index_days (
@@ -2033,7 +2099,7 @@ class MogIndexCommandsCog(commands.Cog):
         elapsed_seconds: float,
     ) -> None:
         now = now_kst().isoformat()
-        with self.service.open() as conn:
+        with self.service.state_open() as conn:
             conn.execute(
                 """
                 INSERT INTO full_index_days (
@@ -2073,7 +2139,7 @@ class MogIndexCommandsCog(commands.Cog):
     ) -> None:
         now = now_kst().isoformat()
         error_text = error_text[:1000]
-        with self.service.open() as conn:
+        with self.service.state_open() as conn:
             conn.execute(
                 """
                 INSERT INTO full_index_days (
@@ -2101,7 +2167,7 @@ class MogIndexCommandsCog(commands.Cog):
 
     def mark_full_index_run_completed(self, run_id: str) -> None:
         now = now_kst().isoformat()
-        with self.service.open() as conn:
+        with self.service.state_open() as conn:
             conn.execute(
                 """
                 UPDATE full_index_runs
@@ -2113,7 +2179,7 @@ class MogIndexCommandsCog(commands.Cog):
             conn.commit()
 
     def completed_full_index_source_rows(self, run_id: str, index_date: date) -> dict[str, Any]:
-        with self.service.open() as conn:
+        with self.service.state_open() as conn:
             rows = conn.execute(
                 """
                 SELECT source_id, scanned, indexed, elapsed_seconds
@@ -2134,7 +2200,7 @@ class MogIndexCommandsCog(commands.Cog):
         source_name: str,
     ) -> None:
         now = now_kst().isoformat()
-        with self.service.open() as conn:
+        with self.service.state_open() as conn:
             conn.execute(
                 """
                 INSERT INTO full_index_source_days (
@@ -2165,7 +2231,7 @@ class MogIndexCommandsCog(commands.Cog):
         elapsed_seconds: float,
     ) -> None:
         now = now_kst().isoformat()
-        with self.service.open() as conn:
+        with self.service.state_open() as conn:
             conn.execute(
                 """
                 INSERT INTO full_index_source_days (
@@ -2209,7 +2275,7 @@ class MogIndexCommandsCog(commands.Cog):
         error_text: str,
     ) -> None:
         now = now_kst().isoformat()
-        with self.service.open() as conn:
+        with self.service.state_open() as conn:
             conn.execute(
                 """
                 INSERT INTO full_index_source_days (
@@ -2262,7 +2328,7 @@ class MogIndexCommandsCog(commands.Cog):
         for attempt in range(1, attempts + 1):
             conn = None
             try:
-                conn = await asyncio.to_thread(self.service.connect)
+                conn = await asyncio.to_thread(self.service.index_connect)
                 return await collect_source(
                     conn,
                     target,
@@ -2272,7 +2338,8 @@ class MogIndexCommandsCog(commands.Cog):
                     before=before,
                     limit=None,
                     dry_run=False,
-                    db_write_lock=self.full_index_db_write_lock,
+                    db_write_lock=self.db_write_queue,
+                    fetch_timeout=FULL_INDEX_SOURCE_TIMEOUT_SECONDS,
                 )
             except Exception as exc:
                 if not self.is_transient_discord_error(exc) or attempt >= attempts:
@@ -2409,14 +2476,7 @@ class MogIndexCommandsCog(commands.Cog):
                 await asyncio.sleep(0.2 * (attempt + 1))
 
     async def run_full_index_db_write(self, callback: Any, *args: Any, **kwargs: Any) -> Any:
-        for attempt in range(6):
-            try:
-                async with self.full_index_db_write_lock:
-                    return await asyncio.to_thread(callback, *args, **kwargs)
-            except sqlite3.OperationalError as exc:
-                if "locked" not in str(exc).lower() or attempt >= 5:
-                    raise
-                await asyncio.sleep(0.2 * (attempt + 1))
+        return await self.db_write_queue.run(callback, *args, **kwargs)
 
     async def build_full_index_target_inventory(
         self,
@@ -2509,13 +2569,7 @@ class MogIndexCommandsCog(commands.Cog):
                     after=after,
                     before=before,
                 )
-                if FULL_INDEX_SOURCE_TIMEOUT_SECONDS > 0:
-                    scanned, indexed = await asyncio.wait_for(
-                        collect_coro,
-                        timeout=FULL_INDEX_SOURCE_TIMEOUT_SECONDS,
-                    )
-                else:
-                    scanned, indexed = await collect_coro
+                scanned, indexed = await collect_coro
                 elapsed = time.perf_counter() - target_started
                 await self.run_full_index_db_write(
                     self.mark_full_index_source_completed,

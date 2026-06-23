@@ -39,12 +39,16 @@ except ModuleNotFoundError:  # pragma: no cover
 
 from mogindex_debug import (
     CATEGORY_ID,
+    MOGINDEX_WRITE_BATCH_SIZE,
+    PreparedIndexedMessage,
     connect,
     discord_snowflake_datetime,
     get_recap,
     initialize_schema,
     insert_message_for_index,
+    insert_prepared_messages_for_index,
     parse_topic_lines,
+    prepare_message_for_index,
     print_inspect,
     print_recap,
     print_search_results,
@@ -55,7 +59,18 @@ from mogindex_debug import (
 )
 
 
-DEFAULT_DB_PATH = Path("/home/ubuntu/mogtel/mogindex/search_index_live_debug.sqlite3")
+MODULE_DIR = Path(__file__).resolve().parent
+
+
+def env_db_path(name: str, default: str) -> Path:
+    raw = os.getenv(name, default)
+    db_path = Path(raw)
+    if not db_path.is_absolute():
+        db_path = MODULE_DIR / db_path
+    return db_path
+
+
+DEFAULT_DB_PATH = env_db_path("MOGINDEX_DB_PATH", "mogindex/search_index_live_debug.sqlite3")
 DEFAULT_PARENT_CHANNEL_IDS = (
     "1347082174347874406",
     "1480185936456188079",
@@ -255,12 +270,20 @@ async def run_db_write(db_write_lock: asyncio.Lock | None, callback, *args, **kw
         try:
             if db_write_lock is None:
                 return await asyncio.to_thread(callback, *args, **kwargs)
+            runner = getattr(db_write_lock, "run", None)
+            if runner is not None:
+                return await runner(callback, *args, **kwargs)
             async with db_write_lock:
                 return await asyncio.to_thread(callback, *args, **kwargs)
         except sqlite3.OperationalError as exc:
             if "locked" not in str(exc).lower() or attempt >= 3:
                 raise
             await asyncio.sleep(0.25 * (attempt + 1))
+
+
+def batched(items: list[PreparedIndexedMessage], size: int) -> Iterable[list[PreparedIndexedMessage]]:
+    for index in range(0, len(items), size):
+        yield items[index : index + size]
 
 
 def write_source_messages(
@@ -272,7 +295,7 @@ def write_source_messages(
     parent_channel_id: str | None,
     guild_id: str,
     category_id: str,
-    messages: list[dict],
+    messages: list[PreparedIndexedMessage],
 ) -> int:
     upsert_source(
         conn,
@@ -283,41 +306,23 @@ def write_source_messages(
         guild_id=guild_id,
         category_id=category_id,
     )
-    indexed = 0
-    for message in messages:
-        inserted = insert_message_for_index(
-            conn,
-            message_id=message["message_id"],
-            source_id=source_id,
-            channel_id=message["channel_id"],
-            thread_id=source_id if source_kind == "thread" else None,
-            author_id=message["author_id"],
-            author_name=message["author_name"],
-            created_at=message["created_at"],
-            content=message["content"],
-            search_context=source_name,
-            guild_id=guild_id,
-        )
-        indexed += int(inserted)
+    indexed = insert_prepared_messages_for_index(conn, messages)
     conn.commit()
     return indexed
 
 
-async def collect_source(
-    conn,
+async def fetch_source_messages(
     target: SourceTarget,
     *,
     guild_id: str,
-    category_id: str,
     after: datetime,
     before: datetime,
     limit: int | None,
     dry_run: bool,
-    db_write_lock: asyncio.Lock | None = None,
-) -> tuple[int, int]:
+) -> tuple[int, int, list[PreparedIndexedMessage]]:
     scanned = 0
     indexed = 0
-    messages_to_write: list[dict] = []
+    messages_to_write: list[PreparedIndexedMessage] = []
 
     async for message in target.channel.history(
         after=after,
@@ -332,31 +337,65 @@ async def collect_source(
             indexed += 1
             continue
         messages_to_write.append(
-            {
-                "message_id": str(message.id),
-                "channel_id": str(message.channel.id),
-                "author_id": str(message.author.id),
-                "author_name": message.author.display_name,
-                "created_at": message.created_at,
-                "content": message.content or "",
-            }
+            prepare_message_for_index(
+                message_id=str(message.id),
+                source_id=target.source_id,
+                channel_id=str(message.channel.id),
+                thread_id=target.source_id if target.source_kind == "thread" else None,
+                author_id=str(message.author.id),
+                author_name=message.author.display_name,
+                created_at=message.created_at,
+                content=message.content or "",
+                search_context=target.name,
+                guild_id=guild_id,
+            )
         )
+    return scanned, indexed, messages_to_write
+
+
+async def collect_source(
+    conn,
+    target: SourceTarget,
+    *,
+    guild_id: str,
+    category_id: str,
+    after: datetime,
+    before: datetime,
+    limit: int | None,
+    dry_run: bool,
+    db_write_lock: asyncio.Lock | None = None,
+    fetch_timeout: int = 0,
+    write_batch_size: int = MOGINDEX_WRITE_BATCH_SIZE,
+) -> tuple[int, int]:
+    fetch_coro = fetch_source_messages(
+        target,
+        guild_id=guild_id,
+        after=after,
+        before=before,
+        limit=limit,
+        dry_run=dry_run,
+    )
+    if fetch_timeout > 0:
+        scanned, indexed, messages_to_write = await asyncio.wait_for(fetch_coro, timeout=fetch_timeout)
+    else:
+        scanned, indexed, messages_to_write = await fetch_coro
 
     if not dry_run:
-        indexed = await run_db_write(
-            db_write_lock,
-            write_source_messages,
-            conn,
-            source_id=target.source_id,
-            source_kind=target.source_kind,
-            source_name=target.name,
-            parent_channel_id=target.parent_channel_id,
-            guild_id=guild_id,
-            category_id=category_id,
-            messages=messages_to_write,
-        )
+        indexed = 0
+        for batch in batched(messages_to_write, max(1, write_batch_size)):
+            indexed += await run_db_write(
+                db_write_lock,
+                write_source_messages,
+                conn,
+                source_id=target.source_id,
+                source_kind=target.source_kind,
+                source_name=target.name,
+                parent_channel_id=target.parent_channel_id,
+                guild_id=guild_id,
+                category_id=category_id,
+                messages=batch,
+            )
     return scanned, indexed
-
 
 async def run_discover(args: argparse.Namespace) -> None:
     client = make_client()
@@ -546,7 +585,7 @@ def make_client() -> discord.Client:
 
 def get_token(env_name: str) -> str:
     if load_dotenv:
-        load_dotenv()
+        load_dotenv(Path(__file__).resolve().with_name(".env"), override=True)
     token = os.getenv(env_name)
     if not token:
         raise SystemExit(f"{env_name} is not set")

@@ -5,6 +5,7 @@ import logging
 import os
 import re
 import sqlite3
+import threading
 import time
 import uuid
 from collections import Counter, defaultdict
@@ -18,13 +19,24 @@ from zoneinfo import ZoneInfo
 from mogindex_debug import INDEX_EXCLUDED_TERMS, connect, extract_terms, initialize_schema, normalize_text
 
 
-DEFAULT_DB_PATH = Path(
-    os.getenv("MOGINDEX_DB_PATH", "/home/ubuntu/mogtel/mogindex/search_index_live_debug.sqlite3")
-)
+MODULE_DIR = Path(__file__).resolve().parent
+
+
+def env_db_path(name: str, default: str) -> Path:
+    raw = os.getenv(name, default)
+    db_path = Path(raw)
+    if not db_path.is_absolute():
+        db_path = MODULE_DIR / db_path
+    return db_path
+
+
+DEFAULT_DB_PATH = env_db_path("MOGINDEX_DB_PATH", "mogindex/search_index_live_debug.sqlite3")
+DEFAULT_STATE_DB_PATH = env_db_path("MOGINDEX_STATE_DB_PATH", "mogindex/search_state.sqlite3")
 SESSION_TTL_MINUTES = 30
 KST = ZoneInfo("Asia/Seoul")
 logger = logging.getLogger(__name__)
-LOCK_RETRY_DELAYS = (0.0, 0.1, 0.25, 0.5)
+LOCK_RETRY_DELAYS = (0.0, 0.25, 0.5, 1.0, 2.0)
+STATE_TABLES = ("search_sessions", "full_index_runs", "full_index_days", "full_index_source_days")
 
 Mode = Literal["hub", "keyword", "recap", "topic", "participants", "recent", "returnee"]
 Visibility = Literal["private", "shared"]
@@ -212,8 +224,7 @@ def ensure_column(conn: sqlite3.Connection, table: str, column: str, ddl: str) -
         conn.execute(f"ALTER TABLE {table} ADD COLUMN {ddl}")
 
 
-def initialize_service_schema(conn: sqlite3.Connection) -> None:
-    initialize_schema(conn)
+def initialize_state_schema(conn: sqlite3.Connection) -> None:
     conn.execute(
         """
         CREATE TABLE IF NOT EXISTS search_sessions (
@@ -307,6 +318,11 @@ def initialize_service_schema(conn: sqlite3.Connection) -> None:
     conn.commit()
 
 
+def initialize_service_schema(conn: sqlite3.Connection) -> None:
+    initialize_schema(conn)
+    initialize_state_schema(conn)
+
+
 def date_bounds(state: SearchPanelState) -> tuple[str | None, str | None]:
     today = now_kst().date()
     if state.date_preset == "today":
@@ -393,28 +409,140 @@ def make_filter_sql(
 
 
 class MogIndexService:
-    def __init__(self, db_path: Path = DEFAULT_DB_PATH):
+    def __init__(
+        self,
+        db_path: Path = DEFAULT_DB_PATH,
+        *,
+        state_db_path: Path = DEFAULT_STATE_DB_PATH,
+    ):
         self.db_path = db_path
+        self.index_db_path = db_path
+        self.state_db_path = state_db_path
+        self._schema_lock = threading.Lock()
+        self._index_schema_ready = False
+        self._state_schema_ready = False
+        self._legacy_state_copied = False
+
+    def index_connect(self) -> sqlite3.Connection:
+        return connect(self.index_db_path)
+
+    def state_connect(self) -> sqlite3.Connection:
+        return connect(self.state_db_path)
 
     def connect(self) -> sqlite3.Connection:
-        conn = connect(self.db_path)
+        return self.index_connect()
+
+    def initialize(self) -> None:
+        self.ensure_index_schema()
+        self.ensure_state_schema()
+
+    def ensure_index_schema(self) -> None:
+        if self._index_schema_ready:
+            return
+        with self._schema_lock:
+            if self._index_schema_ready:
+                return
+            conn = self.index_connect()
+            try:
+                initialize_schema(conn)
+            finally:
+                conn.close()
+            self._index_schema_ready = True
+
+    def ensure_state_schema(self) -> None:
+        if self._state_schema_ready:
+            return
+        with self._schema_lock:
+            if self._state_schema_ready:
+                return
+            conn = self.state_connect()
+            try:
+                initialize_state_schema(conn)
+                self.copy_legacy_state_if_needed(conn)
+            finally:
+                conn.close()
+            self._state_schema_ready = True
+
+    def copy_legacy_state_if_needed(self, state_conn: sqlite3.Connection) -> None:
+        if self._legacy_state_copied or self.index_db_path == self.state_db_path:
+            return
+        if any(self.table_row_count(state_conn, table) for table in STATE_TABLES):
+            self._legacy_state_copied = True
+            return
+        legacy_conn = self.index_connect()
         try:
-            conn.execute("PRAGMA busy_timeout = 5000")
-            initialize_service_schema(conn)
-            return conn
-        except Exception:
-            conn.close()
-            raise
+            copied = 0
+            for table in STATE_TABLES:
+                if not self.table_exists(legacy_conn, table):
+                    continue
+                state_columns = self.table_columns(state_conn, table)
+                legacy_columns = self.table_columns(legacy_conn, table)
+                columns = [column for column in state_columns if column in legacy_columns]
+                if not columns:
+                    continue
+                rows = legacy_conn.execute(
+                    f"SELECT {', '.join(columns)} FROM {table}"
+                ).fetchall()
+                if not rows:
+                    continue
+                placeholders = ", ".join("?" for _ in columns)
+                state_conn.executemany(
+                    f"INSERT OR IGNORE INTO {table} ({', '.join(columns)}) VALUES ({placeholders})",
+                    ([row[column] for column in columns] for row in rows),
+                )
+                copied += len(rows)
+            state_conn.commit()
+            if copied:
+                logger.info(
+                    "mogindex copied legacy state rows=%s from=%s to=%s",
+                    copied,
+                    self.index_db_path,
+                    self.state_db_path,
+                )
+        finally:
+            legacy_conn.close()
+            self._legacy_state_copied = True
+
+    def table_exists(self, conn: sqlite3.Connection, table: str) -> bool:
+        row = conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?",
+            (table,),
+        ).fetchone()
+        return row is not None
+
+    def table_columns(self, conn: sqlite3.Connection, table: str) -> list[str]:
+        return [row["name"] for row in conn.execute(f"PRAGMA table_info({table})")]
+
+    def table_row_count(self, conn: sqlite3.Connection, table: str) -> int:
+        if not self.table_exists(conn, table):
+            return 0
+        row = conn.execute(f"SELECT COUNT(*) AS count FROM {table}").fetchone()
+        return int(row["count"] if row else 0)
 
     @contextmanager
-    def open(self) -> Iterator[sqlite3.Connection]:
-        conn = self.connect()
+    def index_open(self) -> Iterator[sqlite3.Connection]:
+        self.ensure_index_schema()
+        conn = self.index_connect()
         try:
             yield conn
         finally:
             conn.close()
 
-    def create_session(self, interaction: Any) -> SearchPanelState:
+    @contextmanager
+    def state_open(self) -> Iterator[sqlite3.Connection]:
+        self.ensure_state_schema()
+        conn = self.state_connect()
+        try:
+            yield conn
+        finally:
+            conn.close()
+
+    @contextmanager
+    def open(self) -> Iterator[sqlite3.Connection]:
+        with self.index_open() as conn:
+            yield conn
+
+    def create_session(self, interaction: Any, *, persist: bool = True) -> SearchPanelState:
         current = now_kst()
         channel = getattr(interaction, "channel", None)
         channel_type = type(channel).__name__.lower() if channel is not None else ""
@@ -436,7 +564,8 @@ class MogIndexService:
             updated_at=current.isoformat(timespec="seconds"),
             expires_at=(current + timedelta(minutes=SESSION_TTL_MINUTES)).isoformat(timespec="seconds"),
         )
-        self.save_session(state)
+        if persist:
+            self.save_session(state)
         return state
 
     def _write_with_retry(self, label: str, callback: Any) -> Any:
@@ -445,7 +574,7 @@ class MogIndexService:
             if delay:
                 time.sleep(delay)
             try:
-                with self.open() as conn:
+                with self.state_open() as conn:
                     result = callback(conn)
                     conn.commit()
                     return result
@@ -494,7 +623,7 @@ class MogIndexService:
         self._write_with_retry("save_session", write)
 
     def load_session(self, session_id: str, user_id: str) -> SearchPanelState:
-        with self.open() as conn:
+        with self.state_open() as conn:
             row = conn.execute(
                 "SELECT state_json FROM search_sessions WHERE session_id = ?",
                 (session_id,),
@@ -603,7 +732,7 @@ class MogIndexService:
         state.page = 0
         return state
 
-    def create_detail_session(self, parent: SearchPanelState) -> SearchPanelState:
+    def create_detail_session(self, parent: SearchPanelState, *, persist: bool = True) -> SearchPanelState:
         current = now_kst()
         state = SearchPanelState.from_json(parent.to_json())
         state.session_id = uuid.uuid4().hex[:16]
@@ -617,7 +746,8 @@ class MogIndexService:
         state.created_at = current.isoformat(timespec="seconds")
         state.updated_at = current.isoformat(timespec="seconds")
         state.expires_at = (current + timedelta(minutes=SESSION_TTL_MINUTES)).isoformat(timespec="seconds")
-        self.save_session(state)
+        if persist:
+            self.save_session(state)
         return state
 
     def count_matching_sources(self, state: SearchPanelState) -> int:
@@ -635,7 +765,7 @@ class MogIndexService:
             params.extend(category_ids)
         if not source_ids and not category_ids:
             return 0
-        with self.open() as conn:
+        with self.index_open() as conn:
             row = conn.execute(
                 f"SELECT COUNT(*) AS count FROM sources WHERE {' AND '.join(filters)}",
                 tuple(params),
@@ -646,7 +776,7 @@ class MogIndexService:
         needle = source_lookup_key(query)
         if not needle:
             return []
-        with self.open() as conn:
+        with self.index_open() as conn:
             rows = conn.execute(
                 """
                 SELECT source_id, source_kind, category_id, parent_channel_id, name
@@ -781,7 +911,7 @@ class MogIndexService:
 
     def run_keyword_search(self, state: SearchPanelState) -> ResultPage:
         query, ranked = "", Counter()
-        with self.open() as conn:
+        with self.index_open() as conn:
             query, ranked = self._combined_keyword_rankings(conn, state)
             if not query.strip():
                 state.last_result_kind = "keyword"
@@ -874,7 +1004,7 @@ class MogIndexService:
         return ResultPage(title, results[start:end], state.page, state.page_size, total)
 
     def run_recap(self, state: SearchPanelState) -> TextPage:
-        with self.open() as conn:
+        with self.index_open() as conn:
             topic_filters, topic_params = make_filter_sql(
                 state,
                 date_column="mt.topic_date",
@@ -948,7 +1078,7 @@ class MogIndexService:
             return TextPage("복귀자 키워드", [], state.page, state.page_size, 0, "월드 맵 카테고리 설정이 없습니다.")
         limit = min(max(int(state.returnee_limit or 5), 1), 100)
         today = now_kst().date().isoformat()
-        with self.open() as conn:
+        with self.index_open() as conn:
             placeholders = ",".join("?" for _ in worldmap_ids)
             row = conn.execute(
                 f"""
@@ -1015,7 +1145,7 @@ class MogIndexService:
     def run_topic_search(self, state: SearchPanelState) -> TextPage:
         query = normalize_text(state.query or "")
         query_terms = set(extract_terms(query).keys()) if query else set()
-        with self.open() as conn:
+        with self.index_open() as conn:
             filters, params = make_filter_sql(
                 state,
                 date_column="mt.topic_date",
@@ -1075,7 +1205,7 @@ class MogIndexService:
         return page
 
     def run_recent(self, state: SearchPanelState) -> ResultPage:
-        with self.open() as conn:
+        with self.index_open() as conn:
             filters, params = make_filter_sql(
                 state,
                 date_column="m.message_date",
@@ -1130,7 +1260,7 @@ class MogIndexService:
         return page
 
     def run_participants(self, state: SearchPanelState) -> TextPage:
-        with self.open() as conn:
+        with self.index_open() as conn:
             filters, params = make_filter_sql(
                 state,
                 date_column="m.message_date",

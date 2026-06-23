@@ -94,6 +94,7 @@ MOGINDEX_ERROR_THREAD_ID="<에러가 났을 때 알림 메세지를 받을 곳�
 MOG_CATEGORY_ID="<기본 카테고리 ID. 보통 색인할 카테고리 중 하나를 넣으면 됩니다>"
 MOG_GUILD_ID="<서버 ID>"
 MOGINDEX_DB_PATH=mogindex/search_index_live_debug.sqlite3
+MOGINDEX_STATE_DB_PATH=mogindex/search_state.sqlite3
 MOG_INDEX_CATEGORIES_JSON=[{"key":"worldmap","name":"월드 맵","category_id":"<카테고리 ID>","worldmap":true,"parent_channel_ids":["<채널 ID>","<포럼 ID>"]},{"key":"custom","name":"커스텀 모드","category_id":"<카테고리 ID>","worldmap":false,"parent_channel_ids":["<채널 ID>"]}]
 ```
 
@@ -117,6 +118,9 @@ FULL_INDEX_SLOW_DAY_SECONDS=300
 FULL_INDEX_REST_SECONDS=120
 FULL_INDEX_DISCORD_RETRY_ATTEMPTS=4
 FULL_INDEX_DISCORD_RETRY_SECONDS=15
+FULL_INDEX_PARALLEL_SOURCES=4
+FULL_INDEX_SOURCE_TIMEOUT_SECONDS=300
+MOGINDEX_WRITE_BATCH_SIZE=250
 MOGINDEX_DAILY_ENABLED=true
 MOGINDEX_DAILY_HOUR=23
 MOGINDEX_DAILY_MINUTE=59
@@ -126,6 +130,10 @@ MOGINDEX_DAILY_CATEGORIES=메인 메뉴,월드 맵,커스텀 모드
 - `FULL_INDEX_SLOW_DAY_SECONDS`는 하루 색인이 이 시간 이상 걸렸을 때 쉬어갈 기준입니다.
 - `FULL_INDEX_REST_SECONDS`는 쉬어갈 시간입니다.
 - `FULL_INDEX_DISCORD_RETRY_ATTEMPTS`와 `FULL_INDEX_DISCORD_RETRY_SECONDS`는 디스코드 API가 503을 냈을 때 재시도하는 횟수와 대기 시간입니다.
+- `FULL_INDEX_PARALLEL_SOURCES`는 하루 안에서 동시에 읽을 채널/스레드 수입니다. 저장은 queue로 직렬화됩니다.
+- `FULL_INDEX_SOURCE_TIMEOUT_SECONDS`는 source의 Discord history 읽기 제한 시간입니다. DB 저장 중에는 이 timeout으로 끊지 않습니다.
+- `MOGINDEX_WRITE_BATCH_SIZE`는 한 번에 저장할 메시지 수입니다. 기본값은 250입니다.
+- `MOGINDEX_STATE_DB_PATH`는 검색 세션과 전체색인 진행상태를 저장하는 별도 SQLite DB입니다.
 
 ## 4. phs 폴더와 local_server 폴더에 대해
 

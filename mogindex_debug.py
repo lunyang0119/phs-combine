@@ -55,9 +55,11 @@ FULL_INDEX_DISCORD_RETRY_SECONDS = env_int("FULL_INDEX_DISCORD_RETRY_SECONDS", 1
 # Number of sources/threads to index concurrently inside one day.
 # Keep the server default conservative; raise this in local .env when testing.
 FULL_INDEX_PARALLEL_SOURCES = env_int("FULL_INDEX_PARALLEL_SOURCES", 1)
-# Maximum seconds allowed for one source/thread during full-index.
+# Maximum seconds allowed for one source/thread during full-index fetch.
 # Set to 0 to disable the per-source timeout.
 FULL_INDEX_SOURCE_TIMEOUT_SECONDS = env_int("FULL_INDEX_SOURCE_TIMEOUT_SECONDS", 300)
+# Number of fetched Discord messages to write in one SQLite batch.
+MOGINDEX_WRITE_BATCH_SIZE = max(1, env_int("MOGINDEX_WRITE_BATCH_SIZE", 250))
 
 # Fake guild id used only by local seed/debug data. This is not the live server id.
 DEBUG_GUILD_ID = os.getenv("MOG_GUILD_ID")
@@ -858,6 +860,7 @@ STOP_TERMS = {
 }
 
 ENDING_SUFFIXES = (
+    '건가',
     '이었습니다',
     '였습니다',
     '했습니다',
@@ -871,7 +874,6 @@ ENDING_SUFFIXES = (
 )
 
 ENDING_NGRAM_STOP_TERMS = {
-    '하다',
     '니다',
     '습니',
     '습니다',
@@ -905,11 +907,27 @@ class TopicLine:
     source_line: str
 
 
+@dataclass(frozen=True)
+class PreparedIndexedMessage:
+    message_id: str
+    source_id: str
+    channel_id: str
+    thread_id: str | None
+    guild_id: str
+    author_id: str
+    author_name: str
+    created_at: str
+    message_date: str
+    jump_url: str
+    normalized: str
+    message_terms: dict[str, int]
+    content_terms: dict[str, int]
+
 def connect(db_path: Path) -> sqlite3.Connection:
     db_path.parent.mkdir(parents=True, exist_ok=True)
     conn = sqlite3.connect(db_path, check_same_thread=False)
     conn.row_factory = sqlite3.Row
-    conn.execute("PRAGMA busy_timeout = 5000")
+    conn.execute("PRAGMA busy_timeout = 30000")
     conn.execute("PRAGMA foreign_keys = ON")
     conn.execute("PRAGMA journal_mode = WAL")
     conn.execute("PRAGMA synchronous = NORMAL")
@@ -1151,6 +1169,113 @@ def upsert_source(
     )
 
 
+def prepare_message_for_index(
+    *,
+    message_id: str,
+    source_id: str,
+    channel_id: str,
+    author_id: str,
+    author_name: str,
+    created_at: datetime,
+    content: str,
+    search_context: str = "",
+    guild_id: str = DEBUG_GUILD_ID,
+    thread_id: str | None = None,
+) -> PreparedIndexedMessage:
+    message_date = created_at.date().isoformat()
+    normalized = normalize_text(f"{content} {search_context}".strip())
+    content_terms = extract_terms(content)
+    message_terms = Counter(content_terms)
+    for term, count in extract_terms(search_context).items():
+        message_terms[term] += count
+    return PreparedIndexedMessage(
+        message_id=message_id,
+        source_id=source_id,
+        channel_id=channel_id,
+        thread_id=thread_id,
+        guild_id=guild_id,
+        author_id=author_id,
+        author_name=author_name,
+        created_at=created_at.isoformat(),
+        message_date=message_date,
+        jump_url=jump_url(guild_id, channel_id, message_id),
+        normalized=normalized,
+        message_terms=dict(message_terms),
+        content_terms=dict(content_terms),
+    )
+
+
+def insert_prepared_message_for_index(conn: sqlite3.Connection, message: PreparedIndexedMessage) -> bool:
+    cursor = conn.execute(
+        """
+        INSERT OR IGNORE INTO messages (
+            message_id, source_id, guild_id, channel_id, thread_id,
+            author_id, author_name, created_at, message_date, jump_url
+        )
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        (
+            message.message_id,
+            message.source_id,
+            message.guild_id,
+            message.channel_id,
+            message.thread_id,
+            message.author_id,
+            message.author_name,
+            message.created_at,
+            message.message_date,
+            message.jump_url,
+        ),
+    )
+    if cursor.rowcount == 0:
+        return False
+
+    message_pk = int(cursor.lastrowid)
+    if not message_pk:
+        row = conn.execute(
+            "SELECT message_pk FROM messages WHERE message_id = ?",
+            (message.message_id,),
+        ).fetchone()
+        message_pk = int(row["message_pk"])
+
+    if message.normalized:
+        conn.execute(
+            "INSERT INTO message_fts(rowid, index_text) VALUES (?, ?)",
+            (message_pk, message.normalized),
+        )
+
+    for term, count in message.message_terms.items():
+        conn.execute(
+            """
+            INSERT INTO message_terms(term, message_pk, source_id, message_date, count)
+            VALUES (?, ?, ?, ?, ?)
+            """,
+            (term, message_pk, message.source_id, message.message_date, count),
+        )
+
+    for term, count in message.content_terms.items():
+        conn.execute(
+            """
+            INSERT INTO daily_terms(source_id, message_date, term, count)
+            VALUES (?, ?, ?, ?)
+            ON CONFLICT(source_id, message_date, term)
+            DO UPDATE SET count = count + excluded.count
+            """,
+            (message.source_id, message.message_date, term, count),
+        )
+    return True
+
+
+def insert_prepared_messages_for_index(
+    conn: sqlite3.Connection,
+    messages: Iterable[PreparedIndexedMessage],
+) -> int:
+    indexed = 0
+    for message in messages:
+        indexed += int(insert_prepared_message_for_index(conn, message))
+    return indexed
+
+
 def insert_message_for_index(
     conn: sqlite3.Connection,
     *,
@@ -1165,68 +1290,19 @@ def insert_message_for_index(
     guild_id: str = DEBUG_GUILD_ID,
     thread_id: str | None = None,
 ) -> bool:
-    message_date = created_at.date().isoformat()
-    cursor = conn.execute(
-        """
-        INSERT OR IGNORE INTO messages (
-            message_id, source_id, guild_id, channel_id, thread_id,
-            author_id, author_name, created_at, message_date, jump_url
-        )
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-        """,
-        (
-            message_id,
-            source_id,
-            guild_id,
-            channel_id,
-            thread_id,
-            author_id,
-            author_name,
-            created_at.isoformat(),
-            message_date,
-            jump_url(guild_id, channel_id, message_id),
-        ),
+    message = prepare_message_for_index(
+        message_id=message_id,
+        source_id=source_id,
+        channel_id=channel_id,
+        thread_id=thread_id,
+        author_id=author_id,
+        author_name=author_name,
+        created_at=created_at,
+        content=content,
+        search_context=search_context,
+        guild_id=guild_id,
     )
-    if cursor.rowcount == 0:
-        return False
-
-    message_pk = conn.execute(
-        "SELECT message_pk FROM messages WHERE message_id = ?", (message_id,)
-    ).fetchone()["message_pk"]
-
-    normalized = normalize_text(f"{content} {search_context}".strip())
-    if normalized:
-        conn.execute(
-            "INSERT INTO message_fts(rowid, index_text) VALUES (?, ?)",
-            (message_pk, normalized),
-        )
-
-    message_terms = extract_terms(content)
-    for term, count in extract_terms(search_context).items():
-        message_terms[term] += count
-
-    content_terms = extract_terms(content)
-    for term, count in message_terms.items():
-        conn.execute(
-            """
-            INSERT INTO message_terms(term, message_pk, source_id, message_date, count)
-            VALUES (?, ?, ?, ?, ?)
-            """,
-            (term, message_pk, source_id, message_date, count),
-        )
-
-    for term, count in content_terms.items():
-        conn.execute(
-            """
-            INSERT INTO daily_terms(source_id, message_date, term, count)
-            VALUES (?, ?, ?, ?)
-            ON CONFLICT(source_id, message_date, term)
-            DO UPDATE SET count = count + excluded.count
-            """,
-            (source_id, message_date, term, count),
-        )
-    return True
-
+    return insert_prepared_message_for_index(conn, message)
 
 def parse_topic_lines(text: str) -> list[TopicLine]:
     topics: list[TopicLine] = []
