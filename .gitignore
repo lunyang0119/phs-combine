@@ -17,3 +17,7 @@ combat/__pycache__/random_utils.cpython-313.pyc
 combat/__pycache__/combat_utils.cpython-313.pyc
 combat/__pycache__/boss_skill_system.cpython-313.pyc
 combat/__pycache__/battle_manager.cpython-313.pyc
+.rtk/filters.toml
+.gitignore
+RTK.md
+AGENTS.md

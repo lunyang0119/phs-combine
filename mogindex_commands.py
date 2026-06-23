@@ -23,6 +23,7 @@ from mogindex_debug import (
     FULL_INDEX_PARALLEL_SOURCES,
     FULL_INDEX_REST_SECONDS,
     FULL_INDEX_SLOW_DAY_SECONDS,
+    FULL_INDEX_SOURCE_TIMEOUT_SECONDS,
     connect as index_connect,
     initialize_schema,
 )
@@ -2501,13 +2502,20 @@ class MogIndexCommandsCog(commands.Cog):
                     category_key=category.key,
                     source_name=source_name,
                 )
-                scanned, indexed = await self.collect_source_with_retry(
+                collect_coro = self.collect_source_with_retry(
                     target,
                     guild_id=guild_id,
                     category_id=category.category_id,
                     after=after,
                     before=before,
                 )
+                if FULL_INDEX_SOURCE_TIMEOUT_SECONDS > 0:
+                    scanned, indexed = await asyncio.wait_for(
+                        collect_coro,
+                        timeout=FULL_INDEX_SOURCE_TIMEOUT_SECONDS,
+                    )
+                else:
+                    scanned, indexed = await collect_coro
                 elapsed = time.perf_counter() - target_started
                 await self.run_full_index_db_write(
                     self.mark_full_index_source_completed,

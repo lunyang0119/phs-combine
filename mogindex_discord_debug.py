@@ -260,7 +260,47 @@ async def run_db_write(db_write_lock: asyncio.Lock | None, callback, *args, **kw
         except sqlite3.OperationalError as exc:
             if "locked" not in str(exc).lower() or attempt >= 3:
                 raise
-            await asyncio.sleep(0.1 * (attempt + 1))
+            await asyncio.sleep(0.25 * (attempt + 1))
+
+
+def write_source_messages(
+    conn,
+    *,
+    source_id: str,
+    source_kind: str,
+    source_name: str,
+    parent_channel_id: str | None,
+    guild_id: str,
+    category_id: str,
+    messages: list[dict],
+) -> int:
+    upsert_source(
+        conn,
+        source_id,
+        source_kind,
+        source_name,
+        parent_channel_id,
+        guild_id=guild_id,
+        category_id=category_id,
+    )
+    indexed = 0
+    for message in messages:
+        inserted = insert_message_for_index(
+            conn,
+            message_id=message["message_id"],
+            source_id=source_id,
+            channel_id=message["channel_id"],
+            thread_id=source_id if source_kind == "thread" else None,
+            author_id=message["author_id"],
+            author_name=message["author_name"],
+            created_at=message["created_at"],
+            content=message["content"],
+            search_context=source_name,
+            guild_id=guild_id,
+        )
+        indexed += int(inserted)
+    conn.commit()
+    return indexed
 
 
 async def collect_source(
@@ -277,18 +317,7 @@ async def collect_source(
 ) -> tuple[int, int]:
     scanned = 0
     indexed = 0
-    if not dry_run:
-        await run_db_write(
-            db_write_lock,
-            upsert_source,
-            conn,
-            target.source_id,
-            target.source_kind,
-            target.name,
-            target.parent_channel_id,
-            guild_id,
-            category_id,
-        )
+    messages_to_write: list[dict] = []
 
     async for message in target.channel.history(
         after=after,
@@ -302,25 +331,30 @@ async def collect_source(
         if dry_run:
             indexed += 1
             continue
-
-        inserted = await run_db_write(
-            db_write_lock,
-            insert_message_for_index,
-            conn,
-            message_id=str(message.id),
-            source_id=target.source_id,
-            channel_id=str(message.channel.id),
-            thread_id=target.source_id if target.source_kind == "thread" else None,
-            author_id=str(message.author.id),
-            author_name=message.author.display_name,
-            created_at=message.created_at,
-            content=message.content or "",
-            search_context=target.name,
-            guild_id=guild_id,
+        messages_to_write.append(
+            {
+                "message_id": str(message.id),
+                "channel_id": str(message.channel.id),
+                "author_id": str(message.author.id),
+                "author_name": message.author.display_name,
+                "created_at": message.created_at,
+                "content": message.content or "",
+            }
         )
-        indexed += int(inserted)
+
     if not dry_run:
-        await run_db_write(db_write_lock, conn.commit)
+        indexed = await run_db_write(
+            db_write_lock,
+            write_source_messages,
+            conn,
+            source_id=target.source_id,
+            source_kind=target.source_kind,
+            source_name=target.name,
+            parent_channel_id=target.parent_channel_id,
+            guild_id=guild_id,
+            category_id=category_id,
+            messages=messages_to_write,
+        )
     return scanned, indexed
 
 

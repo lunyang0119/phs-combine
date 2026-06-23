@@ -55,6 +55,9 @@ FULL_INDEX_DISCORD_RETRY_SECONDS = env_int("FULL_INDEX_DISCORD_RETRY_SECONDS", 1
 # Number of sources/threads to index concurrently inside one day.
 # Keep the server default conservative; raise this in local .env when testing.
 FULL_INDEX_PARALLEL_SOURCES = env_int("FULL_INDEX_PARALLEL_SOURCES", 1)
+# Maximum seconds allowed for one source/thread during full-index.
+# Set to 0 to disable the per-source timeout.
+FULL_INDEX_SOURCE_TIMEOUT_SECONDS = env_int("FULL_INDEX_SOURCE_TIMEOUT_SECONDS", 300)
 
 # Fake guild id used only by local seed/debug data. This is not the live server id.
 DEBUG_GUILD_ID = os.getenv("MOG_GUILD_ID")
