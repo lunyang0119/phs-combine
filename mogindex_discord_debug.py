@@ -149,6 +149,24 @@ def thread_might_have_messages(
     return True
 
 
+async def thread_has_message_in_range(
+    thread: discord.Thread,
+    *,
+    after: datetime | None,
+    before: datetime | None,
+) -> bool:
+    if after is None or before is None:
+        return True
+    try:
+        async for message in thread.history(before=before, limit=1, oldest_first=False):
+            return message.created_at > after
+    except (discord.Forbidden, discord.NotFound):
+        raise
+    except Exception:
+        return True
+    return False
+
+
 async def iter_archived_threads(channel: object, include_private: bool) -> Iterable[discord.Thread]:
     archived_threads = getattr(channel, "archived_threads", None)
     if archived_threads is None:
@@ -324,10 +342,14 @@ async def fetch_source_messages(
     indexed = 0
     messages_to_write: list[PreparedIndexedMessage] = []
 
+    if target.source_kind == "thread" and not await thread_has_message_in_range(target.channel, after=after, before=before):
+        return scanned, indexed, messages_to_write
+
+    newest_first_for_day = after is not None and before is not None and limit is None
     async for message in target.channel.history(
         after=after,
         before=before,
-        oldest_first=True,
+        oldest_first=not newest_first_for_day,
         limit=limit,
     ):
         scanned += 1
