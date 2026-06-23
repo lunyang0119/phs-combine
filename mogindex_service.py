@@ -281,6 +281,29 @@ def initialize_service_schema(conn: sqlite3.Connection) -> None:
         "CREATE INDEX IF NOT EXISTS idx_full_index_days_status "
         "ON full_index_days(run_id, status, index_date DESC)"
     )
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS full_index_source_days (
+            run_id TEXT NOT NULL,
+            index_date TEXT NOT NULL,
+            source_id TEXT NOT NULL,
+            status TEXT NOT NULL,
+            category_key TEXT,
+            source_name TEXT,
+            scanned INTEGER NOT NULL DEFAULT 0,
+            indexed INTEGER NOT NULL DEFAULT 0,
+            elapsed_seconds REAL NOT NULL DEFAULT 0,
+            error_text TEXT,
+            started_at TEXT,
+            finished_at TEXT,
+            PRIMARY KEY(run_id, index_date, source_id)
+        )
+        """
+    )
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_full_index_source_days_status "
+        "ON full_index_source_days(run_id, index_date, status)"
+    )
     conn.commit()
 
 

@@ -52,6 +52,9 @@ FULL_INDEX_REST_SECONDS = env_int("FULL_INDEX_REST_SECONDS", 120)
 FULL_INDEX_DISCORD_RETRY_ATTEMPTS = env_int("FULL_INDEX_DISCORD_RETRY_ATTEMPTS", 4)
 # Base delay; actual delay is this value multiplied by the retry number.
 FULL_INDEX_DISCORD_RETRY_SECONDS = env_int("FULL_INDEX_DISCORD_RETRY_SECONDS", 15)
+# Number of sources/threads to index concurrently inside one day.
+# Keep the server default conservative; raise this in local .env when testing.
+FULL_INDEX_PARALLEL_SOURCES = env_int("FULL_INDEX_PARALLEL_SOURCES", 1)
 
 # Fake guild id used only by local seed/debug data. This is not the live server id.
 DEBUG_GUILD_ID = os.getenv("MOG_GUILD_ID")
@@ -865,6 +868,7 @@ ENDING_SUFFIXES = (
 )
 
 ENDING_NGRAM_STOP_TERMS = {
+    '하다',
     '니다',
     '습니',
     '습니다',
@@ -900,8 +904,9 @@ class TopicLine:
 
 def connect(db_path: Path) -> sqlite3.Connection:
     db_path.parent.mkdir(parents=True, exist_ok=True)
-    conn = sqlite3.connect(db_path)
+    conn = sqlite3.connect(db_path, check_same_thread=False)
     conn.row_factory = sqlite3.Row
+    conn.execute("PRAGMA busy_timeout = 5000")
     conn.execute("PRAGMA foreign_keys = ON")
     conn.execute("PRAGMA journal_mode = WAL")
     conn.execute("PRAGMA synchronous = NORMAL")

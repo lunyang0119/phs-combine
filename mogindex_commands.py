@@ -5,6 +5,7 @@ import json
 import logging
 import os
 import re
+import sqlite3
 import time
 import traceback
 import uuid
@@ -19,6 +20,7 @@ from discord.ext import commands
 from mogindex_debug import (
     FULL_INDEX_DISCORD_RETRY_ATTEMPTS,
     FULL_INDEX_DISCORD_RETRY_SECONDS,
+    FULL_INDEX_PARALLEL_SOURCES,
     FULL_INDEX_REST_SECONDS,
     FULL_INDEX_SLOW_DAY_SECONDS,
     connect as index_connect,
@@ -30,6 +32,7 @@ from mogindex_discord_debug import (
     collect_source,
     date_bounds as discord_date_bounds,
     gather_targets,
+    thread_might_have_messages,
 )
 from mogindex_service import (
     DatePreset,
@@ -113,6 +116,23 @@ class IndexCategoryConfig:
             "parent_channel_ids": list(self.parent_channel_ids),
             "worldmap": self.worldmap,
         }
+
+
+@dataclass(frozen=True)
+class FullIndexTarget:
+    category: IndexCategoryConfig
+    target: Any
+
+
+@dataclass(frozen=True)
+class FullIndexSourceResult:
+    category_key: str
+    source_id: str
+    source_name: str
+    scanned: int
+    indexed: int
+    elapsed_seconds: float
+    error: str | None = None
 
 
 def parse_index_categories() -> list[IndexCategoryConfig]:
@@ -531,6 +551,7 @@ class MogIndexCommandsCog(commands.Cog):
         self.service = MogIndexService()
         self.full_index_task: asyncio.Task | None = None
         self.daily_index_task: asyncio.Task | None = None
+        self.full_index_db_write_lock = asyncio.Lock()
         self.index_categories = parse_index_categories()
         self.category_by_key = {category.key: category for category in self.index_categories}
         logger.info(
@@ -1600,17 +1621,21 @@ class MogIndexCommandsCog(commands.Cog):
             return
 
         action_value = action.value if action else "status"
+        if action_value == "status":
+            await interaction.response.defer(ephemeral=True, thinking=True)
+            try:
+                status_text = await self.run_full_index_db_read(self.format_full_index_status)
+            except sqlite3.OperationalError as exc:
+                if "locked" not in str(exc).lower():
+                    raise
+                status_text = "색인 DB가 현재 쓰기 작업 중이라 상태를 읽지 못했습니다. 잠시 후 다시 확인해주세요."
+            await interaction.followup.send(status_text, ephemeral=True)
+            return
         if self.full_index_task and not self.full_index_task.done():
-            if action_value == "status":
-                await interaction.response.send_message(self.format_full_index_status(), ephemeral=True)
-                return
             await interaction.response.send_message("전체색인이 이미 실행 중입니다. 상태확인을 사용해주세요.", ephemeral=True)
             return
 
-        self.mark_interrupted_full_index_runs()
-        if action_value == "status":
-            await interaction.response.send_message(self.format_full_index_status(), ephemeral=True)
-            return
+        await self.run_full_index_db_write(self.mark_interrupted_full_index_runs)
         if action_value == "resume":
             await self.start_full_index_resume(interaction)
             return
@@ -1658,7 +1683,8 @@ class MogIndexCommandsCog(commands.Cog):
         start_date = start_date or now_kst().date()
         end_date = end_date or date(2024, 6, 5)
         target_categories = self.selected_categories(category_key)
-        run_id = self.create_full_index_run(
+        run_id = await self.run_full_index_db_write(
+            self.create_full_index_run,
             guild_id=str(interaction.guild_id),
             requested_by=str(interaction.user.id),
             start_date=start_date,
@@ -1691,12 +1717,14 @@ class MogIndexCommandsCog(commands.Cog):
         await interaction.response.send_message(
             f"전체색인을 백그라운드에서 새로 시작했습니다. run={run_id[:8]} / {start_date}부터 {end_date}까지 진행합니다. 대상: {', '.join(category.name for category in target_categories)}. "
             f"하루 처리 시간이 {format_duration(FULL_INDEX_SLOW_DAY_SECONDS)} 이상이면 "
-            f"{format_duration(FULL_INDEX_REST_SECONDS)} 쉬고, 더 빠르면 바로 다음 날짜로 넘어갑니다.",
+            f"{format_duration(FULL_INDEX_REST_SECONDS)} 쉬고, 더 빠르면 바로 다음 날짜로 넘어갑니다. "
+            f"하루 안 source 병렬 수: {self.full_index_parallel_sources()}.",
             ephemeral=True,
         )
 
     async def start_full_index_resume(self, interaction: discord.Interaction) -> None:
-        resume = self.get_full_index_resume_plan(
+        resume = await self.run_full_index_db_write(
+            self.get_full_index_resume_plan,
             requested_by=str(interaction.user.id),
             notify_channel_id=str(interaction.channel_id),
             notify_user_id=str(interaction.user.id),
@@ -1790,6 +1818,15 @@ class MogIndexCommandsCog(commands.Cog):
                 UPDATE full_index_days
                 SET status = 'interrupted', finished_at = ?,
                     error_text = COALESCE(error_text, 'bot stopped before completion')
+                WHERE status = 'running'
+                """,
+                (now,),
+            )
+            conn.execute(
+                """
+                UPDATE full_index_source_days
+                SET status = 'interrupted', finished_at = ?,
+                    error_text = COALESCE(error_text, 'bot stopped before source completion')
                 WHERE status = 'running'
                 """,
                 (now,),
@@ -1913,6 +1950,16 @@ class MogIndexCommandsCog(commands.Cog):
                 """,
                 (row["run_id"],),
             ).fetchall()
+            source_failures = conn.execute(
+                """
+                SELECT index_date, source_id, source_name, error_text
+                FROM full_index_source_days
+                WHERE run_id = ? AND status IN ('failed', 'interrupted')
+                ORDER BY COALESCE(finished_at, started_at) DESC
+                LIMIT 3
+                """,
+                (row["run_id"],),
+            ).fetchall()
             resume_date = self.resolve_full_index_resume_date(conn, row)
         count_map = {item["status"]: item["count"] for item in counts}
         status_names = {
@@ -1925,6 +1972,14 @@ class MogIndexCommandsCog(commands.Cog):
         count_text = ", ".join(
             f"{status_names.get(status, status)} {count}일" for status, count in sorted(count_map.items())
         ) or "처리 기록 없음"
+        failure_text = ""
+        if source_failures:
+            failure_lines = []
+            for item in source_failures:
+                source_name = item["source_name"] or item["source_id"]
+                error = clip(item["error_text"] or "-", 120)
+                failure_lines.append(f"- {item['index_date']} {source_name}: {error}")
+            failure_text = "\n최근 source 실패:\n" + "\n".join(failure_lines)
         return (
             "전체색인 상태\n"
             f"run: {row['run_id'][:8]}\n"
@@ -1935,6 +1990,7 @@ class MogIndexCommandsCog(commands.Cog):
             f"마지막 완료: {row['last_completed_date'] or '-'}\n"
             f"다음 이어하기: {next_text}\n"
             f"일자 기록: {count_text}"
+            f"{failure_text}"
         )
 
     def mark_full_index_day_started(self, run_id: str, index_date: date) -> None:
@@ -2055,6 +2111,134 @@ class MogIndexCommandsCog(commands.Cog):
             )
             conn.commit()
 
+    def completed_full_index_source_rows(self, run_id: str, index_date: date) -> dict[str, Any]:
+        with self.service.open() as conn:
+            rows = conn.execute(
+                """
+                SELECT source_id, scanned, indexed, elapsed_seconds
+                FROM full_index_source_days
+                WHERE run_id = ? AND index_date = ? AND status = 'completed'
+                """,
+                (run_id, index_date.isoformat()),
+            ).fetchall()
+        return {row["source_id"]: row for row in rows}
+
+    def mark_full_index_source_started(
+        self,
+        *,
+        run_id: str,
+        index_date: date,
+        source_id: str,
+        category_key: str,
+        source_name: str,
+    ) -> None:
+        now = now_kst().isoformat()
+        with self.service.open() as conn:
+            conn.execute(
+                """
+                INSERT INTO full_index_source_days (
+                    run_id, index_date, source_id, status, category_key, source_name,
+                    scanned, indexed, elapsed_seconds, error_text, started_at, finished_at
+                )
+                VALUES (?, ?, ?, 'running', ?, ?, 0, 0, 0, NULL, ?, NULL)
+                ON CONFLICT(run_id, index_date, source_id) DO UPDATE SET
+                    status = 'running', category_key = excluded.category_key,
+                    source_name = excluded.source_name, scanned = 0, indexed = 0,
+                    elapsed_seconds = 0, error_text = NULL,
+                    started_at = excluded.started_at, finished_at = NULL
+                """,
+                (run_id, index_date.isoformat(), source_id, category_key, source_name, now),
+            )
+            conn.commit()
+
+    def mark_full_index_source_completed(
+        self,
+        *,
+        run_id: str,
+        index_date: date,
+        source_id: str,
+        category_key: str,
+        source_name: str,
+        scanned: int,
+        indexed: int,
+        elapsed_seconds: float,
+    ) -> None:
+        now = now_kst().isoformat()
+        with self.service.open() as conn:
+            conn.execute(
+                """
+                INSERT INTO full_index_source_days (
+                    run_id, index_date, source_id, status, category_key, source_name,
+                    scanned, indexed, elapsed_seconds, error_text, started_at, finished_at
+                )
+                VALUES (?, ?, ?, 'completed', ?, ?, ?, ?, ?, NULL, ?, ?)
+                ON CONFLICT(run_id, index_date, source_id) DO UPDATE SET
+                    status = 'completed', category_key = excluded.category_key,
+                    source_name = excluded.source_name, scanned = excluded.scanned,
+                    indexed = excluded.indexed, elapsed_seconds = excluded.elapsed_seconds,
+                    error_text = NULL, finished_at = excluded.finished_at
+                """,
+                (
+                    run_id,
+                    index_date.isoformat(),
+                    source_id,
+                    category_key,
+                    source_name,
+                    scanned,
+                    indexed,
+                    elapsed_seconds,
+                    now,
+                    now,
+                ),
+            )
+            conn.commit()
+
+    def mark_full_index_source_failed(
+        self,
+        *,
+        run_id: str,
+        index_date: date,
+        source_id: str,
+        category_key: str,
+        source_name: str,
+        status: str,
+        scanned: int,
+        indexed: int,
+        elapsed_seconds: float,
+        error_text: str,
+    ) -> None:
+        now = now_kst().isoformat()
+        with self.service.open() as conn:
+            conn.execute(
+                """
+                INSERT INTO full_index_source_days (
+                    run_id, index_date, source_id, status, category_key, source_name,
+                    scanned, indexed, elapsed_seconds, error_text, started_at, finished_at
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(run_id, index_date, source_id) DO UPDATE SET
+                    status = excluded.status, category_key = excluded.category_key,
+                    source_name = excluded.source_name, scanned = excluded.scanned,
+                    indexed = excluded.indexed, elapsed_seconds = excluded.elapsed_seconds,
+                    error_text = excluded.error_text, finished_at = excluded.finished_at
+                """,
+                (
+                    run_id,
+                    index_date.isoformat(),
+                    source_id,
+                    status,
+                    category_key,
+                    source_name,
+                    scanned,
+                    indexed,
+                    elapsed_seconds,
+                    error_text[:1000],
+                    now,
+                    now,
+                ),
+            )
+            conn.commit()
+
     def is_transient_discord_error(self, exc: Exception) -> bool:
         if isinstance(exc, (asyncio.TimeoutError, TimeoutError, ConnectionError)):
             return True
@@ -2077,7 +2261,7 @@ class MogIndexCommandsCog(commands.Cog):
         for attempt in range(1, attempts + 1):
             conn = None
             try:
-                conn = self.service.connect()
+                conn = await asyncio.to_thread(self.service.connect)
                 return await collect_source(
                     conn,
                     target,
@@ -2087,6 +2271,7 @@ class MogIndexCommandsCog(commands.Cog):
                     before=before,
                     limit=None,
                     dry_run=False,
+                    db_write_lock=self.full_index_db_write_lock,
                 )
             except Exception as exc:
                 if not self.is_transient_discord_error(exc) or attempt >= attempts:
@@ -2103,12 +2288,12 @@ class MogIndexCommandsCog(commands.Cog):
                     exc_info=True,
                 )
                 if conn is not None:
-                    conn.close()
+                    await asyncio.to_thread(conn.close)
                     conn = None
                 await asyncio.sleep(delay)
             finally:
                 if conn is not None:
-                    conn.close()
+                    await asyncio.to_thread(conn.close)
         raise RuntimeError("unreachable full-index retry state")
 
     def seconds_until_daily_index(self) -> float:
@@ -2145,8 +2330,9 @@ class MogIndexCommandsCog(commands.Cog):
             logger.warning("mogindex daily index skipped because guild id is unavailable")
             return
 
-        self.mark_interrupted_full_index_runs()
-        resume = self.get_full_index_resume_plan(
+        await self.run_full_index_db_write(self.mark_interrupted_full_index_runs)
+        resume = await self.run_full_index_db_write(
+            self.get_full_index_resume_plan,
             requested_by="auto-daily",
             notify_channel_id=None,
             notify_user_id=None,
@@ -2178,7 +2364,8 @@ class MogIndexCommandsCog(commands.Cog):
                 return
 
         index_date = now_kst().date()
-        run_id = self.create_full_index_run(
+        run_id = await self.run_full_index_db_write(
+            self.create_full_index_run,
             guild_id=guild_id,
             requested_by="auto-daily",
             start_date=index_date,
@@ -2208,6 +2395,189 @@ class MogIndexCommandsCog(commands.Cog):
             [category.key for category in target_categories],
         )
 
+    def full_index_parallel_sources(self) -> int:
+        return max(1, int(FULL_INDEX_PARALLEL_SOURCES or 1))
+
+    async def run_full_index_db_read(self, callback: Any, *args: Any, **kwargs: Any) -> Any:
+        for attempt in range(6):
+            try:
+                return await asyncio.to_thread(callback, *args, **kwargs)
+            except sqlite3.OperationalError as exc:
+                if "locked" not in str(exc).lower() or attempt >= 5:
+                    raise
+                await asyncio.sleep(0.2 * (attempt + 1))
+
+    async def run_full_index_db_write(self, callback: Any, *args: Any, **kwargs: Any) -> Any:
+        for attempt in range(6):
+            try:
+                async with self.full_index_db_write_lock:
+                    return await asyncio.to_thread(callback, *args, **kwargs)
+            except sqlite3.OperationalError as exc:
+                if "locked" not in str(exc).lower() or attempt >= 5:
+                    raise
+                await asyncio.sleep(0.2 * (attempt + 1))
+
+    async def build_full_index_target_inventory(
+        self,
+        *,
+        start_date: date,
+        end_date: date,
+        target_categories: list[IndexCategoryConfig],
+    ) -> list[FullIndexTarget]:
+        run_after, run_before = discord_date_bounds(end_date, start_date, "Asia/Seoul")
+        inventory: list[FullIndexTarget] = []
+        for category in target_categories:
+            targets = await gather_targets(
+                self.bot,
+                category.parent_channel_ids,
+                category_id=category.category_id,
+                include_threads=True,
+                include_private_archived=False,
+                thread_after=run_after,
+                thread_before=run_before,
+            )
+            inventory.extend(FullIndexTarget(category=category, target=target) for target in targets)
+            logger.info(
+                "mogindex full-index inventory category=%s targets=%s range=%s..%s",
+                category.key,
+                len(targets),
+                end_date,
+                start_date,
+            )
+        logger.info(
+            "mogindex full-index inventory total_targets=%s categories=%s",
+            len(inventory),
+            [category.key for category in target_categories],
+        )
+        return inventory
+
+    def full_index_targets_for_day(
+        self,
+        inventory: list[FullIndexTarget],
+        *,
+        after: Any,
+        before: Any,
+    ) -> list[FullIndexTarget]:
+        selected: list[FullIndexTarget] = []
+        for item in inventory:
+            target = item.target
+            if getattr(target, "source_kind", None) == "thread":
+                try:
+                    if not thread_might_have_messages(target.channel, after, before):
+                        continue
+                except Exception:
+                    logger.debug(
+                        "mogindex thread metadata filter failed source=%s name=%s; keeping target",
+                        getattr(target, "source_id", None),
+                        getattr(target, "name", None),
+                        exc_info=True,
+                    )
+            selected.append(item)
+        return selected
+
+    async def collect_full_index_target(
+        self,
+        item: FullIndexTarget,
+        *,
+        run_id: str,
+        index_date: date,
+        guild_id: str,
+        after: Any,
+        before: Any,
+        semaphore: asyncio.Semaphore,
+    ) -> FullIndexSourceResult:
+        async with semaphore:
+            category = item.category
+            target = item.target
+            source_id = str(getattr(target, "source_id", ""))
+            source_name = str(getattr(target, "name", source_id))
+            target_started = time.perf_counter()
+            try:
+                await self.run_full_index_db_write(
+                    self.mark_full_index_source_started,
+                    run_id=run_id,
+                    index_date=index_date,
+                    source_id=source_id,
+                    category_key=category.key,
+                    source_name=source_name,
+                )
+                scanned, indexed = await self.collect_source_with_retry(
+                    target,
+                    guild_id=guild_id,
+                    category_id=category.category_id,
+                    after=after,
+                    before=before,
+                )
+                elapsed = time.perf_counter() - target_started
+                await self.run_full_index_db_write(
+                    self.mark_full_index_source_completed,
+                    run_id=run_id,
+                    index_date=index_date,
+                    source_id=source_id,
+                    category_key=category.key,
+                    source_name=source_name,
+                    scanned=scanned,
+                    indexed=indexed,
+                    elapsed_seconds=elapsed,
+                )
+                logger.info(
+                    "mogindex full-index target run=%s day=%s category=%s source=%s name=%s scanned=%s indexed=%s elapsed=%.2fs",
+                    run_id,
+                    index_date,
+                    category.key,
+                    source_id,
+                    source_name,
+                    scanned,
+                    indexed,
+                    elapsed,
+                )
+                await asyncio.sleep(0)
+                return FullIndexSourceResult(category.key, source_id, source_name, scanned, indexed, elapsed)
+            except asyncio.CancelledError:
+                elapsed = time.perf_counter() - target_started
+                await self.run_full_index_db_write(
+                    self.mark_full_index_source_failed,
+                    run_id=run_id,
+                    index_date=index_date,
+                    source_id=source_id,
+                    category_key=category.key,
+                    source_name=source_name,
+                    status="interrupted",
+                    scanned=0,
+                    indexed=0,
+                    elapsed_seconds=elapsed,
+                    error_text="task cancelled",
+                )
+                raise
+            except Exception as exc:
+                elapsed = time.perf_counter() - target_started
+                error_text = f"{type(exc).__name__}: {exc}"
+                await self.run_full_index_db_write(
+                    self.mark_full_index_source_failed,
+                    run_id=run_id,
+                    index_date=index_date,
+                    source_id=source_id,
+                    category_key=category.key,
+                    source_name=source_name,
+                    status="failed",
+                    scanned=0,
+                    indexed=0,
+                    elapsed_seconds=elapsed,
+                    error_text=error_text,
+                )
+                logger.error(
+                    "mogindex full-index source failed run=%s day=%s category=%s source=%s name=%s elapsed=%.2fs error=%s",
+                    run_id,
+                    index_date,
+                    category.key,
+                    source_id,
+                    source_name,
+                    elapsed,
+                    exc,
+                    exc_info=True,
+                )
+                return FullIndexSourceResult(category.key, source_id, source_name, 0, 0, elapsed, error_text)
+
     async def run_full_index_job(
         self,
         *,
@@ -2221,6 +2591,7 @@ class MogIndexCommandsCog(commands.Cog):
         notify_user_id: str | None = None,
     ) -> None:
         current = start_date
+        target_inventory: list[FullIndexTarget] | None = None
         while current >= end_date:
             day_started = time.perf_counter()
             day_elapsed = 0.0
@@ -2228,61 +2599,111 @@ class MogIndexCommandsCog(commands.Cog):
             total_indexed = 0
             target_elapsed_total = 0.0
             targets_count = 0
-            self.mark_full_index_day_started(run_id, current)
+            zero_targets = 0
+            nonzero_targets = 0
+            await self.run_full_index_db_write(self.mark_full_index_day_started, run_id, current)
             try:
                 after, before = discord_date_bounds(current, current, "Asia/Seoul")
-                for category in target_categories:
-                    targets = await gather_targets(
-                        self.bot,
-                        category.parent_channel_ids,
-                        category_id=category.category_id,
-                        include_threads=True,
-                        include_private_archived=False,
-                        thread_after=after,
-                        thread_before=before,
+                if target_inventory is None:
+                    target_inventory = await self.build_full_index_target_inventory(
+                        start_date=start_date,
+                        end_date=end_date,
+                        target_categories=target_categories,
                     )
-                    targets_count += len(targets)
-                    for target in targets:
-                        target_started = time.perf_counter()
-                        scanned, indexed = await self.collect_source_with_retry(
-                            target,
-                            guild_id=guild_id,
-                            category_id=category.category_id,
-                            after=after,
-                            before=before,
-                        )
-                        target_elapsed = time.perf_counter() - target_started
-                        target_elapsed_total += target_elapsed
+                day_targets = self.full_index_targets_for_day(target_inventory, after=after, before=before)
+                targets_count = len(day_targets)
+                completed_rows = await self.run_full_index_db_read(self.completed_full_index_source_rows, run_id, current)
+                pending_targets: list[FullIndexTarget] = []
+                for item in day_targets:
+                    source_id = str(getattr(item.target, "source_id", ""))
+                    completed = completed_rows.get(source_id)
+                    if completed:
+                        scanned = int(completed["scanned"])
+                        indexed = int(completed["indexed"])
+                        elapsed = float(completed["elapsed_seconds"] or 0)
                         total_scanned += scanned
                         total_indexed += indexed
+                        target_elapsed_total += elapsed
+                        if scanned == 0 and indexed == 0:
+                            zero_targets += 1
+                        else:
+                            nonzero_targets += 1
                         logger.info(
-                            "mogindex full-index target run=%s day=%s category=%s source=%s name=%s scanned=%s indexed=%s elapsed=%.2fs",
+                            "mogindex full-index target skipped completed run=%s day=%s category=%s source=%s name=%s scanned=%s indexed=%s elapsed=%.2fs",
                             run_id,
                             current,
-                            category.key,
-                            getattr(target, "id", None),
-                            getattr(target, "name", None),
+                            item.category.key,
+                            source_id,
+                            getattr(item.target, "name", source_id),
                             scanned,
                             indexed,
-                            target_elapsed,
+                            elapsed,
                         )
-                        await asyncio.sleep(0)
-                day_elapsed = time.perf_counter() - day_started
-                avg_target_elapsed = target_elapsed_total / targets_count if targets_count else 0.0
+                    else:
+                        pending_targets.append(item)
+
+                parallel_sources = self.full_index_parallel_sources()
+                semaphore = asyncio.Semaphore(parallel_sources)
                 logger.info(
-                    "mogindex full-index day run=%s day=%s targets=%s scanned=%s indexed=%s elapsed=%.2fs avg_target=%.2fs requested_by=%s",
+                    "mogindex full-index day start run=%s day=%s targets=%s pending=%s skipped=%s parallel_sources=%s",
                     run_id,
                     current,
                     targets_count,
+                    len(pending_targets),
+                    targets_count - len(pending_targets),
+                    parallel_sources,
+                )
+                tasks = [
+                    asyncio.create_task(
+                        self.collect_full_index_target(
+                            item,
+                            run_id=run_id,
+                            index_date=current,
+                            guild_id=guild_id,
+                            after=after,
+                            before=before,
+                            semaphore=semaphore,
+                        )
+                    )
+                    for item in pending_targets
+                ]
+                results = await asyncio.gather(*tasks) if tasks else []
+                failed_results = [result for result in results if result.error]
+                for result in results:
+                    total_scanned += result.scanned
+                    total_indexed += result.indexed
+                    target_elapsed_total += result.elapsed_seconds
+                    if result.scanned == 0 and result.indexed == 0:
+                        zero_targets += 1
+                    else:
+                        nonzero_targets += 1
+                if failed_results:
+                    first = failed_results[0]
+                    raise RuntimeError(
+                        f"{len(failed_results)} source(s) failed; first={first.source_id} {first.source_name}: {first.error}"
+                    )
+
+                day_elapsed = time.perf_counter() - day_started
+                avg_target_elapsed = target_elapsed_total / targets_count if targets_count else 0.0
+                logger.info(
+                    "mogindex full-index day run=%s day=%s targets=%s zero_targets=%s nonzero_targets=%s scanned=%s indexed=%s elapsed=%.2fs target_elapsed_sum=%.2fs avg_target=%.2fs parallel_sources=%s requested_by=%s",
+                    run_id,
+                    current,
+                    targets_count,
+                    zero_targets,
+                    nonzero_targets,
                     total_scanned,
                     total_indexed,
                     day_elapsed,
+                    target_elapsed_total,
                     avg_target_elapsed,
+                    parallel_sources,
                     requested_by,
                 )
             except asyncio.CancelledError:
                 day_elapsed = time.perf_counter() - day_started
-                self.mark_full_index_day_failed(
+                await self.run_full_index_db_write(
+                    self.mark_full_index_day_failed,
                     run_id,
                     current,
                     status="interrupted",
@@ -2296,7 +2717,8 @@ class MogIndexCommandsCog(commands.Cog):
                 raise
             except Exception as exc:
                 day_elapsed = time.perf_counter() - day_started
-                self.mark_full_index_day_failed(
+                await self.run_full_index_db_write(
+                    self.mark_full_index_day_failed,
                     run_id,
                     current,
                     status="failed",
@@ -2306,16 +2728,36 @@ class MogIndexCommandsCog(commands.Cog):
                     elapsed_seconds=day_elapsed,
                     error_text=f"{type(exc).__name__}: {exc}",
                 )
-                logger.error("mogindex full-index day failed run=%s day=%s elapsed=%.2fs error=%s", run_id, current, day_elapsed, exc, exc_info=True)
+                logger.error(
+                    "mogindex full-index day failed run=%s day=%s targets=%s zero_targets=%s nonzero_targets=%s elapsed=%.2fs target_elapsed_sum=%.2fs error=%s",
+                    run_id,
+                    current,
+                    targets_count,
+                    zero_targets,
+                    nonzero_targets,
+                    day_elapsed,
+                    target_elapsed_total,
+                    exc,
+                    exc_info=True,
+                )
                 await self.report_exception(
                     "전체색인 하루 처리 실패",
                     exc,
-                    details={"run_id": run_id, "day": str(current), "elapsed_seconds": round(day_elapsed, 2), "requested_by": requested_by},
+                    details={
+                        "run_id": run_id,
+                        "day": str(current),
+                        "elapsed_seconds": round(day_elapsed, 2),
+                        "target_elapsed_sum": round(target_elapsed_total, 2),
+                        "zero_targets": zero_targets,
+                        "nonzero_targets": nonzero_targets,
+                        "requested_by": requested_by,
+                    },
                 )
                 return
 
             next_date = None if current == end_date else current - timedelta(days=1)
-            self.mark_full_index_day_completed(
+            await self.run_full_index_db_write(
+                self.mark_full_index_day_completed,
                 run_id,
                 current,
                 next_date=next_date,
@@ -2340,7 +2782,7 @@ class MogIndexCommandsCog(commands.Cog):
             )
             if rest_seconds > 0:
                 await asyncio.sleep(rest_seconds)
-        self.mark_full_index_run_completed(run_id)
+        await self.run_full_index_db_write(self.mark_full_index_run_completed, run_id)
         await self.send_full_index_completion_notice(
             notify_channel_id=notify_channel_id,
             notify_user_id=notify_user_id,

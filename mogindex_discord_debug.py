@@ -17,6 +17,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import os
+import sqlite3
 import traceback
 from dataclasses import dataclass
 from datetime import date, datetime, time, timedelta, timezone
@@ -249,6 +250,19 @@ async def gather_targets(
 
     return targets
 
+async def run_db_write(db_write_lock: asyncio.Lock | None, callback, *args, **kwargs):
+    for attempt in range(4):
+        try:
+            if db_write_lock is None:
+                return await asyncio.to_thread(callback, *args, **kwargs)
+            async with db_write_lock:
+                return await asyncio.to_thread(callback, *args, **kwargs)
+        except sqlite3.OperationalError as exc:
+            if "locked" not in str(exc).lower() or attempt >= 3:
+                raise
+            await asyncio.sleep(0.1 * (attempt + 1))
+
+
 async def collect_source(
     conn,
     target: SourceTarget,
@@ -259,18 +273,21 @@ async def collect_source(
     before: datetime,
     limit: int | None,
     dry_run: bool,
+    db_write_lock: asyncio.Lock | None = None,
 ) -> tuple[int, int]:
     scanned = 0
     indexed = 0
     if not dry_run:
-        upsert_source(
+        await run_db_write(
+            db_write_lock,
+            upsert_source,
             conn,
             target.source_id,
             target.source_kind,
             target.name,
             target.parent_channel_id,
-            guild_id=guild_id,
-            category_id=category_id,
+            guild_id,
+            category_id,
         )
 
     async for message in target.channel.history(
@@ -286,7 +303,9 @@ async def collect_source(
             indexed += 1
             continue
 
-        inserted = insert_message_for_index(
+        inserted = await run_db_write(
+            db_write_lock,
+            insert_message_for_index,
             conn,
             message_id=str(message.id),
             source_id=target.source_id,
@@ -301,7 +320,7 @@ async def collect_source(
         )
         indexed += int(inserted)
     if not dry_run:
-        conn.commit()
+        await run_db_write(db_write_lock, conn.commit)
     return scanned, indexed
 
 
