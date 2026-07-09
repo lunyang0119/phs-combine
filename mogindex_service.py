@@ -16,7 +16,13 @@ from pathlib import Path
 from typing import Any, Iterable, Iterator, Literal
 from zoneinfo import ZoneInfo
 
-from mogindex_debug import INDEX_EXCLUDED_TERMS, connect, extract_terms, initialize_schema, normalize_text
+from mogindex_debug import (
+    INDEX_EXCLUDED_TERMS,
+    connect,
+    derive_query_terms,
+    initialize_schema,
+    normalize_text,
+)
 
 
 MODULE_DIR = Path(__file__).resolve().parent
@@ -806,8 +812,10 @@ class MogIndexService:
         return matches
 
     def _keyword_rankings(self, conn: sqlite3.Connection, query: str) -> Counter[int]:
+        # 색인은 Kiwi 형태소(명사 중심)지만 질의 경로는 Kiwi를 쓰지 않는다:
+        # 정확 일치 → 접두 일치 → 트라이그램 FTS 순으로 매칭한다.
         normalized = normalize_text(query)
-        query_terms = extract_terms(query)
+        query_terms = derive_query_terms(query)
         ranked: Counter[int] = Counter()
         if not query_terms:
             return ranked
@@ -823,17 +831,40 @@ class MogIndexService:
             ):
                 ranked[int(row["message_pk"])] += 10
 
-        if query_terms:
-            placeholders = ",".join("?" for _ in query_terms)
+        placeholders = ",".join("?" for _ in query_terms)
+        exact_terms = {
+            row["term"]
             for row in conn.execute(
-                f"""
+                f"SELECT DISTINCT term FROM message_terms WHERE term IN ({placeholders})",
+                tuple(query_terms),
+            )
+        }
+        for row in conn.execute(
+            f"""
+            SELECT message_pk, SUM(count) AS score
+            FROM message_terms
+            WHERE term IN ({placeholders})
+            GROUP BY message_pk
+            LIMIT 1000
+            """,
+            tuple(query_terms),
+        ):
+            ranked[int(row["message_pk"])] += int(row["score"] or 0)
+
+        # 정확 일치가 없었던 토큰만 접두 일치로 보완한다.
+        # (LIKE 대신 범위 조건: 한글 접두에서도 term 인덱스를 확실히 타도록)
+        for token in query_terms:
+            if token in exact_terms or len(token) < 2:
+                continue
+            for row in conn.execute(
+                """
                 SELECT message_pk, SUM(count) AS score
                 FROM message_terms
-                WHERE term IN ({placeholders})
+                WHERE term >= ? AND term < ?
                 GROUP BY message_pk
-                LIMIT 1000
+                LIMIT 500
                 """,
-                tuple(query_terms.keys()),
+                (token, token + chr(0xFFFF)),
             ):
                 ranked[int(row["message_pk"])] += int(row["score"] or 0)
         return ranked
@@ -1037,6 +1068,10 @@ class MogIndexService:
                 WHERE {" AND ".join(term_filters) if term_filters else "1 = 1"}
                   AND LENGTH(d.term) BETWEEN 2 AND 8
                   AND d.term NOT IN ({",".join("?" for _ in INDEX_EXCLUDED_TERMS)})
+                  AND NOT EXISTS (
+                      SELECT 1 FROM df_stopwords ds
+                      WHERE ds.source_id = d.source_id AND ds.term = d.term
+                  )
                 ORDER BY d.message_date DESC, d.source_id, d.count DESC, d.term
                 LIMIT 300
                 """,
@@ -1113,6 +1148,10 @@ class MogIndexService:
                 WHERE {" AND ".join(term_filters) if term_filters else "1 = 1"}
                   AND LENGTH(d.term) BETWEEN 2 AND 8
                   AND d.term NOT IN ({",".join("?" for _ in INDEX_EXCLUDED_TERMS)})
+                  AND NOT EXISTS (
+                      SELECT 1 FROM df_stopwords ds
+                      WHERE ds.source_id = d.source_id AND ds.term = d.term
+                  )
                 GROUP BY d.term
                 HAVING SUM(d.count) > 1
                 ORDER BY total_count DESC, d.term
@@ -1144,7 +1183,7 @@ class MogIndexService:
 
     def run_topic_search(self, state: SearchPanelState) -> TextPage:
         query = normalize_text(state.query or "")
-        query_terms = set(extract_terms(query).keys()) if query else set()
+        query_terms = set(derive_query_terms(query)) if query else set()
         with self.index_open() as conn:
             filters, params = make_filter_sql(
                 state,
@@ -1170,7 +1209,7 @@ class MogIndexService:
         for row in rows:
             normalized_title = normalize_text(row["title"])
             if query:
-                title_terms = set(extract_terms(row["title"]).keys())
+                title_terms = set(derive_query_terms(row["title"]))
                 if query not in normalized_title and not (query_terms & title_terms):
                     continue
             topics.append(

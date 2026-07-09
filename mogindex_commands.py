@@ -6,16 +6,19 @@ import logging
 import os
 import re
 import sqlite3
+import sys
 import time
 import traceback
 import uuid
+from collections import deque
 from dataclasses import dataclass
 from datetime import date, timedelta
+from pathlib import Path
 from typing import Any
 
 import discord
 from discord import app_commands
-from discord.ext import commands
+from discord.ext import commands, tasks
 
 from mogindex_debug import (
     FULL_INDEX_DISCORD_RETRY_ATTEMPTS,
@@ -25,15 +28,19 @@ from mogindex_debug import (
     FULL_INDEX_SLOW_DAY_SECONDS,
     FULL_INDEX_SOURCE_TIMEOUT_SECONDS,
     connect as index_connect,
+    get_meta,
     initialize_schema,
+    prepare_message_for_index,
 )
 from mogindex_discord_debug import (
     CATEGORY_ID,
     DEFAULT_PARENT_CHANNEL_IDS,
     collect_source,
     date_bounds as discord_date_bounds,
+    display_name,
     gather_targets,
     thread_might_have_messages,
+    write_source_messages,
 )
 from mogindex_service import (
     DatePreset,
@@ -87,6 +94,12 @@ DAILY_INDEX_GUILD_ID = os.getenv("MOG_GUILD_ID")
 DAILY_INDEX_RUN_KIND = "daily"
 DAILY_INDEX_SCHEDULE_KEY = "daily-2359"
 FULL_INDEX_DEFAULT_OLDEST_DATE = date(2024, 6, 5)
+# Kiwi 증분 색인 배치: 봇은 원문만 저장하고, 토큰화는 별도 서브프로세스가 담당한다.
+# (kiwipiepy 상주 메모리 ~470MB — 1GB 서버에서 봇 프로세스에 절대 올리지 않는다)
+BATCH_INDEX_ENABLED = env_bool("MOGINDEX_BATCH_ENABLED", True)
+BATCH_INDEX_INTERVAL_MIN = max(1, env_int("MOGINDEX_BATCH_INTERVAL_MIN", 20))
+BATCH_SCRIPT_PATH = Path(__file__).resolve().parent / "mogindex_batch.py"
+BACKFILL_SCRIPT_PATH = Path(__file__).resolve().parent / "mogindex_backfill.py"
 
 
 def clip(text: str, limit: int) -> str:
@@ -610,6 +623,9 @@ class MogIndexCommandsCog(commands.Cog):
         self.service = MogIndexService()
         self.full_index_task: asyncio.Task | None = None
         self.daily_index_task: asyncio.Task | None = None
+        self.batch_process: asyncio.subprocess.Process | None = None
+        self.backfill_process: asyncio.subprocess.Process | None = None
+        self.backfill_last_line: str = ""
         self.db_write_queue = DbWriteQueue("mogindex-db")
         self.index_categories = parse_index_categories()
         self.category_by_key = {category.key: category for category in self.index_categories}
@@ -636,13 +652,329 @@ class MogIndexCommandsCog(commands.Cog):
             )
         else:
             logger.info("mogindex daily index scheduler disabled")
+        if BATCH_INDEX_ENABLED:
+            self.batch_index_loop.start()
+            logger.info(
+                "mogindex batch loop enabled interval=%smin script=%s",
+                BATCH_INDEX_INTERVAL_MIN,
+                BATCH_SCRIPT_PATH,
+            )
+        else:
+            logger.info("mogindex batch loop disabled")
 
     def cog_unload(self) -> None:
         if self.daily_index_task and not self.daily_index_task.done():
             self.daily_index_task.cancel()
         if self.full_index_task and not self.full_index_task.done():
             self.full_index_task.cancel()
+        self.batch_index_loop.cancel()
         self.db_write_queue.close()
+
+    # ------------------------------------------------------------------
+    # 실시간 원문 수집 + 증분 색인 배치
+    # ------------------------------------------------------------------
+
+    def match_index_category(self, channel: Any) -> IndexCategoryConfig | None:
+        """채널/스레드가 색인 대상 카테고리에 속하면 해당 설정을 반환한다."""
+        if isinstance(channel, discord.Thread):
+            lookup_id = str(channel.parent_id)
+        else:
+            lookup_id = str(channel.id)
+        for category in self.index_categories:
+            if lookup_id in category.parent_channel_ids:
+                return category
+        return None
+
+    def _store_raw_message_sync(
+        self,
+        prepared: Any,
+        *,
+        source_kind: str,
+        source_name: str,
+        parent_channel_id: str | None,
+        guild_id: str,
+        category_id: str,
+    ) -> int:
+        conn = index_connect(self.service.index_db_path)
+        try:
+            return write_source_messages(
+                conn,
+                source_id=prepared.source_id,
+                source_kind=source_kind,
+                source_name=source_name,
+                parent_channel_id=parent_channel_id,
+                guild_id=guild_id,
+                category_id=category_id,
+                messages=[prepared],
+            )
+        finally:
+            conn.close()
+
+    @commands.Cog.listener()
+    async def on_message(self, message: discord.Message) -> None:
+        # 토큰화 없이 원문만 즉시 저장한다. 일일 색인(history 풀)과는
+        # message_id 기준 INSERT OR IGNORE로 중복이 제거된다.
+        if message.guild is None or message.author.bot:
+            return
+        if message.type is not discord.MessageType.default:
+            return
+        if DAILY_INDEX_GUILD_ID and str(message.guild.id) != str(DAILY_INDEX_GUILD_ID):
+            return
+        channel = message.channel
+        category = self.match_index_category(channel)
+        if category is None:
+            return
+        if isinstance(channel, discord.Thread):
+            source_kind = "thread"
+            source_name = display_name(channel)
+            parent_channel_id = str(channel.parent_id)
+            thread_id = str(channel.id)
+        else:
+            source_kind = "channel"
+            source_name = channel.name
+            parent_channel_id = None
+            thread_id = None
+        prepared = prepare_message_for_index(
+            message_id=str(message.id),
+            source_id=str(channel.id),
+            channel_id=str(channel.id),
+            thread_id=thread_id,
+            author_id=str(message.author.id),
+            author_name=message.author.display_name,
+            created_at=message.created_at,
+            content=message.content or "",
+            search_context=source_name,
+            guild_id=str(message.guild.id),
+        )
+        try:
+            await self.db_write_queue.run(
+                self._store_raw_message_sync,
+                prepared,
+                source_kind=source_kind,
+                source_name=source_name,
+                parent_channel_id=parent_channel_id,
+                guild_id=str(message.guild.id),
+                category_id=category.category_id,
+            )
+        except Exception:
+            logger.error(
+                "mogindex on_message store failed message_id=%s source=%s",
+                message.id,
+                channel.id,
+                exc_info=True,
+            )
+
+    @tasks.loop(minutes=BATCH_INDEX_INTERVAL_MIN)
+    async def batch_index_loop(self) -> None:
+        if self.batch_process is not None and self.batch_process.returncode is None:
+            logger.info("mogindex batch skipped: previous batch still running")
+            return
+        if self.backfill_process is not None and self.backfill_process.returncode is None:
+            logger.info("mogindex batch skipped: kiwi backfill running")
+            return
+        if self.full_index_task and not self.full_index_task.done():
+            logger.info("mogindex batch skipped: full index job running")
+            return
+        # 전투 진행 중에는 배치를 미룬다 (1GB 서버에서 Kiwi 메모리 스파이크 회피)
+        combat_cog = self.bot.get_cog("CombatCog")
+        active_battles = getattr(combat_cog, "active_battles", None) if combat_cog else None
+        if active_battles:
+            logger.info("mogindex batch skipped: active combat channels=%s", len(active_battles))
+            return
+        try:
+            process = await asyncio.create_subprocess_exec(
+                sys.executable,
+                str(BATCH_SCRIPT_PATH),
+                "--db",
+                str(self.service.index_db_path),
+            )
+        except Exception as exc:
+            logger.error("mogindex batch spawn failed", exc_info=True)
+            await self.report_exception("증분 색인 배치 실행 실패", exc)
+            return
+        self.batch_process = process
+        try:
+            returncode = await process.wait()
+        finally:
+            self.batch_process = None
+        if returncode == 0:
+            logger.info("mogindex batch finished rc=0")
+        else:
+            logger.error("mogindex batch failed rc=%s", returncode)
+            await self.report_exception(
+                "증분 색인 배치 비정상 종료",
+                RuntimeError(f"mogindex_batch.py exit code {returncode}"),
+            )
+
+    @batch_index_loop.before_loop
+    async def batch_index_loop_before(self) -> None:
+        await self.bot.wait_until_ready()
+
+    # ------------------------------------------------------------------
+    # Kiwi 재색인(백필) 명령 — 원문 재수집은 /전체색인 새로시작이 담당하고,
+    # 이 명령은 mogindex_backfill.py 를 서브프로세스로 돌려 형태소 색인을
+    # 재구축/내보내기한다. 봇 프로세스는 여전히 kiwipiepy를 import하지 않는다.
+    # ------------------------------------------------------------------
+
+    def read_reindex_status(self) -> str:
+        conn = index_connect(self.service.index_db_path)
+        try:
+            raw_total = conn.execute("SELECT COUNT(*) AS n FROM messages").fetchone()["n"]
+            with_content = conn.execute(
+                "SELECT COUNT(*) AS n FROM messages WHERE content IS NOT NULL"
+            ).fetchone()["n"]
+            pending = conn.execute(
+                "SELECT COUNT(*) AS n FROM messages WHERE tokenized_at IS NULL"
+            ).fetchone()["n"]
+            stopwords = conn.execute("SELECT COUNT(*) AS n FROM df_stopwords").fetchone()["n"]
+            lines = [
+                f"메시지 {raw_total}건 (원문 보유 {with_content}건)",
+                f"토큰화 대기 {pending}건",
+                f"DF 불용어 {stopwords}개",
+                f"백필 상태: {get_meta(conn, 'backfill_state') or '없음'}",
+                f"마지막 백필: {get_meta(conn, 'last_backfill_at') or '없음'}",
+                f"마지막 배치: {get_meta(conn, 'last_batch_run') or '없음'}",
+                f"tokenizer_version: {get_meta(conn, 'tokenizer_version') or '없음'}",
+            ]
+            return "\n".join(lines)
+        finally:
+            conn.close()
+
+    def reindex_busy_reason(self) -> str | None:
+        if self.backfill_process is not None and self.backfill_process.returncode is None:
+            return "백필이 이미 실행 중입니다."
+        if self.batch_process is not None and self.batch_process.returncode is None:
+            return "증분 색인 배치가 실행 중입니다. 잠시 후 다시 시도해주세요."
+        if self.full_index_task and not self.full_index_task.done():
+            return "전체색인(원문 수집)이 실행 중입니다. 수집이 끝난 뒤 백필을 시작해주세요."
+        return None
+
+    async def run_backfill_subprocess(
+        self, args: list[str], *, label: str, channel_id: int | None, user_id: int
+    ) -> None:
+        env = dict(os.environ)
+        env["PYTHONIOENCODING"] = "utf-8"
+        try:
+            process = await asyncio.create_subprocess_exec(
+                sys.executable,
+                "-X",
+                "utf8",
+                str(BACKFILL_SCRIPT_PATH),
+                *args,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.STDOUT,
+                env=env,
+            )
+        except Exception as exc:
+            logger.error("mogindex backfill spawn failed", exc_info=True)
+            await self.report_exception(f"{label} 실행 실패", exc)
+            return
+        self.backfill_process = process
+        tail: deque[str] = deque(maxlen=15)
+        try:
+            assert process.stdout is not None
+            while True:
+                line = await process.stdout.readline()
+                if not line:
+                    break
+                text = line.decode("utf-8", errors="replace").rstrip()
+                if text:
+                    tail.append(text)
+                    self.backfill_last_line = text  # 진행률/ETA 줄 — 상태확인에서 노출
+                    logger.info("mogindex backfill> %s", text)
+            returncode = await process.wait()
+        finally:
+            self.backfill_process = None
+        summary = clip("\n".join(tail), 1500) or "(출력 없음)"
+        status = "완료" if returncode == 0 else f"비정상 종료 (exit={returncode})"
+        message = f"<@{user_id}> {label} {status}\n```\n{summary}\n```"
+        channel = self.bot.get_channel(channel_id) if channel_id else None
+        if channel is not None:
+            try:
+                await channel.send(message)
+            except Exception:
+                logger.error("mogindex backfill notify failed", exc_info=True)
+        if returncode != 0:
+            await self.report_exception(
+                f"{label} 비정상 종료",
+                RuntimeError(f"mogindex_backfill.py exit code {returncode}"),
+            )
+
+    @app_commands.command(name="재색인", description="[관리자] Kiwi 형태소 백필을 실행/확인/내보내기합니다.")
+    @app_commands.default_permissions(manage_roles=True)
+    @app_commands.describe(action="재색인 작업", export_path="내보낼 파일 경로 (내보내기 작업에서만 사용)")
+    @app_commands.rename(action="작업", export_path="내보내기경로")
+    @app_commands.choices(
+        action=[
+            app_commands.Choice(name="상태확인", value="status"),
+            app_commands.Choice(name="백필시작", value="start"),
+            app_commands.Choice(name="처음부터다시", value="restart"),
+            app_commands.Choice(name="내보내기", value="export"),
+        ]
+    )
+    async def kiwi_reindex(
+        self,
+        interaction: discord.Interaction,
+        action: app_commands.Choice[str] = None,
+        export_path: str | None = None,
+    ) -> None:
+        if not interaction.guild_id:
+            await interaction.response.send_message("서버 안에서만 사용할 수 있습니다.", ephemeral=True)
+            return
+        action_value = action.value if action else "status"
+
+        if action_value == "status":
+            await interaction.response.defer(ephemeral=True, thinking=True)
+            status_text = await asyncio.to_thread(self.read_reindex_status)
+            if self.backfill_process is not None and self.backfill_process.returncode is None:
+                status_text += f"\n백필 실행 중 → {self.backfill_last_line or '(시작 대기)'}"
+            await interaction.followup.send(status_text, ephemeral=True)
+            return
+
+        busy = self.reindex_busy_reason()
+        if busy:
+            await interaction.response.send_message(busy, ephemeral=True)
+            return
+
+        db_arg = str(self.service.index_db_path)
+        if action_value == "export":
+            raw_path = (export_path or "").strip() or (
+                f"mogindex/deploy_{now_kst().strftime('%Y%m%d_%H%M')}.sqlite3"
+            )
+            target = Path(raw_path)
+            if not target.is_absolute():
+                target = Path(__file__).resolve().parent / target
+            args = ["--db", db_arg, "--export-only", "--export", str(target)]
+            label = f"재색인 내보내기 ({target.name})"
+            notice = f"내보내기를 시작했습니다: {target}\n완료되면 이 채널에 결과를 알려드립니다."
+        else:
+            args = ["--db", db_arg]
+            if action_value == "restart":
+                args.append("--restart")
+                label = "Kiwi 백필 (처음부터)"
+            else:
+                label = "Kiwi 백필"
+            notice = (
+                f"{label}을 백그라운드에서 시작했습니다. 진행 로그는 봇 로그에 남고, "
+                "완료되면 이 채널에 결과를 알려드립니다.\n"
+                "(원문이 없는 메시지는 색인되지 않습니다 — 먼저 /전체색인 새로시작으로 원문을 수집해두세요.)"
+            )
+
+        asyncio.create_task(
+            self.run_backfill_subprocess(
+                args,
+                label=label,
+                channel_id=interaction.channel_id,
+                user_id=interaction.user.id,
+            )
+        )
+        logger.info(
+            "mogindex reindex command action=%s by=%s args=%s",
+            action_value,
+            interaction.user.id,
+            args,
+        )
+        await interaction.response.send_message(notice, ephemeral=True)
 
     def get_category(self, key: str | None) -> IndexCategoryConfig | None:
         if not key or key == "all":
@@ -2027,6 +2359,14 @@ class MogIndexCommandsCog(commands.Cog):
                 """,
                 (row["run_id"],),
             ).fetchall()
+            eta_row = conn.execute(
+                """
+                SELECT COUNT(*) AS done, COALESCE(SUM(elapsed_seconds), 0) AS elapsed
+                FROM full_index_days
+                WHERE run_id = ? AND status = 'completed'
+                """,
+                (row["run_id"],),
+            ).fetchone()
             resume_date = self.resolve_full_index_resume_date(conn, row)
         count_map = {item["status"]: item["count"] for item in counts}
         status_names = {
@@ -2036,6 +2376,28 @@ class MogIndexCommandsCog(commands.Cog):
             "completed": "완료",
         }
         next_text = resume_date.isoformat() if resume_date else "완료 또는 이어갈 날짜 없음"
+        # 남은 시간 추정: 완료된 날짜들의 평균 처리 시간 × 남은 날짜 수.
+        # 하루 처리에 SLOW 기준 이상 걸리면 날짜마다 휴식이 붙으므로 그만큼 더한다.
+        eta_text = "-"
+        try:
+            total_days = abs(
+                (date.fromisoformat(row["start_date"]) - date.fromisoformat(row["end_date"])).days
+            ) + 1
+            done_days = int(eta_row["done"]) if eta_row else 0
+            if row["status"] == "completed" or done_days >= total_days:
+                eta_text = "완료"
+            elif done_days > 0:
+                avg_seconds = float(eta_row["elapsed"]) / done_days
+                per_day = avg_seconds + (
+                    FULL_INDEX_REST_SECONDS if avg_seconds >= FULL_INDEX_SLOW_DAY_SECONDS else 0
+                )
+                remaining_seconds = int((total_days - done_days) * per_day)
+                hours, rem = divmod(remaining_seconds, 3600)
+                minutes = rem // 60
+                eta_human = f"약 {hours}시간 {minutes}분" if hours else f"약 {minutes}분"
+                eta_text = f"{eta_human} (완료 {done_days}/{total_days}일, 평균 {avg_seconds:.0f}초/일)"
+        except (KeyError, TypeError, ValueError):
+            pass
         count_text = ", ".join(
             f"{status_names.get(status, status)} {count}일" for status, count in sorted(count_map.items())
         ) or "처리 기록 없음"
@@ -2056,6 +2418,7 @@ class MogIndexCommandsCog(commands.Cog):
             f"현재 날짜: {row['current_date'] or '-'}\n"
             f"마지막 완료: {row['last_completed_date'] or '-'}\n"
             f"다음 이어하기: {next_text}\n"
+            f"예상 남은 시간: {eta_text}\n"
             f"일자 기록: {count_text}"
             f"{failure_text}"
         )

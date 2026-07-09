@@ -87,6 +87,7 @@ PARTICLE_SUFFIXES = (
     "로서",
     "로써",
     "에게",
+    "에서",
     "한테",
     "께서",
     "부터",
@@ -920,8 +921,8 @@ class PreparedIndexedMessage:
     message_date: str
     jump_url: str
     normalized: str
-    message_terms: dict[str, int]
-    content_terms: dict[str, int]
+    content: str
+    search_context: str
 
 def connect(db_path: Path) -> sqlite3.Connection:
     db_path.parent.mkdir(parents=True, exist_ok=True)
@@ -1013,7 +1014,63 @@ def initialize_schema(conn: sqlite3.Connection) -> None:
         "CREATE VIRTUAL TABLE IF NOT EXISTS message_fts "
         "USING fts5(index_text, content='', tokenize='trigram')"
     )
+    migrate_schema(conn)
     conn.commit()
+
+
+def migrate_schema(conn: sqlite3.Connection) -> None:
+    """Kiwi 색인 전환용 멱등 마이그레이션. 기존 데이터가 있는 DB에도 안전하다.
+
+    - messages: 원문(content/search_context) 저장 + 토큰화 상태(tokenized_at/tokenizer_version)
+      (기존 indexed_at 컬럼은 '행 삽입 시각'이라 재사용 불가 → tokenized_at 신설)
+    - df_stopwords: 백필 시 문서빈도(DF) 기반으로 산출되는 말뭉치 불용어
+    - mogindex_meta: tokenizer_version / last_batch_run 등 메타 정보
+    """
+    existing_columns = {row[1] for row in conn.execute("PRAGMA table_info(messages)")}
+    for column in ("content", "search_context", "tokenized_at", "tokenizer_version"):
+        if column not in existing_columns:
+            conn.execute(f"ALTER TABLE messages ADD COLUMN {column} TEXT")
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_messages_pending_tokenize "
+        "ON messages(tokenized_at) WHERE tokenized_at IS NULL"
+    )
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS df_stopwords (
+            source_id TEXT NOT NULL,
+            term TEXT NOT NULL,
+            df_ratio REAL NOT NULL,
+            created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            PRIMARY KEY (source_id, term)
+        )
+        """
+    )
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS mogindex_meta (
+            key TEXT PRIMARY KEY,
+            value TEXT NOT NULL,
+            updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+        )
+        """
+    )
+    conn.commit()
+
+
+def set_meta(conn: sqlite3.Connection, key: str, value: str) -> None:
+    conn.execute(
+        """
+        INSERT INTO mogindex_meta(key, value, updated_at)
+        VALUES (?, ?, CURRENT_TIMESTAMP)
+        ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = CURRENT_TIMESTAMP
+        """,
+        (key, value),
+    )
+
+
+def get_meta(conn: sqlite3.Connection, key: str) -> str | None:
+    row = conn.execute("SELECT value FROM mogindex_meta WHERE key = ?", (key,)).fetchone()
+    return None if row is None else str(row["value"])
 
 
 def reset_debug_data(conn: sqlite3.Connection) -> None:
@@ -1023,6 +1080,8 @@ def reset_debug_data(conn: sqlite3.Connection) -> None:
         DELETE FROM manual_topics;
         DELETE FROM message_terms;
         DELETE FROM daily_terms;
+        DELETE FROM df_stopwords;
+        DELETE FROM mogindex_meta;
         DELETE FROM messages;
         DELETE FROM sources;
         """
@@ -1126,6 +1185,23 @@ def extract_terms(text: str) -> Counter[str]:
     return terms
 
 
+def derive_query_terms(query: str) -> list[str]:
+    """질의어에서 검색용 토큰을 뽑는다 (봇 프로세스용, Kiwi 미사용).
+
+    색인은 Kiwi 형태소(명사 중심)라서 질의어는 조사/종결어미만 벗긴 원형으로
+    정확 일치 → 접두(LIKE) 일치 → 트라이그램 FTS 순으로 매칭한다.
+    한계: 활용이 심한 동사형 질의는 용어 색인에서 빗나갈 수 있다(명사 질의는 정확 일치).
+    """
+    terms: list[str] = []
+    for raw_token in TOKEN_RE.findall(normalize_text(query)):
+        token = strip_ending_suffix(strip_particle(raw_token))
+        if not token or token.isdigit():
+            continue
+        if token not in terms:
+            terms.append(token)
+    return terms
+
+
 def discord_snowflake_datetime(snowflake: str) -> datetime:
     timestamp_ms = (int(snowflake) >> 22) + DISCORD_EPOCH_MS
     return datetime.fromtimestamp(timestamp_ms / 1000, tz=timezone.utc)
@@ -1183,11 +1259,9 @@ def prepare_message_for_index(
     thread_id: str | None = None,
 ) -> PreparedIndexedMessage:
     message_date = created_at.date().isoformat()
+    # 토큰화는 봇 프로세스에서 하지 않는다: 원문만 저장하고,
+    # 형태소 색인은 별도 배치(mogindex_batch.py)/백필(mogindex_backfill.py)이 담당한다.
     normalized = normalize_text(f"{content} {search_context}".strip())
-    content_terms = extract_terms(content)
-    message_terms = Counter(content_terms)
-    for term, count in extract_terms(search_context).items():
-        message_terms[term] += count
     return PreparedIndexedMessage(
         message_id=message_id,
         source_id=source_id,
@@ -1200,8 +1274,8 @@ def prepare_message_for_index(
         message_date=message_date,
         jump_url=jump_url(guild_id, channel_id, message_id),
         normalized=normalized,
-        message_terms=dict(message_terms),
-        content_terms=dict(content_terms),
+        content=content,
+        search_context=search_context,
     )
 
 
@@ -1210,9 +1284,10 @@ def insert_prepared_message_for_index(conn: sqlite3.Connection, message: Prepare
         """
         INSERT OR IGNORE INTO messages (
             message_id, source_id, guild_id, channel_id, thread_id,
-            author_id, author_name, created_at, message_date, jump_url
+            author_id, author_name, created_at, message_date, jump_url,
+            content, search_context
         )
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """,
         (
             message.message_id,
@@ -1225,10 +1300,22 @@ def insert_prepared_message_for_index(conn: sqlite3.Connection, message: Prepare
             message.created_at,
             message.message_date,
             message.jump_url,
+            message.content,
+            message.search_context,
         ),
     )
     if cursor.rowcount == 0:
-        return False
+        # 이미 존재하는 행: 원문이 없는 레거시 행에만 원문을 채우고
+        # 재토큰화 대상(tokenized_at NULL)으로 되돌린다. 그 외에는 그대로 둔다.
+        updated = conn.execute(
+            """
+            UPDATE messages
+            SET content = ?, search_context = ?, tokenized_at = NULL, tokenizer_version = NULL
+            WHERE message_id = ? AND content IS NULL
+            """,
+            (message.content, message.search_context, message.message_id),
+        )
+        return updated.rowcount > 0
 
     message_pk = int(cursor.lastrowid)
     if not message_pk:
@@ -1242,26 +1329,6 @@ def insert_prepared_message_for_index(conn: sqlite3.Connection, message: Prepare
         conn.execute(
             "INSERT INTO message_fts(rowid, index_text) VALUES (?, ?)",
             (message_pk, message.normalized),
-        )
-
-    for term, count in message.message_terms.items():
-        conn.execute(
-            """
-            INSERT INTO message_terms(term, message_pk, source_id, message_date, count)
-            VALUES (?, ?, ?, ?, ?)
-            """,
-            (term, message_pk, message.source_id, message.message_date, count),
-        )
-
-    for term, count in message.content_terms.items():
-        conn.execute(
-            """
-            INSERT INTO daily_terms(source_id, message_date, term, count)
-            VALUES (?, ?, ?, ?)
-            ON CONFLICT(source_id, message_date, term)
-            DO UPDATE SET count = count + excluded.count
-            """,
-            (message.source_id, message.message_date, term, count),
         )
     return True
 
@@ -1465,7 +1532,7 @@ def search_messages(
     limit: int = 10,
 ) -> list[sqlite3.Row]:
     normalized = normalize_text(query)
-    query_terms = extract_terms(query)
+    query_terms = derive_query_terms(query)
     if not query_terms:
         return []
     filters = ["1 = 1"]
@@ -1493,18 +1560,40 @@ def search_messages(
         ):
             ranked[int(row["message_pk"])] += 10
 
-    if query_terms:
-        placeholders = ",".join("?" for _ in query_terms)
+    placeholders = ",".join("?" for _ in query_terms)
+    exact_terms = {
+        row["term"]
         for row in conn.execute(
-            f"""
+            f"SELECT DISTINCT term FROM message_terms WHERE term IN ({placeholders})",
+            tuple(query_terms),
+        )
+    }
+    for row in conn.execute(
+        f"""
+        SELECT message_pk, SUM(count) AS score
+        FROM message_terms
+        WHERE term IN ({placeholders})
+        GROUP BY message_pk
+        """,
+        tuple(query_terms),
+    ):
+        ranked[int(row["message_pk"])] += int(row["score"])
+
+    # 정확 일치가 없었던 토큰은 접두 일치로 보완 (범위 조건으로 term 인덱스 활용)
+    for token in query_terms:
+        if token in exact_terms or len(token) < 2:
+            continue
+        for row in conn.execute(
+            """
             SELECT message_pk, SUM(count) AS score
             FROM message_terms
-            WHERE term IN ({placeholders})
+            WHERE term >= ? AND term < ?
             GROUP BY message_pk
+            LIMIT 500
             """,
-            tuple(query_terms.keys()),
+            (token, token + chr(0xFFFF)),
         ):
-            ranked[int(row["message_pk"])] += int(row["score"])
+            ranked[int(row["message_pk"])] += int(row["score"] or 0)
 
     if not ranked:
         return []
@@ -1580,6 +1669,10 @@ def get_recap(
         WHERE {keyword_where}
           AND LENGTH(d.term) BETWEEN 2 AND 8
           AND d.term NOT IN ({excluded_placeholders})
+          AND NOT EXISTS (
+              SELECT 1 FROM df_stopwords ds
+              WHERE ds.source_id = d.source_id AND ds.term = d.term
+          )
         ORDER BY d.message_date, d.source_id, d.count DESC, d.term
         """,
         tuple(term_params) + excluded_terms,
