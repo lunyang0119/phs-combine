@@ -370,6 +370,11 @@ def main(argv: list[str] | None = None) -> int:
             )
             return 1
         conn = connect(db_path)
+        # 백필 연결은 FK 검사를 끈다. 쓰는 행이 전부 messages 에서 방금 읽은 값이라
+        # 무결성이 구조적으로 보장되고, 결정적으로 foreign_keys=ON 이면 wipe 의
+        # `DELETE FROM message_terms`(수천만 행)가 truncate 최적화를 못 받아
+        # 한 행씩 지워진다 — OFF 면 몇 초, ON 이면 수십 분 걸린다.
+        conn.execute("PRAGMA foreign_keys = OFF")
         initialize_schema(conn)
         return run_backfill(conn, args, db_path, started)
     except KeyboardInterrupt:
