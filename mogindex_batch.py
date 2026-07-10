@@ -138,7 +138,8 @@ def main(argv: list[str] | None = None) -> int:
         kiwi = mogindex_kiwi.load_kiwi(userdict_path)
 
         def report(done: int, total: int) -> None:
-            print(f"[mogindex_batch] {done}/{total}")
+            # 봇/서비스가 스폰하면 stdout이 파이프라 블록 버퍼링된다 — 매 청크 flush.
+            print(f"[mogindex_batch] {done}/{total}", flush=True)
 
         processed = mogindex_kiwi.index_pending_messages(
             conn, kiwi, chunk_size=chunk_size, progress=report

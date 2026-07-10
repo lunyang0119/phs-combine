@@ -982,6 +982,11 @@ def initialize_schema(conn: sqlite3.Connection) -> None:
         CREATE INDEX IF NOT EXISTS idx_message_terms_lookup
             ON message_terms(term, message_date, source_id);
 
+        -- 재토큰화 시 메시지 단위 DELETE 용. PK가 (term, message_pk)라 이 인덱스가
+        -- 없으면 메시지당 전체 테이블 풀스캔이 된다 (수천만 행이면 사실상 정지).
+        CREATE INDEX IF NOT EXISTS idx_message_terms_message
+            ON message_terms(message_pk);
+
         CREATE TABLE IF NOT EXISTS daily_terms (
             source_id TEXT NOT NULL,
             message_date TEXT NOT NULL,

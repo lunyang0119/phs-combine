@@ -44,7 +44,13 @@ PC에서 봇을 직접 돌려서 진행한다 (명령 → 봇 → PC 처리; 서
 ```
 MOGINDEX_DB_PATH=mogindex/search_index_live_debug.sqlite3
 MOGINDEX_STATE_DB_PATH=mogindex/search_state.sqlite3
+MOGINDEX_BATCH_ENABLED=false
 ```
+
+`MOGINDEX_BATCH_ENABLED=false` 권장(PC 한정): 켜두면 원문 수집 직후 20분 증분
+배치가 전체 백로그를 먼저 잡아 `/재색인 백필시작`이 "배치 실행 중" 안내로
+미뤄진다. 잡혀도 결과는 동일하다 — 배치와 백필은 같은 토크나이저를 쓰므로
+백필이 이어받아 남은 대기분 + DF 산출만 수행한다.
 
 절차 (PC에서 `python main.py`로 봇 실행 후, 디스코드에서):
 
@@ -52,8 +58,10 @@ MOGINDEX_STATE_DB_PATH=mogindex/search_state.sqlite3
    기존 행에는 원문(content)만 채우고, 새 행은 원문과 함께 저장한다.
    (카테고리 인벤토리·재시도·일자별 상태/이어하기 등 기존 전체색인 기능 그대로.)
 2. **Kiwi 백필**: `/재색인 작업:백필시작` — `mogindex_backfill.py`를 서브프로세스로
-   실행해 용어 색인 전체 재구축 + DF 불용어 산출. 중단됐으면 같은 명령으로 이어서
-   진행되고, `작업:처음부터다시`는 색인을 지우고 처음부터 다시 만든다.
+   실행해 용어 색인 재구축 + DF 불용어 산출. 현재 토크나이저 버전으로 이미
+   토큰화된 행은 유지하고 남은 대기분만 처리하므로, 중단·배치 선점 어느 쪽이든
+   같은 명령으로 이어진다. **사용자 사전을 바꿨으면 `작업:처음부터다시`**(버전
+   문자열은 그대로라 자동 감지되지 않음 — 전체 와이프 후 재색인 필요).
    진행 상황은 `/재색인 작업:상태확인`(토큰화 대기 건수)으로 확인.
 3. **내보내기**: `/재색인 작업:내보내기` — `VACUUM INTO`로 사이드카 없는 단일 파일
    생성(기본 경로 `mogindex/deploy_YYYYMMDD_HHMM.sqlite3`, `내보내기경로` 옵션으로 변경).

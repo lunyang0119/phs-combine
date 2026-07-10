@@ -21,12 +21,14 @@ from __future__ import annotations
 import argparse
 import os
 import sqlite3
+import sys
 import time
 import traceback
 from datetime import datetime, timezone
 from pathlib import Path
 
-from mogindex_debug import connect, get_meta, initialize_schema, set_meta
+from mogindex_batch import acquire_batch_lock
+from mogindex_debug import connect, initialize_schema, set_meta
 
 MODULE_DIR = Path(__file__).resolve().parent
 
@@ -234,47 +236,83 @@ def run_backfill(
         print("내보내기 전용 모드입니다. 색인과 DF 산출을 건너뜁니다.")
         return 0 if export_clean_copy(conn, export_path) else 1
 
-    # 1) 재개 여부 판단
-    resuming = get_meta(conn, "backfill_state") == "in_progress" and not args.restart
-    if resuming:
-        print("이전 백필을 이어서 진행합니다 (완료된 행의 토큰화 상태는 유지).")
-    else:
-        wipe_index(conn)
-        set_meta(conn, "backfill_state", "in_progress")
-        conn.commit()
-
-    # 2) Kiwi 로드 (필요할 때만 import)
+    # 1) 재개/와이프 판단 (mogindex_kiwi 모듈 import 는 가볍다 —
+    #    kiwipiepy 자체는 load_kiwi() 안에서만 import 된다)
     import mogindex_kiwi
 
-    userdict_path: Path | None = args.userdict
-    effective_userdict = userdict_path or mogindex_kiwi.resolve_userdict_path()
-    print(f"사용자 사전: {effective_userdict}")
-    load_started = time.monotonic()
-    kiwi = mogindex_kiwi.load_kiwi(userdict_path)
-    print(f"Kiwi 로드 완료 ({time.monotonic() - load_started:.1f}s)")
+    # 와이프 생략(이어하기) 안전 조건 — backfill_state 메타가 아니라 데이터 자체로
+    # 판단한다: (1) 다른 토크나이저 버전으로 토큰화된 행이 없고, (2) 토큰화 도장
+    # 없이 용어만 있는 행(도장 없이 용어를 쓰던 구버전 휴리스틱 색인의 잔재)도
+    # 없어야 한다. 잔재가 있으면 daily_terms 도 함께 오염돼 있으므로(용어-도장
+    # 동일 트랜잭션 규칙 이전 데이터) 전체 와이프가 필요하다. 이 조건이면 중단된
+    # 백필 재개든 증분 배치가 미리 해둔 작업이든 안전하게 이어받는다.
+    # 사용자 사전을 바꿔서 전부 다시 만들어야 하면 --restart 를 쓴다.
+    resuming = False
+    if not args.restart:
+        stale = conn.execute(
+            "SELECT COUNT(*) AS n FROM messages WHERE tokenized_at IS NOT NULL"
+            " AND (tokenizer_version IS NULL OR tokenizer_version != ?)",
+            (mogindex_kiwi.TOKENIZER_VERSION,),
+        ).fetchone()["n"]
+        # idx_message_terms_message 덕에 이 검사는 빠르다.
+        legacy_orphan = conn.execute(
+            "SELECT 1 FROM messages m JOIN message_terms mt ON mt.message_pk = m.message_pk"
+            " WHERE m.tokenized_at IS NULL LIMIT 1"
+        ).fetchone()
+        if stale == 0 and legacy_orphan is None:
+            resuming = True
+            done_rows = conn.execute(
+                "SELECT COUNT(*) AS n FROM messages WHERE tokenized_at IS NOT NULL"
+            ).fetchone()["n"]
+            if done_rows:
+                print(
+                    f"현재 버전({mogindex_kiwi.TOKENIZER_VERSION})으로 이미 토큰화된 "
+                    f"{done_rows}건은 유지하고, 남은 대기분만 처리합니다."
+                )
 
-    # 3) 색인 (청크 단위 커밋 + 진행률 출력)
-    index_started = time.monotonic()
+    if not resuming:
+        wipe_index(conn)
+    set_meta(conn, "backfill_state", "in_progress")
+    conn.commit()
 
-    def on_progress(done: int, total: int) -> None:
-        elapsed = time.monotonic() - index_started
-        rate = done / elapsed if elapsed > 0 else 0.0
-        remaining = max(total - done, 0)
-        eta = remaining / rate if rate > 0 else 0.0
-        pct = (done / total * 100.0) if total else 100.0
-        print(
-            f"  {done}/{total} ({pct:.1f}%) | {rate:.0f} msg/s | ETA {format_hms(eta)}",
-            flush=True,
+    # 2) 대기분 확인 — 없으면 Kiwi 로드(~470MB) 자체를 건너뛴다.
+    pending = conn.execute(
+        "SELECT COUNT(*) AS n FROM messages WHERE tokenized_at IS NULL"
+    ).fetchone()["n"]
+
+    processed = 0
+    if pending == 0:
+        print("토큰화 대기 메시지가 없습니다 — 색인 단계를 건너뜁니다.")
+    else:
+        # 3) Kiwi 로드 + 색인 (청크 단위 커밋 + 진행률 출력)
+        userdict_path: Path | None = args.userdict
+        effective_userdict = userdict_path or mogindex_kiwi.resolve_userdict_path()
+        print(f"사용자 사전: {effective_userdict}")
+        load_started = time.monotonic()
+        kiwi = mogindex_kiwi.load_kiwi(userdict_path)
+        print(f"Kiwi 로드 완료 ({time.monotonic() - load_started:.1f}s)")
+
+        index_started = time.monotonic()
+
+        def on_progress(done: int, total: int) -> None:
+            elapsed = time.monotonic() - index_started
+            rate = done / elapsed if elapsed > 0 else 0.0
+            remaining = max(total - done, 0)
+            eta = remaining / rate if rate > 0 else 0.0
+            pct = (done / total * 100.0) if total else 100.0
+            print(
+                f"  {done}/{total} ({pct:.1f}%) | {rate:.0f} msg/s | ETA {format_hms(eta)}",
+                flush=True,
+            )
+
+        print(f"색인 시작 (chunk_size={args.chunk_size}) ...")
+        processed = mogindex_kiwi.index_pending_messages(
+            conn, kiwi, chunk_size=args.chunk_size, progress=on_progress
         )
-
-    print(f"색인 시작 (chunk_size={args.chunk_size}) ...")
-    processed = mogindex_kiwi.index_pending_messages(
-        conn, kiwi, chunk_size=args.chunk_size, progress=on_progress
-    )
-    print(
-        f"색인 완료: 이번 실행에서 {processed}건 처리 "
-        f"({format_hms(time.monotonic() - index_started)})"
-    )
+        print(
+            f"색인 완료: 이번 실행에서 {processed}건 처리 "
+            f"({format_hms(time.monotonic() - index_started)})"
+        )
 
     # 4) DF 불용어 산출
     cutoff_ratio = args.df_cutoff_pct / 100.0
@@ -308,6 +346,10 @@ def run_backfill(
 
 
 def main(argv: list[str] | None = None) -> int:
+    # 봇이 파이프로 스폰하면 stdout이 블록 버퍼링돼 진행 로그가 한참 뒤에 몰려 나온다.
+    # 라인 버퍼링으로 강제해 매 print가 즉시 봇 로그/상태확인에 반영되게 한다.
+    if hasattr(sys.stdout, "reconfigure"):
+        sys.stdout.reconfigure(line_buffering=True)
     parser = build_parser()
     args = parser.parse_args(argv)
     if args.export_only and not args.export:
@@ -315,8 +357,18 @@ def main(argv: list[str] | None = None) -> int:
 
     db_path = resolve_db_path(args.db)
     started = time.monotonic()
+    lock_conn: sqlite3.Connection | None = None
     conn: sqlite3.Connection | None = None
     try:
+        # 증분 배치(mogindex_batch)와 같은 락을 잡아 동시 실행을 막는다.
+        # 와이프 도중 배치가 daily_terms 를 누적하면 이중 집계가 되므로 필수.
+        lock_conn = acquire_batch_lock(db_path)
+        if lock_conn is None:
+            print(
+                "[오류] 증분 색인 배치(mogindex_batch)가 실행 중입니다. "
+                "배치가 끝난 뒤 다시 시도해주세요."
+            )
+            return 1
         conn = connect(db_path)
         initialize_schema(conn)
         return run_backfill(conn, args, db_path, started)
@@ -331,6 +383,8 @@ def main(argv: list[str] | None = None) -> int:
     finally:
         if conn is not None:
             conn.close()
+        if lock_conn is not None:
+            lock_conn.close()
 
 
 if __name__ == "__main__":
