@@ -236,3 +236,24 @@ def test_config_coerce():
         cfg.coerce("nope", 1)
     c, mid = cfg.build_config(6)
     assert mid == "car2077_16" and c["scan_budget"] == 2
+
+
+def test_doorlock_range_message_lists_adjacent_doors():
+    st = make(map_id="car2077_9", start="A2", doorlock_range=0)
+    st.fugitive.ram = 10
+    with pytest.raises(E.RuleError) as ei:
+        E.submit_fugitive_order(st, None, "doorlock", "C1-C2")
+    msg = str(ei.value)
+    assert "A2" in msg and "A1-A2" in msg and "A2-B2" in msg and "C1-C2" not in msg.split("가능:")[1]
+    assert sorted(E.lockable_edges(st)) == ["A1-A2", "A2-A3", "A2-B2"]
+    E.submit_fugitive_order(st, None, "doorlock", "A2-B2")
+
+
+def test_device_hack_message_names_room_and_candidates():
+    st = make(map_id="car2077_9", start="A2")
+    st.fugitive.ram = 10
+    with pytest.raises(E.RuleError) as ei:
+        E.submit_fugitive_order(st, None, "blackout", "C2")
+    msg = str(ei.value)
+    assert "광학 재부팅" in msg and "조명" in msg and "A2" in msg and "커피포트" in msg
+    assert "A3" in msg and "C2" in msg

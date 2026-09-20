@@ -55,7 +55,7 @@ tuned for *how long* and *how* that happens, not *whether*.
 | RAM + trace gauge | **Keep**, add passive trace | A fugitive who never hacks must still get caught. `trace_passive` per round is the fuse. |
 | 9 rooms for 2–3 hunters; scale by map and resources, not hunter actions | **Keep**, and 12 rooms are **not enough for 5–6** | 12 rooms / 6 hunters = 2 rooms per hunter; expected capture in ~3 rounds with plain co-location. Proposal: 16-room map (row D) for 5–6. Draft in §7.2. |
 | Bot = handheld tracker, "Activating Combat Mode" | **Keep** | The tracker also owns the 추적률 gauge, which becomes the visible clock. |
-| One pinned public table, true state only in control server | **Keep** | Plus a per-round message with buttons (mobile). |
+| One public table, true state only in control server | **Keep**, but the table is re-posted as a new message every round (no pin, no edit) | Plus a per-round message with buttons (mobile). |
 | Guild-scoped admin commands + allowlist | **Keep** | §6. |
 | Local persistence | **Keep — JSON, not SQLite** | One game at a time, <20 KB of state; atomic write (tmp + rename). SQLite adds nothing here. |
 | Monte Carlo tuning | **Keep** | §9. Bots give a lower bound on round count; a human fugitive lasts longer. |
@@ -74,10 +74,10 @@ From round `lockdown_start`, the tracker announces a section that seals permanen
 - Map v0 (12 rooms) is the one in the brief; 9-room and 16-room variants in §7.2.
 
 ### 3.2 Round loop
-1. **Round opens.** Bot posts/edits the round message (`R{n}`, timer end as a Discord `<t:…:R>` timestamp, submission counter `제출 3/5`). Pinned table already reflects the previous resolution.
+1. **Round opens.** Bot posts/edits the round message (`R{n}`, timer end as a Discord `<t:…:R>` timestamp, submission counter `제출 3/5`). The latest table message already reflects the previous resolution.
 2. **Orders.** Each hunter submits one order: 이동 (move to an adjacent room) / 수색 (search current room) / 추적 (active scan) / 대기 (stay). Re-submitting overwrites. The fugitive submits move (or stay) + at most one quickhack from the control server.
 3. **Close.** When all hunters and the fugitive have committed, or the timer expires (missing orders → 대기, fugitive → stay, no hack). After the last hunter commits, the fugitive gets `fugitive_grace_sec` extra seconds if not yet committed.
-4. **Resolve** (§3.5) → post the tracker report → edit pinned table → open next round, or post the capture line and go silent.
+4. **Resolve** (§3.5) → post the tracker report → post a fresh table message → open next round, or post the capture line and go silent.
 
 ### 3.3 Hunter actions
 | Order | Effect |
@@ -138,7 +138,7 @@ With the 4-hunter defaults (`trace_passive=4`, `scan_trace=5`) a hack-heavy fugi
 6. Per-scan results are DM'd/ephemeral to the scanning hunter **and** echoed in the report (team info).
 
 ### 3.8 Start and end
-- Start (`/추적기 시작`): read config once, build map, place fugitive at `fugitive_start` (default `auto` = most central room), spread hunters over the rooms farthest from it (`hunter_spawn_rooms=auto`), post `Activating Combat Mode`, pin the table, open round 1. The fugitive's position is never shown until captured (`reveal_start=false`).
+- Start (`/추적기 시작`): read config once, build map, place fugitive at `fugitive_start` (default `auto` = most central room), spread hunters over the rooms farthest from it (`hunter_spawn_rooms=auto`), post `Activating Combat Mode`, post the table, open round 1. The fugitive's position is never shown until captured (`reveal_start=false`).
 - End: bot posts exactly `수수께끼의 인영을 {name}{이|가} 잡았다! Conflict Resolved.` and stops. Nothing else is posted in the game channel until `/추적기 요약` is invoked from the control server.
 - Capturer name: Characters-sheet `name` for the hunter's discord_id if registered, else guild display name.
 
@@ -169,7 +169,7 @@ The round message carries buttons **[이동] [수색] [추적] [대기]**; [이�
 | `/탑승` | Join the lobby (LOBBY only). Admin can also add/remove players. |
 | `/이동 <room>` | Autocomplete offers only adjacent rooms. |
 | `/수색` `/추적` `/대기` | As §3.3 |
-| `/현황` | Re-post the current public table (if the pin scrolled off on mobile). |
+| `/현황` | Re-post the current public table. |
 | `/추적기 도움말` | Rules in Korean. |
 
 ### 5.2 Admin (control guild only + user allowlist)
@@ -307,7 +307,7 @@ fugitive/
   engine.py      pure rules: Map, GameState, submit_order(), resolve_round(), PublicView
   config.py      defaults, sheet loader, validation, scaling merge
   strings.py     every Korean string, one place
-  render.py      pinned table + round report (code block)
+  render.py      public table + round report (code block)
   store.py       JSON snapshot
   views.py       persistent round View, room select
   cog.py         FugitiveCog: public commands, timer task, restart restore

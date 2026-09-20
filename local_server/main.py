@@ -2,8 +2,6 @@ import discord
 from discord.ext import commands
 import os
 from dotenv import load_dotenv
-from pathlib import Path
-from multiprocessing import freeze_support
 import logging
 
 from google_sheets_handler import SheetsHandler
@@ -12,11 +10,9 @@ from google_sheets_handler import SheetsHandler
 # 로깅 설정
 logging.basicConfig(level=logging.INFO, format='%(asctime)s:%(levelname)s:%(name)s: %(message)s')
 
-BASE_DIR = Path(__file__).resolve().parent
-load_dotenv(BASE_DIR / ".env", override=True)
-DISCORD_TOKEN = os.getenv("MOG_TOKEN")
-GSPREAD_SHEET_NAME = os.getenv("GSPREAD_SHEET_NAME")
-GUILD_ID = os.getenv("MOG_GUILD_ID")
+load_dotenv()
+DISCORD_TOKEN = os.getenv("TEST_TOKEN")
+GSPREAD_SHEET_NAME = "Discord_Bot"
 
 intents = discord.Intents.default()
 intents.members = True
@@ -32,7 +28,7 @@ class BattleManager(commands.Bot):
     async def setup_hook(self):
         """봇이 시작될 때 Cogs를 로드하고 슬래시 커맨드를 동기화함"""
         # cogs 폴더 내의 모든 .py 파일을 Cog로 로드
-        cogs_to_load = ['character_commands', 'combat_commands', 'utility_commands', 'shop_commands', 'archive', 'mogindex_commands']
+        cogs_to_load = ['character_commands', 'combat_commands', 'utility_commands', 'shop_commands', 'archive', 'fugitive.cog']
         for cog_name in cogs_to_load:
             try:
                 await self.load_extension(cog_name)
@@ -41,31 +37,27 @@ class BattleManager(commands.Bot):
                 logging.error(f"Cog '{cog_name}' 로드 실패: {e}")
         # 슬래시 명령어 동기화
         try:
-            local_commands = [command.name for command in self.tree.get_commands()]
-            logging.info("슬래시 명령어 로컬 등록 목록: %s", local_commands)
-            if GUILD_ID:
-                guild = discord.Object(id=int(GUILD_ID))
-                self.tree.copy_global_to(guild=guild)
-                synced = await self.tree.sync(guild=guild)
-                logging.info("✅ 길드 슬래시 명령어 동기화 성공 guild=%s commands=%s", GUILD_ID, [command.name for command in synced])
-            else:
-                synced = await self.tree.sync()
-                logging.info("✅ 전역 슬래시 명령어 동기화 성공 commands=%s", [command.name for command in synced])
+            await self.tree.sync()
+            logging.info("✅ 슬래시 명령어 동기화 성공")
         except Exception as e:
             logging.error(f"슬래시 명령어 동기화 실패: {e}")
+        # 침입자 추적 관제 명령은 관제 서버에만 등록
+        control_guild_id = os.getenv("FUGITIVE_CONTROL_GUILD_ID")
+        if control_guild_id and control_guild_id.isdigit():
+            try:
+                await self.tree.sync(guild=discord.Object(id=int(control_guild_id)))
+                logging.info("✅ 관제 서버 명령어 동기화 성공")
+            except Exception as e:
+                logging.error(f"관제 서버 명령어 동기화 실패: {e}")
 
     async def on_ready(self):
         """봇이 연결될 때 호출"""
         logging.info(f'{self.user}(ID: {self.user.id})봇 연결 성공')
 
-def main():
-    if not DISCORD_TOKEN or not GSPREAD_SHEET_NAME:
-        logging.critical("토큰 또는 스프레드 시트 환경 변수가 설정되어 있지 않습니다.")
-        return
-    bot = BattleManager()
-    bot.run(DISCORD_TOKEN)
-
+bot = BattleManager()
 
 if __name__ == "__main__":
-    freeze_support()
-    main()
+    if not DISCORD_TOKEN or not GSPREAD_SHEET_NAME:
+        logging.critical("토큰 또는 스프레드 시트 환경 변수가 설정되어 있지 않습니다.")
+    else:
+        bot.run(DISCORD_TOKEN)

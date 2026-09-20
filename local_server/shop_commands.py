@@ -11,41 +11,13 @@ import json
 import numpy as np
 from collections import Counter
 from view import ItemSelectView
+from utils import get_korean_particle
 
 logger = logging.getLogger(__name__)
 
 # 티켓 상품명 상수
 TICKET_ITEM_NAME = "티켓"
 
-
-def get_korean_particle(word: str, particle_batchim: str, particle_no_batchim: str) -> str:
-    """
-    한글 단어의 마지막 글자에 받침이 있는지 확인하여 적절한 조사 반환
-
-    Args:
-        word: 조사를 붙일 단어
-        particle_batchim: 받침이 있을 때 사용할 조사 (예: '이', '을', '은')
-        particle_no_batchim: 받침이 없을 때 사용할 조사 (예: '가', '를', '는')
-
-    Returns:
-        적절한 조사 문자열
-    """
-    if not word:
-        return particle_no_batchim
-
-    last_char = word[-1]
-
-    # 한글 유니코드 범위 확인
-    if '가' <= last_char <= '힣':
-        # 받침 유무 확인: (유니코드 - '가') % 28 == 0이면 받침 없음
-        char_code = ord(last_char) - ord('가')
-        if char_code % 28 == 0:
-            return particle_no_batchim
-        else:
-            return particle_batchim
-    else:
-        # 한글이 아닌 경우 기본값
-        return particle_no_batchim
 
 def chunked(iterable, n):
     """iterable을 n개씩 잘라서 반환"""
