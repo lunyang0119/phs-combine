@@ -1,6 +1,6 @@
-# 침입자 추적 (Fugitive) — 디자인 문서 v0.1
+# 침입자 추적 (Fugitive) — 디자인 문서 v0.2
 
-Status: **DRAFT — awaiting answers to §11 before implementation.**
+Status: **IMPLEMENTED (v1)** — decisions from the review are folded in (§11). Tunables and sim results in §7.3 / §9.
 
 A 1-vs-N hidden-movement minigame for the train RP. The bot plays the crew's
 handheld signal tracker; hunters (2–6 players) chase an unidentified intruder
@@ -46,10 +46,10 @@ tuned for *how long* and *how* that happens, not *whether*.
 
 | Proposal | Verdict | Reasoning / replacement |
 |---|---|---|
-| Simultaneous submission + timer, no turn rotation | **Keep** | Only sane option for async Discord play; rotation with 6 players is dead time. |
+| Simultaneous submission + timer, no turn rotation | **Keep** (async, 12 h default) | Hunters submit in any order; the bot shuffles the **resolution order** each round, which decides scan slots, capture ties and event order. |
 | Fugitive commits first, hunters after | **Drop the ordering rule** | Ordering only matters if the fugitive can *see* hunter orders. Make that a quickhack (핑, §3.4) instead of a fixed rule. Round closes when everyone has committed or the timer expires; the fugitive may commit at any time in the window. A `fugitive_grace_sec` gives you a short window after the last hunter commits. |
 | Fugitive timeout = stays in place | **Keep** | Also the correct default for a dropped connection. |
-| Edge crossing = capture | **Keep** | Without it, simultaneous moves allow infinite place-swapping. Also add co-location after moves and 수색 (search) for hidden fugitives. |
+| Edge crossing = capture | **Keep**, and make it one of only two ways to catch | Sim (§9) showed that if merely *entering* the fugitive's room captures, 4 hunters clear a 12-room car in ~6 rounds even with all tracker information switched off — the grid is too small for guess-capture. Default `capture_mode=search`: capture by 수색 in the fugitive's room, by a doorway collision (edge swap or running through an occupied room), and by the freeze finale. `capture_mode=contact` (+ `contact_capture_chance`) remains available live for a short, tense variant. |
 | Room device = usable quickhack AND queryable trace | **Keep, split into two channels** | (a) **Passive signature**: any hack publicly broadcasts its *device type* (narrows to 3 rooms). (b) **Active scan** (`추적`): reveals the device type of the fugitive's *current* room. Both are 3-room narrowings, so all information is "which of three". |
 | Door lock blocks an edge for 1 round | **Keep**, make range a tunable | `doorlock_range=0` (edges touching the fugitive's room only — a strong tell) vs `-1` (any edge — a bluff tool). Tune live. |
 | RAM + trace gauge | **Keep**, add passive trace | A fugitive who never hacks must still get caught. `trace_passive` per round is the fuse. |
@@ -83,14 +83,14 @@ From round `lockdown_start`, the tracker announces a section that seals permanen
 | Order | Effect |
 |---|---|
 | 이동 `room` | Move along one edge. If the edge is locked this round, the hunter stays and is told `문이 잠겨 있다`. |
-| 수색 | Stay and search the current room. Catches a **hidden** fugitive in this room. Also the only way to catch a hidden fugitive at all. |
-| 추적 | Stay and operate the tracker: learn the device type of the fugitive's current room (after this round's moves). Only the first `scan_budget` scans per round succeed; later ones return `채널 혼선`. During blackout returns `노이즈`. |
+| 수색 | Stay and search the current room. Catches the fugitive if they end the round here (hidden or not). In `search` mode this is the main way to capture. Fails in a steam-filled room. |
+| 추적 | Stay and operate the tracker: learn the device type of the room the fugitive was in at the **start** of the round (`scan_lag=1`; 0 = after moving). Only the first `scan_budget` scans (in the shuffled order) succeed; later ones return `채널 혼선`. During blackout returns `노이즈`. Each successful scan adds `scan_trace` to the gauge — hunters have a hand on the clock. |
 | 대기 | Nothing (also the timeout default). |
 
-Hunters' orders are visible to each other (co-op team; the intruder can only read them via 핑).
+Hunters' orders are visible to each other on the round message (they all carry crew communicators); the intruder can only read them via 핑. A hunter dazed by steam is skipped for that round.
 
 ### 3.4 Fugitive actions
-Per round: **one movement** (move to an adjacent room, or stay) and **at most one quickhack**. Quickhacks cost RAM immediately and add to the trace gauge. The device-bound ones require the fugitive to be in a room with that device *at the start of the round* (you hack what is around you, then run).
+Per round: **one movement** (up to `fugitive_speed` doors, default 1; the path stops at a locked door and running through a room a hunter starts or ends in is a collision) and **at most one quickhack**. Quickhacks cost RAM immediately and add to the trace gauge. The device-bound ones require the fugitive to be in a room with that device *at the start of the round* (you hack what is around you, then run).
 
 | Quickhack | Device needed | Cost (RAM / trace) | Effect |
 |---|---|---|---|
@@ -99,19 +99,21 @@ Per round: **one movement** (move to an adjacent room, or stay) and **at most on
 | 교란 Distract | speaker | 3 / +15 | Plant a decoy: this round's report shows a `◎ 신호 감지` marker on a room of your choice. Indistinguishable from a real last-seen marker. |
 | 광학 재부팅 Blackout | light | 3 / +15 | The tracker report for this round is suppressed (no signal strength, no signature, no marker update); scans this round return 노이즈. Config `blackout_blocks_scan`. |
 | 은신 Hide | curtain | 4 / +20 | Movement becomes "stay". Immune to co-location capture this round and the next (`hide_duration=2`). 수색 in the room still catches. |
-| 과부하 Overheat | coffeepot | 2 / −20 trace | Dump the trace into the pot's controller: trace −`overheat_amount`. Still broadcasts a coffeepot signature. `overheat_uses` per game (default 2). |
+| 과부하 Overload | coffeepot | 2 / +15 | The pot bursts into steam in the fugitive's current room for this round: hunters who end the round there are dazed (`overload_daze_rounds`, their next order is forced to 대기) and 수색 there fails. Broadcasts a coffeepot signature. |
 
 - Every quickhack (except 핑, config `ping_signature=false`) broadcasts its device type as a **signature** in this round's report: `스피커 계열 장치에서 비정상 접근 감지`. That narrows the fugitive to the 3 rooms of that type at cast time.
-- RAM: `ram_max=10`, `ram_regen=1` per round, starts full. Trace: 0–100, `trace_passive=+5` per round regardless of hacks.
+- RAM: `ram_max`, `ram_regen` per round, starts full. Trace: 0–100, `trace_passive` per round regardless of hacks, plus `scan_trace` per successful hunter scan.
 
 ### 3.5 Resolution order (deterministic)
 ```
 1. fugitive hack pre-effects: door lock placed; hide → move=stay; blackout flag; decoy queued; overheat applied
 2. hunter moves            (locked edge → stay)
-3. fugitive move           (locked edge → stay; frozen → stay)
-4. capture check, priority: (a) 수색 in fugitive's room   > (b) edge swap   > (c) co-location (not hidden)
-                          tie-break inside a class: earliest order timestamp
-5. scans answered (submission order, up to scan_budget)
+3. fugitive move           (path of ≤ fugitive_speed doors; stops at a locked door; frozen → stay)
+4. capture check, priority: (a) 수색 in fugitive's final room  > (b) doorway collision (edge swap or a hunter
+                          starts/ends in a room the fugitive ran through)  > (c) [contact mode only] co-location,
+                          rolled against contact_capture_chance unless the hunter stayed; a miss reveals the room
+                          tie-break inside a class: this round's shuffled hunter order
+5. scans answered (shuffled order, up to scan_budget; each adds scan_trace)
 6. trace += trace_passive; tier effects (§3.6); ram += ram_regen
 7. build tracker report; last-seen marker = fugitive position as of (round − lag(tier)); decoys merged in
 8. failsafe check (§3.6)
@@ -122,21 +124,21 @@ Per round: **one movement** (move to an adjacent room, or stay) and **at most on
 | Fuse | Mechanism |
 |---|---|
 | Trace tiers | `trace ≥ t1 (40)`: last-seen marker auto-updates each round with lag 2. `≥ t2 (70)`: lag 1. `≥ t3 (100)` "TRACED": live position every round and all quickhacks disabled. |
-| Overheat lock | `overheat_rounds (3)` rounds after reaching 100, the deck burns out: the fugitive is **frozen** (cannot move) until caught. |
+| Overheat lock | `overheat_rounds (3)` rounds after reaching 100, the deck burns out: the fugitive is **frozen** (cannot move) and shown live on the tracker until a hunter reaches the room and searches. This is the canonical finale in most games. |
 | Round cap | At `max_rounds (20)` the fugitive is frozen regardless. |
 
-With `trace_passive=5` and no hacks, TRACED arrives at round 20; with normal hacking around round 10–12. Both are tunables.
+With the 4-hunter defaults (`trace_passive=4`, `scan_trace=5`) a hack-heavy fugitive is TRACED around round 11 and frozen by 14; a silent one runs into `max_rounds=18`. All tunables.
 
 ### 3.7 Tracker report (public, each round, in this order)
 1. `R{n}` header and 추적률 bar (trace as a percentage — the visible clock).
-2. **신호 강도**: `강 / 중 / 약 / 없음` = minimum hop distance from any hunter to the fugitive banded as `1 / 2 / 3+ / blackout`. One value per round regardless of hunter count, which is what keeps information per round from scaling with N. Config `signal_mode = banded | exact | off`.
+2. **신호 강도**: `강 / 중 / 약` = minimum hop distance from any hunter to the fugitive, banded by `signal_bands="1,3"` (강 ≤1, 중 ≤3, 약 farther); `판독 불가` under blackout. One value per round regardless of hunter count, which is what keeps information per round from scaling with N. Config `signal_mode = banded | exact | off`.
 3. **시그니처**: device type of any quickhack this round (or nothing).
 4. **표식**: `◎` markers (last-seen per tier lag, plus any decoy).
 5. Locked doors `⛔`, hunters told `문이 잠겨 있다`.
 6. Per-scan results are DM'd/ephemeral to the scanning hunter **and** echoed in the report (team info).
 
 ### 3.8 Start and end
-- Start (`/추적기 시작`): read config once, build map, place fugitive at `fugitive_start` (admin-set; default from config), place hunters on `hunter_spawn_rooms` round-robin (default: the two rooms farthest from the fugitive start), post `Activating Combat Mode`, post the initial report with `침입자 신호 최초 감지: {room}` if `reveal_start=true` (Scotland-Yard-style opening reveal), pin the table, open round 1.
+- Start (`/추적기 시작`): read config once, build map, place fugitive at `fugitive_start` (default `auto` = most central room), spread hunters over the rooms farthest from it (`hunter_spawn_rooms=auto`), post `Activating Combat Mode`, pin the table, open round 1. The fugitive's position is never shown until captured (`reveal_start=false`).
 - End: bot posts exactly `수수께끼의 인영을 {name}{이|가} 잡았다! Conflict Resolved.` and stops. Nothing else is posted in the game channel until `/추적기 요약` is invoked from the control server.
 - Capturer name: Characters-sheet `name` for the hunter's discord_id if registered, else guild display name.
 
@@ -174,9 +176,10 @@ The round message carries buttons **[이동] [수색] [추적] [대기]**; [이�
 | Command | Notes |
 |---|---|
 | `/추적기 개설 <channel_id>` | Create lobby bound to the public channel. |
+| `/추적기 참가자 <추가|제거> <user_id> [이름]` | Manual roster edits while in the lobby. |
 | `/추적기 시작 [fugitive_start]` | Read sheets once, start round 1. |
 | `/도주 <이동|대기> [핵] [대상]` | The fugitive's whole order in one command; re-issue to overwrite until the round closes. `대상` = edge (`A2-B2`) for 문 잠금, room for 교란. |
-| `/도주 핑` | Cast 핑 immediately. |
+| `/도주 핑` / `/도주 취소` | Cast 핑 immediately / withdraw this round's fugitive order. |
 | `/추적기 상태` | True state: fugitive room, RAM, trace, all pending orders, decoys, history tail. |
 | `/추적기 설정 <key> <value>` / `/추적기 설정보기` | Mutate/show any tunable live. Validated by type/range. |
 | `/추적기 라운드종료` / `/추적기 연장 <sec>` | Force-resolve now / extend the timer. |
@@ -238,28 +241,33 @@ Draft variants (to confirm):
 **`Fugitive_Scaling`** — one row per hunter count, columns override Config:
 | hunters | map_id | ram_max | ram_regen | trace_passive | scan_budget | max_rounds |
 |---|---|---|---|---|---|---|
-| 2 | car2077_9 | 8 | 1 | 6 | 1 | 18 |
-| 3 | car2077_9 | 8 | 1 | 6 | 1 | 18 |
-| 4 | car2077_12 | 10 | 1 | 5 | 1 | 20 |
-| 5 | car2077_16 | 12 | 1 | 4 | 2 | 20 |
-| 6 | car2077_16 | 12 | 2 | 4 | 2 | 20 |
+| 2 | car2077_9 | 8 | 1 | 3 | 1 | 22 |
+| 3 | car2077_9 | 8 | 1 | 4 | 1 | 20 |
+| 4 | car2077_12 | 10 | 1 | 4 | 1 | 18 |
+| 5 | car2077_16 | 12 | 1 | 6 | 2 | 16 |
+| 6 | car2077_16 | 12 | 2 | 7 | 2 | 15 |
+
+An `extra` column holding a JSON object is merged on top (any tunable).
 
 Missing sheets → built-in defaults in `fugitive/config.py`, so the game runs even before the sheet exists.
 
-### 7.3 Tunables (all `/추적기 설정`-mutable)
+### 7.3 Tunables (all `/추적기 설정`-mutable; defaults in `fugitive/config.py`)
 ```
-round_timer_sec=180   fugitive_grace_sec=30   early_resolve=true
+round_timer_sec=43200  fugitive_grace_sec=1800  early_resolve=true
+fugitive_speed=1  capture_mode=search  contact_capture_chance=0.5
 ram_max=10  ram_regen=1
-trace_passive=5  trace_t1=40  trace_t2=70  trace_t3=100  overheat_rounds=3  max_rounds=20
-scan_budget=1  signal_mode=banded  signature_reveal=true  reveal_start=true
+trace_passive=5  trace_t1=40  trace_t2=70  trace_t3=100  overheat_rounds=3  max_rounds=24
+scan_budget=1  scan_trace=5  scan_lag=1  signal_mode=banded  signal_bands=1,3
+signature_reveal=true  reveal_start=false
 ping_enabled=true ping_cost=1 ping_trace=5 ping_signature=false
 doorlock_cost=2 doorlock_trace=10 doorlock_range=0
 distract_cost=3 distract_trace=15
 blackout_cost=3 blackout_trace=15 blackout_blocks_scan=true
 hide_cost=4 hide_trace=20 hide_duration=2
-overheat_cost=2 overheat_amount=20 overheat_uses=2
-lockdown_enabled=false lockdown_start=8 lockdown_every=3
-hunter_spawn_rooms=auto  fugitive_start=A2
+overload_cost=2 overload_trace=15 overload_daze_rounds=1
+render_mode=text            # image = PNG via Pillow when a CJK font is available
+hunter_spawn_rooms=auto  fugitive_start=auto
+lockdown_enabled=false lockdown_start=8 lockdown_every=3   # TODO, not implemented (§11-8)
 ```
 
 ---
@@ -277,6 +285,18 @@ hunter_spawn_rooms=auto  fugitive_start=A2
 - Hunter bots: `random`, `greedy` (move toward the centroid of the current candidate set = rooms consistent with all signatures/scans/markers; search when the candidate set ≤ 2 and a curtain signature is live; scan when the candidate set > 4).
 - Fugitive bots: `stealth` (maximise distance, never hack), `hacker` (lock when a hunter is adjacent, hide when ≥2 hunters within 1 hop, overheat when trace ≥ 60, distract otherwise when RAM allows).
 - Output: p10/p50/p90 rounds-to-capture and capture-cause breakdown (search / swap / co-location / frozen) per (hunters, map, config). The scaling table in §7.2 is what we adjust until p50 lines up across hunter counts.
+
+Results with the §7.2 defaults (400 games each, seed 1):
+
+| hunters | hacker fugitive p50 (p10–p90) | stealth fugitive p50 | ends by freeze |
+|---|---|---|---|
+| 2 | 17 (15–19) | 25 | ~99% |
+| 3 | 14 (8–15) | 21 | ~80% |
+| 4 | 15 (7–17) | 8 | ~60% |
+| 5 | 12 (8–14) | 15 | ~80% |
+| 6 | 12 (7–13) | 14 | ~80% |
+
+Why `contact` capture was rejected as the default: with `capture_mode=contact` and every tracker signal turned **off**, 4 greedy hunters still caught the fugitive in a median of 8 rounds on 12 rooms and 9 on 16 rooms; with signals on, 6. No information tuning reaches 15 on a train car, so the clock (trace + freeze) has to carry the pacing and hunters' direct captures are the bonus.
 
 ---
 
@@ -318,17 +338,19 @@ An image renderer (Pillow) can be added later behind `render_mode=image` if the 
 
 ---
 
-## 11. Open questions (need answers before code)
+## 11. Decisions (from review of v0.1)
 
-1. **Target round count.** Proposal: p50 ≈ 10 rounds, p90 ≤ 15 for every hunter count. OK, or shorter/longer?
-2. **Round timer.** Sync play at 180 s per round (≈ 30–40 min game) vs. async (e.g. 6–12 h per round). The design supports both via `round_timer_sec`; which is the default you will actually run?
-3. **Quickhack list.** Six proposed in §3.4 (핑, 문 잠금, 교란, 광학 재부팅, 은신, 과부하). Remove/rename any? Is a coffeepot "trace dump" acceptable diegetically, or should coffeepot rooms do something else (e.g. steam that blocks 수색 in that room for a round)?
-4. **RAM/trace numbers.** Accept the §7.3 defaults as the starting point for the sim, or do you want a specific pacing (e.g. "no hacks → traced by round 15")?
-5. **Hunter action set.** 이동 / 수색 / 추적 / 대기 with 추적 costing the action and limited by `scan_budget`. Alternative: 추적 is free but only one per round for the whole team (first come). Which?
-6. **Tracker mechanics.** Signal strength = banded minimum distance (one value per round). Alternative: per-hunter proximity flags (scales with N, stronger). Keep banded?
-7. **Map size.** Confirm 9 / 12 / 16 by hunter count, and the row-D draft in §7.2. Should the car loop A4↔A1 / D4↔D1 physically (a real ring), or is "has cycles" enough?
-8. **격리 프로토콜 (shrinking zone).** Implement as an off-by-default option, or leave it out of v1?
-9. **Rendering.** Code block first (above) and image later, or image from the start?
-10. **Hunters' orders visibility.** Visible to fellow hunters (proposed) or ephemeral/private until resolution?
-11. **Capturer name source.** Characters-sheet name → guild display name fallback. OK?
-12. **Opening reveal.** Show the fugitive's start room at round 0 (`reveal_start=true`), or start fully dark?
+1. **Pacing**: median 15 rounds at 4 hunters, fewer as hunters increase → `max_rounds` 22/20/18/16/15 and `trace_passive` scale with hunter count (§7.2).
+2. **Timer**: async, 12 h per round by default, resolve early when everyone has submitted.
+3. **Quickhacks**: list kept; coffeepot 과부하 is a steam distraction (daze + blocks 수색), not a trace dump.
+4. **Numbers**: §7.3 defaults are the sim starting point.
+5. **Hunter actions**: one action per hunter per round; the bot shuffles the resolution order each round.
+6. **Tracker**: banded minimum distance (one value per round).
+7. **Maps**: 9 / 12 / 16 by hunter count, row-D draft confirmed, no physical end-to-end loop.
+8. **격리 프로토콜 (shrinking zone)**: TODO for later; config keys reserved, not implemented.
+9. **Rendering**: code block by default; `render_mode=image` PNG renderer implemented behind a font check (see `fugitive/image_render.py`) for you to evaluate on Discord.
+10. **Orders**: hunters see each other's orders (communicators).
+11. **Capturer name**: Characters sheet `name`, falling back to the guild display name.
+12. **Opening**: fully hidden; nothing about the fugitive is shown until capture (tier markers still appear as the trace gauge climbs — that is the fuse).
+
+Added during implementation, all live-tunable: `capture_mode` (default `search`, see §2), `contact_capture_chance`, `fugitive_speed`, `scan_lag`, `scan_trace`, `signal_bands`, `render_mode`; a frozen fugitive is always shown live.

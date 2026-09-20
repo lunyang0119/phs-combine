@@ -28,7 +28,7 @@ class BattleManager(commands.Bot):
     async def setup_hook(self):
         """봇이 시작될 때 Cogs를 로드하고 슬래시 커맨드를 동기화함"""
         # cogs 폴더 내의 모든 .py 파일을 Cog로 로드
-        cogs_to_load = ['character_commands', 'combat_commands', 'utility_commands', 'shop_commands', 'archive']
+        cogs_to_load = ['character_commands', 'combat_commands', 'utility_commands', 'shop_commands', 'archive', 'fugitive.cog']
         for cog_name in cogs_to_load:
             try:
                 await self.load_extension(cog_name)
@@ -41,6 +41,14 @@ class BattleManager(commands.Bot):
             logging.info("✅ 슬래시 명령어 동기화 성공")
         except Exception as e:
             logging.error(f"슬래시 명령어 동기화 실패: {e}")
+        # 침입자 추적 관제 명령은 관제 서버에만 등록
+        control_guild_id = os.getenv("FUGITIVE_CONTROL_GUILD_ID")
+        if control_guild_id and control_guild_id.isdigit():
+            try:
+                await self.tree.sync(guild=discord.Object(id=int(control_guild_id)))
+                logging.info("✅ 관제 서버 명령어 동기화 성공")
+            except Exception as e:
+                logging.error(f"관제 서버 명령어 동기화 실패: {e}")
 
     async def on_ready(self):
         """봇이 연결될 때 호출"""

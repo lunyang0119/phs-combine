@@ -1,0 +1,770 @@
+"""침입자 추적 미니게임 — Discord 코그.
+
+공개 명령(헌터, 게임 서버): /탑승 /이동 /수색 /추적 /대기 /현황 /추적기도움말
+관제 명령(어드민, 관제 서버 + 사용자 허용 목록): /추적기 … , /도주 …
+
+숨겨진 상태(도주자 위치·RAM·명령)는 메모리와 data/fugitive_state.json 에만 있다.
+공개 채널에는 PublicView 로 만든 내용만 나간다.
+"""
+from __future__ import annotations
+
+import asyncio
+import logging
+import os
+import random
+import time
+from typing import Dict, List, Optional
+
+import discord
+from discord import app_commands
+from discord.ext import commands
+
+import utils
+from . import config as cfgmod
+from . import engine as E
+from . import image_render, render, store
+from . import strings as S
+from .views import RoomSelectView, RoundView
+
+logger = logging.getLogger(__name__)
+
+MIN_HUNTERS, MAX_HUNTERS = 2, 6
+
+
+def _env_int(name: str) -> int:
+    try:
+        return int(os.getenv(name, "0") or 0)
+    except ValueError:
+        return 0
+
+
+def capture_line(name: str) -> str:
+    if utils.ends_with_hangul(name):
+        particle = utils.get_korean_particle(name, "이", "가")
+    else:
+        particle = "이(가)"
+    return S.CAPTURE_LINE.format(name=name, particle=particle)
+
+
+class FugitiveCog(commands.Cog):
+    def __init__(self, bot: commands.Bot):
+        self.bot = bot
+        self.sheet_handler = getattr(bot, "sheet_handler", None)
+        self.state: Optional[E.GameState] = None
+        self.lock = asyncio.Lock()
+        self.timer_task: Optional[asyncio.Task] = None
+        self.rng = random.Random()
+        self.control_guild_id = _env_int("FUGITIVE_CONTROL_GUILD_ID")
+        self.admin_ids = {
+            int(x) for x in os.getenv("FUGITIVE_ADMIN_IDS", "").replace(";", ",").split(",") if x.strip().isdigit()
+        }
+        self.admin_group = self._build_admin_group()
+        self.fugitive_group = self._build_fugitive_group()
+
+    # ------------------------------------------------------------------ 수명
+    async def cog_load(self):
+        self.bot.add_view(RoundView())
+        if self.control_guild_id:
+            guild = discord.Object(id=self.control_guild_id)
+            self.bot.tree.add_command(self.admin_group, guild=guild)
+            self.bot.tree.add_command(self.fugitive_group, guild=guild)
+        else:
+            logger.warning("FUGITIVE_CONTROL_GUILD_ID 미설정 — 관제 명령을 등록하지 않습니다")
+        self.state = store.load()
+        if self.state and self.state.status == E.ROUND_OPEN:
+            remaining = max(15.0, self.state.deadline_ts - time.time())
+            self._arm_timer(remaining)
+            logger.info("추적기 상태 복원: R%s, 남은 시간 %.0fs", self.state.round_no, remaining)
+        elif self.state and self.state.status == E.PAUSED:
+            logger.info("추적기 상태 복원: 일시정지 상태")
+
+    async def cog_unload(self):
+        self._cancel_timer()
+        if self.control_guild_id:
+            guild = discord.Object(id=self.control_guild_id)
+            self.bot.tree.remove_command(self.admin_group.name, guild=guild)
+            self.bot.tree.remove_command(self.fugitive_group.name, guild=guild)
+
+    # ------------------------------------------------------------------ 도우미
+    def _is_admin(self, interaction: discord.Interaction) -> bool:
+        return (interaction.guild_id == self.control_guild_id and self.control_guild_id != 0
+                and interaction.user.id in self.admin_ids)
+
+    def _save(self):
+        store.save(self.state)
+
+    async def _char_name(self, user: discord.abc.User, guild: Optional[discord.Guild]) -> str:
+        if self.sheet_handler is not None:
+            try:
+                row = self.sheet_handler.get_char_data(str(user.id))
+                if row is not None:
+                    name = str(row.get("name", "")).strip()
+                    if name and name.lower() != "nan":
+                        return name
+            except Exception as e:  # noqa: BLE001
+                logger.warning("캐릭터 이름 조회 실패: %s", e)
+        if guild:
+            member = guild.get_member(user.id)
+            if member:
+                return member.display_name
+        return user.display_name
+
+    async def _channel(self, channel_id: int) -> Optional[discord.abc.Messageable]:
+        ch = self.bot.get_channel(channel_id)
+        if ch is None:
+            try:
+                ch = await self.bot.fetch_channel(channel_id)
+            except discord.HTTPException:
+                return None
+        return ch  # type: ignore[return-value]
+
+    async def _control_send(self, content: str):
+        if not self.state or not self.state.control_channel_id:
+            return
+        ch = await self._channel(self.state.control_channel_id)
+        if ch:
+            try:
+                await ch.send(content)
+            except discord.HTTPException as e:
+                logger.warning("관제 채널 전송 실패: %s", e)
+
+    def _names(self) -> Dict[str, str]:
+        return {uid: h.name for uid, h in self.state.hunters.items()} if self.state else {}
+
+    def _render_mode(self) -> str:
+        mode = str(self.state.config.get("render_mode", "text")) if self.state else "text"
+        return "image" if mode == "image" and image_render.available() else "text"
+
+    async def _update_table(self, channel: discord.abc.Messageable):
+        st = self.state
+        pv = E.public_view(st)
+        text = render.table_text(pv)
+        kwargs: Dict = {"content": text}
+        if self._render_mode() == "image":
+            buf = image_render.render(pv)
+            if buf:
+                kwargs = {"content": f"**{S.TABLE_TITLE}**", "attachments": [discord.File(buf, "tracker.png")]}
+        msg = None
+        if st.table_message_id:
+            try:
+                msg = await channel.fetch_message(st.table_message_id)  # type: ignore[attr-defined]
+                await msg.edit(**kwargs)
+            except discord.HTTPException:
+                msg = None
+        if msg is None:
+            if "attachments" in kwargs:
+                kwargs["files"] = kwargs.pop("attachments")
+            msg = await channel.send(**kwargs)
+            st.table_message_id = msg.id
+            try:
+                await msg.pin()
+            except discord.HTTPException:
+                pass
+
+    # ------------------------------------------------------------------ 타이머
+    def _arm_timer(self, seconds: float):
+        self._cancel_timer()
+        self.timer_task = asyncio.create_task(self._timer(seconds))
+
+    def _cancel_timer(self):
+        if self.timer_task and not self.timer_task.done():
+            self.timer_task.cancel()
+        self.timer_task = None
+
+    async def _timer(self, seconds: float):
+        try:
+            await asyncio.sleep(seconds)
+        except asyncio.CancelledError:
+            return
+        await self._close_round(timed_out=True)
+
+    def _maybe_shorten_deadline(self):
+        """전원 제출 시: 도주자도 제출했으면 즉시, 아니면 유예 후 정산."""
+        st = self.state
+        if not st or st.status != E.ROUND_OPEN or not st.config.get("early_resolve", True):
+            return
+        if not st.all_hunters_submitted():
+            return
+        now = time.time()
+        if st.fugitive.order is not None or st.fugitive.frozen:
+            st.deadline_ts = now
+            self._arm_timer(0.5)
+            return
+        grace = float(st.config.get("fugitive_grace_sec", 0))
+        new_deadline = min(st.deadline_ts, now + grace)
+        if new_deadline < st.deadline_ts:
+            st.deadline_ts = new_deadline
+            self._arm_timer(max(0.5, new_deadline - now))
+
+    # ------------------------------------------------------------------ 라운드 진행
+    async def _open_round(self, channel: discord.abc.Messageable):
+        st = self.state
+        st.status = E.ROUND_OPEN
+        st.deadline_ts = time.time() + float(st.config["round_timer_sec"])
+        msg = await channel.send(render.round_open_text(st, int(st.deadline_ts)), view=RoundView())
+        st.round_message_id = msg.id
+        self._save()
+        self._arm_timer(st.deadline_ts - time.time())
+
+    async def _refresh_round_message(self):
+        st = self.state
+        if not st or not st.round_message_id:
+            return
+        ch = await self._channel(st.channel_id)
+        if not ch:
+            return
+        try:
+            msg = await ch.fetch_message(st.round_message_id)  # type: ignore[attr-defined]
+            await msg.edit(content=render.round_open_text(st, int(st.deadline_ts)))
+        except discord.HTTPException:
+            pass
+
+    async def _close_round(self, timed_out: bool = False):
+        async with self.lock:
+            st = self.state
+            if not st or st.status != E.ROUND_OPEN:
+                return
+            self._cancel_timer()
+            try:
+                rep = E.resolve_round(st, self.rng, timed_out=timed_out)
+            except E.RuleError as e:
+                logger.error("정산 실패: %s", e)
+                st.status = E.ROUND_OPEN
+                return
+            self._save()
+            ch = await self._channel(st.channel_id)
+            if ch is None:
+                logger.error("게임 채널 %s 을 찾을 수 없습니다", st.channel_id)
+                return
+            # 이전 라운드 메시지의 버튼 제거
+            if st.round_message_id:
+                try:
+                    old = await ch.fetch_message(st.round_message_id)  # type: ignore[attr-defined]
+                    await old.edit(view=None)
+                except discord.HTTPException:
+                    pass
+            await ch.send(render.report_text(rep, self._names()))
+            await self._update_table(ch)
+            await self._control_send(render.true_state_text(st))
+            if st.status == E.CAPTURED:
+                name = st.hunters[st.captured_by].name
+                await ch.send(capture_line(name))
+                st.round_message_id = 0
+                self._save()
+                return
+            await self._open_round(ch)
+
+    # ------------------------------------------------------------------ 헌터 입력 공통
+    async def _reply(self, interaction: discord.Interaction, content: str, edit: bool = False):
+        if interaction.response.is_done():
+            await interaction.followup.send(content, ephemeral=True)
+        elif edit:
+            await interaction.response.edit_message(content=content, view=None)
+        else:
+            await interaction.response.send_message(content, ephemeral=True)
+
+    def _hunter_guard(self, interaction: discord.Interaction) -> Optional[str]:
+        st = self.state
+        if st is None or st.status in (E.IDLE, E.LOBBY, E.CAPTURED):
+            return S.ERR_NO_GAME
+        if interaction.guild_id != st.guild_id:
+            return S.ERR_WRONG_GUILD
+        if str(interaction.user.id) not in st.hunters:
+            return S.ERR_NOT_HUNTER
+        if st.status != E.ROUND_OPEN:
+            return S.ERR_NOT_OPEN
+        return None
+
+    async def handle_button(self, interaction: discord.Interaction, kind: str):
+        err = self._hunter_guard(interaction)
+        if err:
+            await self._reply(interaction, err)
+            return
+        if kind == "move":
+            h = self.state.hunters[str(interaction.user.id)]
+            if h.dazed_until >= self.state.round_no:
+                await self._reply(interaction, S.ERR_DAZED)
+                return
+            rooms = list(self.state.game_map.rooms[h.room].neighbors)
+            await interaction.response.send_message(
+                f"현재 위치 **{h.room}**. 이동할 구역을 고르세요.", view=RoomSelectView(rooms, h.room), ephemeral=True)
+            return
+        await self.handle_order(interaction, kind, None)
+
+    async def handle_order(self, interaction: discord.Interaction, kind: str, target: Optional[str], edit: bool = False):
+        err = self._hunter_guard(interaction)
+        if err:
+            await self._reply(interaction, err, edit)
+            return
+        st = self.state
+        uid = str(interaction.user.id)
+        async with self.lock:
+            if st.status != E.ROUND_OPEN:
+                await self._reply(interaction, S.ERR_NOT_OPEN, edit)
+                return
+            try:
+                order = E.submit_hunter_order(st, uid, kind, target)
+            except E.RuleError as e:
+                h = st.hunters[uid]
+                code = str(e)
+                if code == "DAZED":
+                    msg = S.ERR_DAZED
+                elif code == "NOT_ADJACENT":
+                    msg = S.ERR_NOT_ADJACENT.format(room=target, here=h.room, options=", ".join(st.game_map.rooms[h.room].neighbors))
+                elif code == "UNKNOWN_ROOM":
+                    msg = S.ERR_UNKNOWN_ROOM.format(room=target)
+                elif code == "NOT_OPEN":
+                    msg = S.ERR_NOT_OPEN
+                else:
+                    msg = code
+                await self._reply(interaction, msg, edit)
+                return
+            all_in = st.all_hunters_submitted()
+            self._maybe_shorten_deadline()
+            self._save()
+        label = render.order_label(order)
+        await self._reply(interaction, (S.OK_ORDER_ALL_IN if all_in and st.fugitive.order else S.OK_ORDER).format(order=label), edit)
+        await self._refresh_round_message()
+        if st.fugitive.ping_round == st.round_no:
+            await self._control_send(f"📡 핑: {st.hunters[uid].name} → {label}")
+
+    # ------------------------------------------------------------------ 공개 슬래시 명령
+    @app_commands.command(name="탑승", description="침입자 추적에 참가합니다 (참가 모집 중에만).")
+    async def join(self, interaction: discord.Interaction):
+        st = self.state
+        if st is None or st.status != E.LOBBY:
+            await interaction.response.send_message(S.ERR_LOBBY_ONLY, ephemeral=True)
+            return
+        if interaction.guild_id != st.guild_id:
+            await interaction.response.send_message(S.ERR_WRONG_GUILD, ephemeral=True)
+            return
+        uid = str(interaction.user.id)
+        if uid in st.hunters:
+            await interaction.response.send_message(S.ERR_ALREADY_JOINED, ephemeral=True)
+            return
+        if len(st.hunters) >= MAX_HUNTERS:
+            await interaction.response.send_message(S.ERR_LOBBY_FULL.format(max=MAX_HUNTERS), ephemeral=True)
+            return
+        name = await self._char_name(interaction.user, interaction.guild)
+        st.hunters[uid] = E.Hunter(user_id=uid, name=name, room="", joined_ts=time.time())
+        self._save()
+        await interaction.response.send_message(S.OK_JOINED.format(name=name, n=len(st.hunters)))
+        await self._refresh_lobby_message()
+
+    async def _refresh_lobby_message(self):
+        st = self.state
+        if not st or not st.round_message_id:
+            return
+        ch = await self._channel(st.channel_id)
+        if not ch:
+            return
+        try:
+            msg = await ch.fetch_message(st.round_message_id)  # type: ignore[attr-defined]
+            await msg.edit(content=render.lobby_text([h.name for h in st.hunters.values()]))
+        except discord.HTTPException:
+            pass
+
+    async def _room_autocomplete(self, interaction: discord.Interaction, current: str) -> List[app_commands.Choice[str]]:
+        st = self.state
+        if not st or st.status != E.ROUND_OPEN:
+            return []
+        h = st.hunters.get(str(interaction.user.id))
+        if not h:
+            return []
+        rooms = [r for r in st.game_map.rooms[h.room].neighbors if current.lower() in r.lower()]
+        return [app_commands.Choice(name=f"{r} ({S.DEVICE_KO[st.game_map.rooms[r].device]})", value=r) for r in rooms][:25]
+
+    @app_commands.command(name="이동", description="인접한 구역으로 이동 명령을 제출합니다.")
+    @app_commands.describe(구역="이동할 구역 (예: B2)")
+    @app_commands.autocomplete(구역=_room_autocomplete)
+    async def move(self, interaction: discord.Interaction, 구역: str):
+        await self.handle_order(interaction, "move", 구역.strip().upper())
+
+    @app_commands.command(name="수색", description="현재 구역을 수색합니다. 숨은 침입자를 잡는 유일한 방법.")
+    async def search(self, interaction: discord.Interaction):
+        await self.handle_order(interaction, "search", None)
+
+    @app_commands.command(name="추적", description="추적기를 조작해 침입자가 있는 구역의 장치 계열을 알아냅니다.")
+    async def scan(self, interaction: discord.Interaction):
+        await self.handle_order(interaction, "scan", None)
+
+    @app_commands.command(name="대기", description="이번 라운드는 제자리에 머뭅니다.")
+    async def stay(self, interaction: discord.Interaction):
+        await self.handle_order(interaction, "stay", None)
+
+    @app_commands.command(name="현황", description="추적기 현황판을 다시 보여줍니다.")
+    async def status(self, interaction: discord.Interaction):
+        st = self.state
+        if st is None or st.status in (E.IDLE, E.LOBBY):
+            await interaction.response.send_message(S.ERR_NO_GAME, ephemeral=True)
+            return
+        if interaction.guild_id == self.control_guild_id and self.control_guild_id:
+            await interaction.response.send_message(S.ERR_WRONG_GUILD, ephemeral=True)
+            return
+        pv = E.public_view(st)
+        if self._render_mode() == "image":
+            buf = image_render.render(pv)
+            if buf:
+                await interaction.response.send_message(file=discord.File(buf, "tracker.png"), ephemeral=True)
+                return
+        await interaction.response.send_message(render.table_text(pv), ephemeral=True)
+
+    @app_commands.command(name="추적기도움말", description="침입자 추적 미니게임 규칙 안내.")
+    async def help_cmd(self, interaction: discord.Interaction):
+        budget = self.state.config["scan_budget"] if self.state and self.state.config else cfgmod.DEFAULTS["scan_budget"]
+        await interaction.response.send_message(S.HELP.format(scan_budget=budget), ephemeral=True)
+
+    # ------------------------------------------------------------------ 관제 명령: /추적기
+    def _build_admin_group(self) -> app_commands.Group:
+        cog = self
+        grp = app_commands.Group(name="추적기", description="[관제] 침입자 추적 미니게임 운영")
+
+        async def admin_only(interaction: discord.Interaction) -> bool:
+            return cog._is_admin(interaction)
+
+        @grp.error
+        async def on_error(interaction: discord.Interaction, error: app_commands.AppCommandError):
+            if isinstance(error, app_commands.CheckFailure):
+                msg = S.ERR_WRONG_GUILD
+            else:
+                logger.error("관제 명령 오류: %s", error, exc_info=error)
+                msg = f"오류: {error}"
+            if interaction.response.is_done():
+                await interaction.followup.send(msg, ephemeral=True)
+            else:
+                await interaction.response.send_message(msg, ephemeral=True)
+
+        @grp.command(name="개설", description="게임 채널을 지정하고 참가 모집을 시작합니다.")
+        @app_commands.describe(채널id="공개 게임 채널 ID")
+        @app_commands.check(admin_only)
+        async def open_lobby(interaction: discord.Interaction, 채널id: str):
+            if cog.state and cog.state.status in (E.ROUND_OPEN, E.PAUSED, E.RESOLVING):
+                await interaction.response.send_message("진행 중인 게임이 있습니다. 먼저 `/추적기 종료` 하세요.", ephemeral=True)
+                return
+            try:
+                cid = int(채널id)
+            except ValueError:
+                await interaction.response.send_message("채널 ID는 숫자여야 합니다.", ephemeral=True)
+                return
+            ch = await cog._channel(cid)
+            if ch is None or not isinstance(ch, (discord.TextChannel, discord.Thread)):
+                await interaction.response.send_message("채널을 찾을 수 없습니다.", ephemeral=True)
+                return
+            st = E.GameState(status=E.LOBBY, guild_id=ch.guild.id, channel_id=cid,
+                             control_guild_id=interaction.guild_id or 0, control_channel_id=interaction.channel_id or 0,
+                             created_ts=time.time())
+            cog.state = st
+            msg = await ch.send(render.lobby_text([]))
+            st.round_message_id = msg.id
+            cog._save()
+            await interaction.response.send_message(f"참가 모집 시작: <#{cid}>", ephemeral=True)
+
+        @grp.command(name="참가자", description="참가자를 수동으로 추가/제거합니다.")
+        @app_commands.describe(동작="추가 또는 제거", 유저id="디스코드 사용자 ID", 이름="표시 이름 (추가 시, 생략하면 자동)")
+        @app_commands.choices(동작=[app_commands.Choice(name="추가", value="add"), app_commands.Choice(name="제거", value="remove")])
+        @app_commands.check(admin_only)
+        async def manage_hunter(interaction: discord.Interaction, 동작: app_commands.Choice[str], 유저id: str, 이름: Optional[str] = None):
+            st = cog.state
+            if st is None or st.status != E.LOBBY:
+                await interaction.response.send_message("참가 모집 중에만 가능합니다.", ephemeral=True)
+                return
+            uid = 유저id.strip()
+            if 동작.value == "remove":
+                st.hunters.pop(uid, None)
+            else:
+                name = 이름
+                if not name:
+                    try:
+                        user = await cog.bot.fetch_user(int(uid))
+                        guild = cog.bot.get_guild(st.guild_id)
+                        name = await cog._char_name(user, guild)
+                    except (discord.HTTPException, ValueError):
+                        name = uid
+                st.hunters[uid] = E.Hunter(user_id=uid, name=name, room="", joined_ts=time.time())
+            cog._save()
+            await cog._refresh_lobby_message()
+            await interaction.response.send_message(f"참가자 {len(st.hunters)}명: " + ", ".join(h.name for h in st.hunters.values()), ephemeral=True)
+
+        @grp.command(name="시작", description="시트를 한 번 읽고 게임을 시작합니다.")
+        @app_commands.describe(시작구역="도주자 시작 구역 (생략 시 자동)", 맵="맵 ID 강제 지정 (선택)")
+        @app_commands.check(admin_only)
+        async def start_game(interaction: discord.Interaction, 시작구역: Optional[str] = None, 맵: Optional[str] = None):
+            st = cog.state
+            if st is None or st.status != E.LOBBY:
+                await interaction.response.send_message("먼저 `/추적기 개설` 로 참가를 모집하세요.", ephemeral=True)
+                return
+            n = len(st.hunters)
+            if not MIN_HUNTERS <= n <= MAX_HUNTERS:
+                await interaction.response.send_message(f"참가자는 {MIN_HUNTERS}~{MAX_HUNTERS}명이어야 합니다 (현재 {n}명).", ephemeral=True)
+                return
+            await interaction.response.defer(ephemeral=True)
+            spreadsheet = getattr(cog.sheet_handler, "spreadsheet", None)
+            try:
+                sheet = await asyncio.to_thread(cfgmod.load_sheet_data, spreadsheet)
+            except Exception as e:  # noqa: BLE001
+                logger.warning("Fugitive 시트 읽기 실패, 기본값 사용: %s", e)
+                sheet = {"maps": None, "config": None, "scaling": None}
+            try:
+                config, map_id = cfgmod.build_config(n, sheet["config"], sheet["scaling"])
+                map_id = (맵 or map_id).strip()
+                maps = dict(cfgmod.BUILTIN_MAPS)
+                if sheet["maps"]:
+                    maps.update(sheet["maps"])
+                if map_id not in maps:
+                    raise cfgmod.ConfigError(f"맵 {map_id} 없음 (사용 가능: {', '.join(maps)})")
+                gmap = E.GameMap.from_rows(map_id, cfgmod.map_rows(map_id, maps))
+                hunters = [(uid, h.name) for uid, h in st.hunters.items()]
+                new = E.new_game(gmap, config, hunters, fugitive_start=(시작구역 or None), rng=cog.rng)
+            except (cfgmod.ConfigError, E.RuleError) as e:
+                await interaction.followup.send(f"시작 실패: {e}", ephemeral=True)
+                return
+            new.guild_id, new.channel_id = st.guild_id, st.channel_id
+            new.control_guild_id, new.control_channel_id = st.control_guild_id, st.control_channel_id
+            cog.state = new
+            ch = await cog._channel(new.channel_id)
+            if ch is None:
+                await interaction.followup.send("게임 채널을 찾을 수 없습니다.", ephemeral=True)
+                return
+            await ch.send(f"**{S.COMBAT_MODE_ON}**\n{S.GAME_START_INTRO}")
+            new.table_message_id = 0
+            await cog._update_table(ch)
+            await cog._open_round(ch)
+            await cog._control_send(render.true_state_text(new))
+            await interaction.followup.send(f"시작: 맵 {map_id}, 참가 {n}명, 라운드 타이머 {config['round_timer_sec']}초", ephemeral=True)
+
+        @grp.command(name="상태", description="실제 상태(도주자 위치 포함)를 봅니다.")
+        @app_commands.check(admin_only)
+        async def true_state(interaction: discord.Interaction):
+            if cog.state is None:
+                await interaction.response.send_message(S.ERR_NO_GAME, ephemeral=True)
+                return
+            await interaction.response.send_message(render.true_state_text(cog.state), ephemeral=True)
+
+        @grp.command(name="설정", description="튜너블 값을 즉시 바꿉니다.")
+        @app_commands.describe(키="설정 키", 값="새 값")
+        @app_commands.check(admin_only)
+        async def set_config(interaction: discord.Interaction, 키: str, 값: str):
+            st = cog.state
+            if st is None or not st.config:
+                await interaction.response.send_message(S.ERR_NO_GAME, ephemeral=True)
+                return
+            try:
+                v = cfgmod.coerce(키.strip(), 값)
+            except cfgmod.ConfigError as e:
+                await interaction.response.send_message(str(e), ephemeral=True)
+                return
+            st.config[키.strip()] = v
+            if 키.strip() == "round_timer_sec" and st.status == E.ROUND_OPEN:
+                pass  # 다음 라운드부터 적용; 현재 라운드는 /추적기 연장 으로
+            cog._save()
+            await interaction.response.send_message(f"`{키}` = `{v}`", ephemeral=True)
+
+        @set_config.autocomplete("키")
+        async def key_ac(interaction: discord.Interaction, current: str):
+            keys = [k for k in cfgmod.DEFAULTS if current.lower() in k.lower()]
+            return [app_commands.Choice(name=k, value=k) for k in keys[:25]]
+
+        @grp.command(name="설정보기", description="현재 설정 전체를 봅니다.")
+        @app_commands.check(admin_only)
+        async def show_config(interaction: discord.Interaction):
+            cfg = cog.state.config if cog.state and cog.state.config else cfgmod.DEFAULTS
+            await interaction.response.send_message(render.config_text(cfg), ephemeral=True)
+
+        @grp.command(name="라운드종료", description="타이머를 기다리지 않고 지금 정산합니다.")
+        @app_commands.check(admin_only)
+        async def force_close(interaction: discord.Interaction):
+            if cog.state is None or cog.state.status != E.ROUND_OPEN:
+                await interaction.response.send_message("정산할 라운드가 없습니다.", ephemeral=True)
+                return
+            await interaction.response.send_message("정산합니다.", ephemeral=True)
+            await cog._close_round(timed_out=False)
+
+        @grp.command(name="연장", description="현재 라운드 마감을 연장합니다 (초).")
+        @app_commands.check(admin_only)
+        async def extend(interaction: discord.Interaction, 초: int):
+            st = cog.state
+            if st is None or st.status != E.ROUND_OPEN:
+                await interaction.response.send_message("진행 중인 라운드가 없습니다.", ephemeral=True)
+                return
+            st.deadline_ts = max(st.deadline_ts, time.time()) + 초
+            cog._arm_timer(st.deadline_ts - time.time())
+            cog._save()
+            await cog._refresh_round_message()
+            await interaction.response.send_message(f"마감: <t:{int(st.deadline_ts)}:f>", ephemeral=True)
+
+        @grp.command(name="일시정지", description="타이머를 멈춥니다.")
+        @app_commands.check(admin_only)
+        async def pause(interaction: discord.Interaction):
+            st = cog.state
+            if st is None or st.status != E.ROUND_OPEN:
+                await interaction.response.send_message("일시정지할 라운드가 없습니다.", ephemeral=True)
+                return
+            cog._cancel_timer()
+            st.paused_remaining = max(0.0, st.deadline_ts - time.time())
+            st.status = E.PAUSED
+            cog._save()
+            await interaction.response.send_message(f"일시정지 (남은 시간 {int(st.paused_remaining)}초)", ephemeral=True)
+
+        @grp.command(name="재개", description="일시정지를 해제합니다.")
+        @app_commands.check(admin_only)
+        async def resume(interaction: discord.Interaction):
+            st = cog.state
+            if st is None or st.status != E.PAUSED:
+                await interaction.response.send_message("일시정지 상태가 아닙니다.", ephemeral=True)
+                return
+            st.status = E.ROUND_OPEN
+            st.deadline_ts = time.time() + max(15.0, st.paused_remaining)
+            cog._arm_timer(st.deadline_ts - time.time())
+            cog._save()
+            await cog._refresh_round_message()
+            await interaction.response.send_message("재개", ephemeral=True)
+
+        @grp.command(name="위치", description="헌터 또는 도주자의 위치를 수동으로 바꿉니다.")
+        @app_commands.describe(대상="유저 ID 또는 'fugitive'", 구역="구역 ID")
+        @app_commands.check(admin_only)
+        async def set_pos(interaction: discord.Interaction, 대상: str, 구역: str):
+            st = cog.state
+            if st is None or st.fugitive is None:
+                await interaction.response.send_message(S.ERR_NO_GAME, ephemeral=True)
+                return
+            room = 구역.strip().upper()
+            if room not in st.game_map.rooms:
+                await interaction.response.send_message(S.ERR_UNKNOWN_ROOM.format(room=room), ephemeral=True)
+                return
+            if 대상.strip().lower() == "fugitive":
+                st.fugitive.room = room
+                st.position_history[-1] = room
+            elif 대상.strip() in st.hunters:
+                st.hunters[대상.strip()].room = room
+            else:
+                await interaction.response.send_message("대상을 찾을 수 없습니다.", ephemeral=True)
+                return
+            cog._save()
+            await interaction.response.send_message(f"{대상} → {room}", ephemeral=True)
+
+        @grp.command(name="요약", description="[종료 후] 라운드별 기록을 게시합니다.")
+        @app_commands.describe(채널id="게시할 채널 ID (생략 시 게임 채널)")
+        @app_commands.check(admin_only)
+        async def summary(interaction: discord.Interaction, 채널id: Optional[str] = None):
+            st = cog.state
+            if st is None or not st.log:
+                await interaction.response.send_message("기록이 없습니다.", ephemeral=True)
+                return
+            if st.status != E.CAPTURED:
+                await interaction.response.send_message("게임이 끝난 뒤에만 게시할 수 있습니다.", ephemeral=True)
+                return
+            cid = int(채널id) if 채널id and 채널id.strip().isdigit() else st.channel_id
+            ch = await cog._channel(cid)
+            if ch is None:
+                await interaction.response.send_message("채널을 찾을 수 없습니다.", ephemeral=True)
+                return
+            await interaction.response.defer(ephemeral=True)
+            for chunk in render.summary_chunks(st):
+                await ch.send(chunk)
+            await interaction.followup.send("게시 완료", ephemeral=True)
+
+        @grp.command(name="종료", description="게임을 중단하고 상태를 지웁니다.")
+        @app_commands.describe(확인="'확인' 을 입력해야 실행됩니다")
+        @app_commands.check(admin_only)
+        async def end_game(interaction: discord.Interaction, 확인: str):
+            if 확인.strip() != "확인":
+                await interaction.response.send_message("`확인` 을 입력해야 합니다.", ephemeral=True)
+                return
+            cog._cancel_timer()
+            st = cog.state
+            if st and st.round_message_id and st.status in (E.ROUND_OPEN, E.PAUSED):
+                ch = await cog._channel(st.channel_id)
+                if ch:
+                    try:
+                        msg = await ch.fetch_message(st.round_message_id)  # type: ignore[attr-defined]
+                        await msg.edit(view=None)
+                    except discord.HTTPException:
+                        pass
+            cog.state = None
+            store.save(None)
+            await interaction.response.send_message("종료했습니다.", ephemeral=True)
+
+        return grp
+
+    # ------------------------------------------------------------------ 관제 명령: /도주
+    def _build_fugitive_group(self) -> app_commands.Group:
+        cog = self
+        grp = app_commands.Group(name="도주", description="[관제] 도주자 명령")
+
+        async def admin_only(interaction: discord.Interaction) -> bool:
+            return cog._is_admin(interaction)
+
+        @grp.error
+        async def on_error(interaction: discord.Interaction, error: app_commands.AppCommandError):
+            msg = S.ERR_WRONG_GUILD if isinstance(error, app_commands.CheckFailure) else f"오류: {error}"
+            if not isinstance(error, app_commands.CheckFailure):
+                logger.error("도주 명령 오류: %s", error, exc_info=error)
+            if interaction.response.is_done():
+                await interaction.followup.send(msg, ephemeral=True)
+            else:
+                await interaction.response.send_message(msg, ephemeral=True)
+
+        HACK_CHOICES = [app_commands.Choice(name=S.HACK_KO[h], value=h) for h in ("doorlock", "distract", "blackout", "hide", "overload")]
+
+        async def _submit(interaction: discord.Interaction, move: Optional[str], hack: Optional[str], target: Optional[str]):
+            st = cog.state
+            if st is None or st.fugitive is None:
+                await interaction.response.send_message(S.ERR_NO_GAME, ephemeral=True)
+                return
+            async with cog.lock:
+                try:
+                    order = E.submit_fugitive_order(st, move, hack, target)
+                except E.RuleError as e:
+                    await interaction.response.send_message(f"거부: {e}", ephemeral=True)
+                    return
+                cog._maybe_shorten_deadline()
+                cog._save()
+            desc = f"이동 {order.move or '대기'}" + (f" + {S.HACK_KO[order.hack]} {order.target or ''}" if order.hack else "")
+            await interaction.response.send_message(f"도주자 명령 접수: {desc}\n(마감 전까지 다시 제출하면 덮어씁니다)", ephemeral=True)
+
+        @grp.command(name="이동", description="도주자를 이동시킵니다 (퀵핵 동시 사용 가능).")
+        @app_commands.describe(구역="목적지 구역", 핵="퀵핵", 대상="문 잠금: A1-A2 / 교란: 구역")
+        @app_commands.choices(핵=HACK_CHOICES)
+        @app_commands.check(admin_only)
+        async def f_move(interaction: discord.Interaction, 구역: str, 핵: Optional[app_commands.Choice[str]] = None, 대상: Optional[str] = None):
+            await _submit(interaction, 구역.strip().upper(), 핵.value if 핵 else None, 대상.strip().upper() if 대상 else None)
+
+        @grp.command(name="대기", description="도주자가 제자리에 머뭅니다 (퀵핵 동시 사용 가능).")
+        @app_commands.describe(핵="퀵핵", 대상="문 잠금: A1-A2 / 교란: 구역")
+        @app_commands.choices(핵=HACK_CHOICES)
+        @app_commands.check(admin_only)
+        async def f_stay(interaction: discord.Interaction, 핵: Optional[app_commands.Choice[str]] = None, 대상: Optional[str] = None):
+            await _submit(interaction, None, 핵.value if 핵 else None, 대상.strip().upper() if 대상 else None)
+
+        @grp.command(name="핑", description="즉시 핑: 지금까지 제출된 헌터 명령을 봅니다.")
+        @app_commands.check(admin_only)
+        async def f_ping(interaction: discord.Interaction):
+            st = cog.state
+            if st is None or st.fugitive is None:
+                await interaction.response.send_message(S.ERR_NO_GAME, ephemeral=True)
+                return
+            try:
+                orders = E.cast_ping(st)
+            except E.RuleError as e:
+                await interaction.response.send_message(f"거부: {e}", ephemeral=True)
+                return
+            cog._save()
+            lines = [S.ORDER_LINE.format(name=n, order=render.order_label(o)) for n, o in orders]
+            await interaction.response.send_message("📡 핑 결과 (이후 제출도 관제 채널로 전달)\n" + "\n".join(lines), ephemeral=True)
+
+        @grp.command(name="취소", description="이번 라운드에 제출한 도주자 명령을 취소합니다.")
+        @app_commands.check(admin_only)
+        async def f_cancel(interaction: discord.Interaction):
+            st = cog.state
+            if st is None or st.fugitive is None:
+                await interaction.response.send_message(S.ERR_NO_GAME, ephemeral=True)
+                return
+            st.fugitive.order = None
+            cog._save()
+            await interaction.response.send_message("취소했습니다 (미제출 시 대기).", ephemeral=True)
+
+        return grp
+
+
+async def setup(bot: commands.Bot):
+    await bot.add_cog(FugitiveCog(bot))

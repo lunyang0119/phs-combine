@@ -131,3 +131,21 @@ def calculate_dmw_number(charm_stat: int) -> int:
     bonus = apply_damage_rounding(charm_stat)
     dice_rolls = sum(random_utils.randint(1, 10) for _ in range(4))
     return bonus + dice_rolls
+
+def get_korean_particle(word: str, particle_batchim: str, particle_no_batchim: str) -> str:
+    """한글 단어의 마지막 글자 받침 유무로 조사 선택 (예: '이'/'가', '을'/'를').
+
+    한글이 아닌 글자로 끝나면 particle_no_batchim 을 돌려준다.
+    """
+    if not word:
+        return particle_no_batchim
+    last_char = word[-1]
+    if '가' <= last_char <= '힣':
+        if (ord(last_char) - ord('가')) % 28 == 0:
+            return particle_no_batchim
+        return particle_batchim
+    return particle_no_batchim
+
+
+def ends_with_hangul(word: str) -> bool:
+    return bool(word) and '가' <= word[-1] <= '힣'
