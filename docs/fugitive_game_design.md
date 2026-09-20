@@ -138,7 +138,7 @@ With the 4-hunter defaults (`trace_passive=4`, `scan_trace=5`) a hack-heavy fugi
 6. Per-scan results are DM'd/ephemeral to the scanning hunter **and** echoed in the report (team info).
 
 ### 3.8 Start and end
-- Start (`/추적기 시작`): read config once, build map, place fugitive at `fugitive_start` (default `auto` = most central room), spread hunters over the rooms farthest from it (`hunter_spawn_rooms=auto`), post `Activating Combat Mode`, post the table, open round 1. The fugitive's position is never shown until captured (`reveal_start=false`).
+- Start (`/추적기 시작`): read config once, build map, place fugitive at `fugitive_start` (default `auto` = most central room), spread hunters over the rooms farthest from it (`hunter_spawn_rooms=auto`), post `Activating Combat Mode`, post a short command tutorial (`strings.TUTORIAL`), post the table, open round 1. The fugitive's position is never shown until captured (`reveal_start=false`).
 - End: bot posts exactly `수수께끼의 인영을 {name}{이|가} 잡았다! Conflict Resolved.` and stops. Nothing else is posted in the game channel until `/추적기 요약` is invoked from the control server.
 - Capturer name: Characters-sheet `name` for the hunter's discord_id if registered, else guild display name.
 

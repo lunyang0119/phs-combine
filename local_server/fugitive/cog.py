@@ -368,7 +368,7 @@ class FugitiveCog(commands.Cog):
         name = await self._char_name(interaction.user, interaction.guild)
         st.hunters[uid] = E.Hunter(user_id=uid, name=name, room="", joined_ts=time.time())
         self._save()
-        await interaction.response.send_message(S.OK_JOINED.format(name=name, n=len(st.hunters)))
+        await interaction.response.send_message(S.OK_JOINED.format(name=name, n=len(st.hunters)), ephemeral=True)
         await self._refresh_lobby_message()
 
     async def _refresh_lobby_message(self):
@@ -546,6 +546,7 @@ class FugitiveCog(commands.Cog):
                 await interaction.followup.send("게임 채널을 찾을 수 없습니다.", ephemeral=True)
                 return
             await ch.send(f"**{S.COMBAT_MODE_ON}**\n{S.GAME_START_INTRO}")
+            await ch.send(S.TUTORIAL.format(scan_budget=new.config["scan_budget"]))
             new.table_message_id = 0
             await cog._update_table(ch)
             await cog._open_round(ch)
