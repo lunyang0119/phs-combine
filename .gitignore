@@ -4,3 +4,7 @@
 __pycache__/
 /data/
 .pytest_cache/
+local_server/mogindex
+local_server/.env
+local_server/dogwood-method-448216-f4-4023cd31106c.json
+phs/dogwood-method-448216-f4-4023cd31106c.json
