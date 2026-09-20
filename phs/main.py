@@ -11,9 +11,9 @@ from google_sheets_handler import SheetsHandler
 logging.basicConfig(level=logging.INFO, format='%(asctime)s:%(levelname)s:%(name)s: %(message)s')
 
 load_dotenv()
-DISCORD_TOKEN = os.getenv("MOG_TOKEN")
+DISCORD_TOKEN = os.getenv("PHS_TOKEN")
 GSPREAD_SHEET_NAME = os.getenv("GSPREAD_SHEET_NAME")
-GUILD_ID = os.getenv("MOG_GUILD_ID")
+GUILD_ID = os.getenv("PHS_GUILD_ID")
 
 intents = discord.Intents.default()
 intents.members = True
