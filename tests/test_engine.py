@@ -257,3 +257,20 @@ def test_device_hack_message_names_room_and_candidates():
     msg = str(ei.value)
     assert "광학 재부팅" in msg and "조명" in msg and "A2" in msg and "커피포트" in msg
     assert "A3" in msg and "C2" in msg
+
+
+def test_normalize_map_id_absorbs_typing_noise():
+    n = cfg.normalize_map_id
+    for raw in ("car2077_16", " CAR2077_16 ", "car2077-16", "ｃａｒ２０７７＿１６", "car2077_16​"):
+        assert n(raw) == "car2077_16", raw
+    assert {n(k) for k in cfg.BUILTIN_MAPS} == {"car2077_9", "car2077_12", "car2077_16"}
+
+
+def test_image_renderer_finds_repo_font_even_with_foreign_env_path(monkeypatch):
+    from fugitive import image_render as R
+    monkeypatch.setenv("FUGITIVE_FONT_PATH", "D:/somewhere/else/fontYouandiModernTR.ttf")
+    p = R.font_path()
+    assert p and p.endswith("fontYouandiModernTR.ttf")
+    monkeypatch.setenv("FUGITIVE_FONT_PATH", "")
+    assert R.font_path() is not None          # 루트/패키지에 놓인 글꼴을 자동 인식
+    assert R.unavailable_reason() is None

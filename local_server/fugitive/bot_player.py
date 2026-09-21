@@ -21,9 +21,9 @@ from . import strings as S
 logger = logging.getLogger(__name__)
 
 BOT_PREFIX = "bot:"
-DEFAULT_MODEL = os.getenv("FUGITIVE_GEMINI_MODEL", "gemini-3.8-flash")
+DEFAULT_MODEL = os.getenv("FUGITIVE_GEMINI_MODEL", "gemini-3.7-flash")
 # 기본 모델이 과부하(503)/할당량 초과(429)면 이 순서로 넘어간다
-FALLBACK_MODELS = [m.strip() for m in os.getenv("FUGITIVE_GEMINI_FALLBACK_MODELS", "gemini-2.5-flash,gemini-2.0-flash").split(",") if m.strip()]
+FALLBACK_MODELS = [m.strip() for m in os.getenv("FUGITIVE_GEMINI_FALLBACK_MODELS", "gemini-3.5-flash-lite,gemini-3.8-flash").split(",") if m.strip()]
 RETRY_ATTEMPTS = int(os.getenv("FUGITIVE_GEMINI_RETRIES", "3"))
 RETRY_BASE_SEC = float(os.getenv("FUGITIVE_GEMINI_RETRY_BASE_SEC", "2"))
 ORDER_TYPES = ("move", "search", "scan", "stay")

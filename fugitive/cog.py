@@ -55,6 +55,7 @@ class FugitiveCog(commands.Cog):
         self.timer_task: Optional[asyncio.Task] = None
         self.bot_task: Optional[asyncio.Task] = None
         self.bot_player = bot_player.GeminiPlayer()
+        self.sheet_map_ids: List[str] = []       # 마지막 /추적기 시작 때 시트에서 읽은 맵 ID (자동완성용)
         self.rng = random.Random()
         self.control_guild_id = _env_int("FUGITIVE_CONTROL_GUILD_ID")
         self.admin_ids = {
@@ -138,7 +139,15 @@ class FugitiveCog(commands.Cog):
 
     def _render_mode(self) -> str:
         mode = str(self.state.config.get("render_mode", "text")) if self.state else "text"
-        return "image" if mode == "image" and image_render.available() else "text"
+        if mode != "image":
+            return "text"
+        why = image_render.unavailable_reason()
+        if why is None:
+            return "image"
+        if why != getattr(self, "_render_warned", None):
+            logger.warning("render_mode=image 이지만 텍스트로 대체: %s", why)
+            self._render_warned = why
+        return "text"
 
     async def _update_table(self, channel: discord.abc.Messageable):
         st = self.state
@@ -579,8 +588,15 @@ class FugitiveCog(commands.Cog):
             await cog._refresh_lobby_message()
             await interaction.response.send_message(f"참가자 {len(st.hunters)}명: " + ", ".join(h.name for h in st.hunters.values()), ephemeral=True)
 
+        async def _map_autocomplete(interaction: discord.Interaction, current: str) -> List[app_commands.Choice[str]]:
+            ids = list(cfgmod.BUILTIN_MAPS) + [m for m in cog.sheet_map_ids if m not in cfgmod.BUILTIN_MAPS]
+            cur = cfgmod.normalize_map_id(current)
+            return [app_commands.Choice(name=f"{m} ({len(cfgmod.BUILTIN_MAPS.get(m, {})) or '시트'}칸)", value=m)
+                    for m in ids if cur in m][:25]
+
         @grp.command(name="시작", description="시트를 한 번 읽고 게임을 시작합니다.")
-        @app_commands.describe(시작구역="도주자 시작 구역 (생략 시 자동)", 맵="맵 ID 강제 지정 (선택)")
+        @app_commands.describe(시작구역="도주자 시작 구역 (생략 시 자동)", 맵="맵 ID 강제 지정 (선택, 내장: car2077_9 / car2077_12 / car2077_16)")
+        @app_commands.autocomplete(맵=_map_autocomplete)
         @app_commands.check(admin_only)
         async def start_game(interaction: discord.Interaction, 시작구역: Optional[str] = None, 맵: Optional[str] = None):
             st = cog.state
@@ -600,12 +616,19 @@ class FugitiveCog(commands.Cog):
                 sheet = {"maps": None, "config": None, "scaling": None}
             try:
                 config, map_id = cfgmod.build_config(n, sheet["config"], sheet["scaling"])
-                map_id = (맵 or map_id).strip()
+                if st.config:   # 로비에서 /추적기 설정 으로 미리 넣은 값이 시트/기본값보다 우선
+                    config.update(st.config)
+                    logger.info("추적기 시작: 로비 설정 적용 %s", st.config)
                 maps = dict(cfgmod.BUILTIN_MAPS)
                 if sheet["maps"]:
                     maps.update(sheet["maps"])
-                if map_id not in maps:
-                    raise cfgmod.ConfigError(f"맵 {map_id} 없음 (사용 가능: {', '.join(maps)})")
+                cog.sheet_map_ids = list(sheet["maps"] or {})
+                wanted = cfgmod.normalize_map_id(맵 or map_id)
+                by_norm = {cfgmod.normalize_map_id(k): k for k in maps}
+                if wanted not in by_norm:
+                    raise cfgmod.ConfigError(f"맵 {맵 or map_id!r} 없음 (사용 가능: {', '.join(maps)})")
+                map_id = by_norm[wanted]
+                logger.info("추적기 시작: 맵 %s (입력 %r), 참가 %d명", map_id, 맵, n)
                 gmap = E.GameMap.from_rows(map_id, cfgmod.map_rows(map_id, maps))
                 hunters = [(uid, h.name) for uid, h in st.hunters.items()]
                 new = E.new_game(gmap, config, hunters, fugitive_start=(시작구역 or None), rng=cog.rng)
@@ -626,7 +649,11 @@ class FugitiveCog(commands.Cog):
             await cog._update_table(ch)
             await cog._open_round(ch)
             await cog._control_send(render.true_state_text(new))
-            await interaction.followup.send(f"시작: 맵 {map_id}, 참가 {n}명, 라운드 타이머 {config['round_timer_sec']}초", ephemeral=True)
+            note = ""
+            if str(config.get("render_mode")) == "image":
+                why = image_render.unavailable_reason()
+                note = f"\n⚠ render_mode=image 이지만 텍스트로 대체합니다: {why}" if why else f"\n🖼 이미지 현황판 (글꼴: {image_render.font_path()})"
+            await interaction.followup.send(f"시작: 맵 {map_id}, 참가 {n}명, 라운드 타이머 {config['round_timer_sec']}초{note}", ephemeral=True)
 
         @grp.command(name="상태", description="실제 상태(도주자 위치 포함)를 봅니다.")
         @app_commands.check(admin_only)
@@ -653,9 +680,10 @@ class FugitiveCog(commands.Cog):
         @app_commands.check(admin_only)
         async def set_config(interaction: discord.Interaction, 키: str, 값: str):
             st = cog.state
-            if st is None or not st.config:
+            if st is None or (not st.config and st.status != E.LOBBY):
                 await interaction.response.send_message(S.ERR_NO_GAME, ephemeral=True)
                 return
+            # 로비 단계에서는 st.config 가 '시작 시 적용할 오버라이드' 역할을 한다
             try:
                 v = cfgmod.coerce(키.strip(), 값)
             except cfgmod.ConfigError as e:

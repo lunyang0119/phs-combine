@@ -13,7 +13,6 @@ from . import strings as S
 from .engine import PublicView
 
 _CANDIDATES = [
-    os.getenv("FUGITIVE_FONT_PATH", ""),
     "/usr/share/fonts/truetype/nanum/NanumGothic.ttf",
     "/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc",
     "/usr/share/fonts/truetype/noto/NotoSansCJK-Regular.ttc",
@@ -24,19 +23,51 @@ _CANDIDATES = [
 ]
 
 
+_PKG_DIR = os.path.dirname(os.path.abspath(__file__))
+_ROOT_DIR = os.path.dirname(_PKG_DIR)
+
+
+def _local_fonts() -> List[str]:
+    """저장소 루트 / fugitive 패키지 / 현재 디렉터리에 놓인 글꼴 파일 (서버 경로가 달라도 잡힌다)."""
+    out: List[str] = []
+    for d in (_ROOT_DIR, _PKG_DIR, os.getcwd()):
+        try:
+            for name in sorted(os.listdir(d)):
+                if name.lower().endswith((".ttf", ".otf", ".ttc")):
+                    out.append(os.path.join(d, name))
+        except OSError:
+            pass
+    return out
+
+
 def font_path() -> Optional[str]:
-    for p in _CANDIDATES:
+    env = os.getenv("FUGITIVE_FONT_PATH", "")
+    candidates = [env] if env else []
+    if env and not os.path.exists(env):
+        # 다른 OS 에서 쓰던 절대 경로여도 파일 이름만 같으면 로컬에서 찾아 준다
+        candidates += [os.path.join(d, os.path.basename(env)) for d in (_ROOT_DIR, _PKG_DIR, os.getcwd())]
+    candidates += _local_fonts() + _CANDIDATES
+    for p in candidates:
         if p and os.path.exists(p):
             return p
     return None
 
 
-def available() -> bool:
+def unavailable_reason() -> Optional[str]:
+    """이미지 렌더를 못 쓰는 이유. 쓸 수 있으면 None."""
     try:
         import PIL  # noqa: F401
     except ImportError:
-        return False
-    return font_path() is not None
+        return "Pillow 가 설치되어 있지 않습니다 (pip install Pillow)"
+    if font_path() is None:
+        env = os.getenv("FUGITIVE_FONT_PATH", "")
+        hint = f"FUGITIVE_FONT_PATH={env!r} 도 존재하지 않습니다" if env else "FUGITIVE_FONT_PATH 가 비어 있습니다"
+        return f"한글 글꼴(.ttf/.otf)을 찾지 못했습니다 — {hint}. 저장소 루트나 fugitive/ 에 글꼴 파일을 두면 자동 인식합니다"
+    return None
+
+
+def available() -> bool:
+    return unavailable_reason() is None
 
 
 def render(pv: PublicView) -> Optional[io.BytesIO]:

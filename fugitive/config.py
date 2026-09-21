@@ -126,6 +126,14 @@ BUILTIN_MAPS: Dict[str, Dict[str, tuple]] = {
 }
 
 
+def normalize_map_id(raw: Any) -> str:
+    """입력 오차(대소문자, 공백, '-' 대신 '_', 전각 문자, 보이지 않는 문자)를 흡수한 비교용 키."""
+    import unicodedata
+    s = unicodedata.normalize("NFKC", str(raw or ""))
+    s = "".join(ch for ch in s if ch.isprintable() and not ch.isspace())
+    return s.lower().replace("-", "_")
+
+
 def map_rows(map_id: str, maps: Optional[Dict[str, Dict[str, tuple]]] = None) -> List[Dict[str, Any]]:
     """맵을 시트 행 형식(list of dict)으로 반환."""
     src = (maps or BUILTIN_MAPS)[map_id]
