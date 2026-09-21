@@ -65,6 +65,8 @@ DEFAULTS: Dict[str, Any] = {
     "overload_daze_rounds": 1,
     # 표시
     "render_mode": "text",         # text = 코드 블록 | image = PNG (Pillow + 한글 글꼴 필요)
+    # 이미지 현황판의 승무원 번호 색 (탑승 순서대로, 쉼표 구분 16진수). 부족하면 순환.
+    "hunter_colors": "#00DCBE,#FF5A5A,#FFC857,#7FB3FF,#C792EA,#8BE28B",
     # 배치
     "hunter_spawn_rooms": "auto",
     "fugitive_start": "auto",

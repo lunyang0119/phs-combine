@@ -6,7 +6,7 @@
 
 # 고정 문구 (변경 금지)
 COMBAT_MODE_ON = "Activating Combat Mode"
-CAPTURE_LINE = "수수께끼의 인영을 {name}{particle} 잡았다! Conflict Resolved."
+CAPTURE_LINE = "**수수께끼의 인영을 {name}{particle} 잡았다!**\n**Conflict Resolved.**"
 
 DEVICE_KO = {
     "curtain": "커튼",
@@ -65,6 +65,7 @@ REPORT_STEAM_ROOM = "☕ {room} 에 증기가 가득하다"
 # 상태판
 TABLE_HEADER = "R{round:02d}  추적률 {bar} {pct:>3d}%   신호: {band}"
 TABLE_LEGEND = "c=커튼 k=커피포트 l=조명 s=스피커  ◎ 신호 감지  ⛔ 잠김  ☕ 증기"
+TABLE_LEGEND_CAPTURE = "  ★ 체포 지점"
 TABLE_TITLE = "📡 신호 추적기 — 현황판"
 TABLE_WAITING = "(대기 중)"
 

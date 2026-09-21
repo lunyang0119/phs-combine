@@ -56,6 +56,8 @@ def table_text(pv: PublicView) -> str:
         marks.setdefault(m, []).append("◎")
     for s in pv.steam:
         marks.setdefault(s, []).append("☕")
+    if pv.capture_room:
+        marks.setdefault(pv.capture_room, []).insert(0, "★")
     cell = {k: "".join(v)[:5] for k, v in marks.items()}
     if pv.round_no == 0:
         header = f"R00  추적률 {pv.bar}   0%   {S.TABLE_WAITING}"
@@ -64,7 +66,7 @@ def table_text(pv: PublicView) -> str:
     body = _grid(pv.map_rows, cell)
     locks = ("⛔ " + "  ".join(pv.locks)) if pv.locks else ""
     names = "  ".join(f"{h['tag']} {h['name']}" + ("✓" if h["submitted"] else "") + ("☕" if h.get("dazed") else "") for h in pv.hunters)
-    parts = [header, body, S.TABLE_LEGEND, names]
+    parts = [header, body, S.TABLE_LEGEND + (S.TABLE_LEGEND_CAPTURE if pv.capture_room else ""), names]
     if locks:
         parts.insert(2, locks)
     return f"**{S.TABLE_TITLE}**\n```\n" + "\n".join(parts) + "\n```"

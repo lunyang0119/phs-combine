@@ -274,3 +274,43 @@ def test_image_renderer_finds_repo_font_even_with_foreign_env_path(monkeypatch):
     monkeypatch.setenv("FUGITIVE_FONT_PATH", "")
     assert R.font_path() is not None          # 루트/패키지에 놓인 글꼴을 자동 인식
     assert R.unavailable_reason() is None
+
+
+def test_hunter_colors_from_config_reach_public_view_and_parse():
+    from fugitive import image_render as R
+    st = make(hunters=(("1", "a"), ("2", "b"), ("3", "c")), hunter_colors="#FF0000, 0F0 ,zzz")
+    cols = [h["color"] for h in E.public_view(st).hunters]
+    assert cols == ["#FF0000", "0F0", "zzz"]
+    assert R.parse_color("#FF0000", (0, 0, 0)) == (255, 0, 0)
+    assert R.parse_color("0F0", (0, 0, 0)) == (0, 255, 0)
+    assert R.parse_color("zzz", (1, 2, 3)) == (1, 2, 3)
+    st2 = make(hunter_colors="")
+    assert all(h["color"] == "" for h in E.public_view(st2).hunters)
+    assert R.render(E.public_view(st)) is not None   # 실제로 그려진다
+
+
+def test_hunter_fixed_color_overrides_palette():
+    st = make(hunters=(("1", "a"), ("2", "b")), hunter_colors="#111111,#222222")
+    st.hunters["2"].color = "#ABCDEF"
+    cols = [h["color"] for h in E.public_view(st).hunters]
+    assert cols == ["#111111", "#ABCDEF"]
+    back = E.GameState.from_dict(st.to_dict())
+    assert back.hunters["2"].color == "#ABCDEF"
+
+
+def test_capture_room_only_public_after_capture():
+    from fugitive import render as RD
+    st = make(map_id="car2077_9", start="A2")
+    assert E.public_view(st).capture_room is None
+    assert "★" not in RD.table_text(E.public_view(st))
+    place(st, "1", "A2")
+    E.submit_hunter_order(st, "1", "search")
+    E.submit_fugitive_order(st, None)
+    E.resolve_round(st, random.Random(1))
+    assert st.status == E.CAPTURED
+    pv = E.public_view(st)
+    assert pv.capture_room == "A2"
+    t = RD.table_text(pv)
+    assert "★" in t and "체포 지점" in t
+    from fugitive import image_render as R
+    assert R.render(pv) is not None

@@ -38,8 +38,9 @@ def is_bot(uid: str) -> bool:
     return uid.startswith(BOT_PREFIX)
 
 
-def bot_hunters(n: int) -> List[tuple]:
-    return [(f"{BOT_PREFIX}{i}", f"제미나이-{i}") for i in range(1, n + 1)]
+def bot_hunters(n: int, start: int = 1) -> List[tuple]:
+    """bot:N 헌터 n명. start 는 첫 번호 (이미 있는 봇 뒤에 이어 붙일 때)."""
+    return [(f"{BOT_PREFIX}{i}", f"제미나이-{i}") for i in range(start, start + n)]
 
 
 @dataclass
@@ -200,3 +201,154 @@ def decision_text(name: str, d: Decision) -> str:
     """관제 채널에 게시하는 선택 메시지 (행동 제출 직전에 보낸다)."""
     order = S.ORDER_KO.get(d.order, d.order) + (f" {d.target}" if d.target else "")
     return S.BOT_DECISION.format(name=name, order=order, reason=d.reason)
+
+
+# ---------------------------------------------------------------------------
+# 도주자 AI
+# ---------------------------------------------------------------------------
+FUGITIVE_UID = "fugitive"
+FUGITIVE_NAME = "도주자-AI"
+
+
+@dataclass
+class FugitiveDecision:
+    move: Optional[str]          # None = 대기
+    hack: Optional[str]
+    target: Optional[str]
+    reason: str
+    raw: str = ""
+    error: Optional[str] = None
+
+
+def build_fugitive_prompt(st: E.GameState, past: List[Dict[str, Any]]) -> str:
+    f = st.fugitive
+    gmap = st.game_map
+    c = st.config
+    pv = E.public_view(st)
+    table = render.table_text(pv)
+    names = {u: x.name for u, x in st.hunters.items()}
+    last = render.report_text(st.last_report, names) if st.last_report else "(아직 보고 없음 — 1라운드)"
+    speed = int(c.get("fugitive_speed", 1))
+    reach = sorted(r for r in gmap.rooms if 0 < gmap.distance(f.room, r) <= speed)
+    reach_s = ", ".join(f"{r}({S.DEVICE_KO[gmap.rooms[r].device]})" for r in reach)
+    hunters = "\n".join(
+        f"- {x.name}: {x.room} (거리 {gmap.distance(f.room, x.room)})"
+        + (f" → 제출: {render.order_label(x.order)}" if x.order else " (미제출)")
+        for x in st.hunters.values()
+    )
+    hacks = []
+    for hk in ("doorlock", "distract", "blackout", "hide", "overload"):
+        ok, why = E.hack_available(st, hk)
+        cost, trace = int(c[f"{hk}_cost"]), int(c[f"{hk}_trace"])
+        dev = S.HACK_DEVICE[hk]
+        need = f", {S.DEVICE_KO[dev]} 방에서만" if dev else ""
+        hacks.append(f"- {hk} ({S.HACK_KO[hk]}): RAM {cost}, 추적률 +{trace}{need} — " + ("사용 가능" if ok else f"불가: {why}"))
+    locks = ", ".join(E.lockable_edges(st)) or "없음"
+    history = "\n".join(
+        f"- R{p['round']}: 이동 {p.get('target') or '대기'}"
+        + (f" + {p['order']}" if p.get('order') not in (None, '', 'stay') else "")
+        + f" — {p['reason']}" for p in past[-4:]
+    ) or "(없음)"
+    flags = []
+    if f.hidden_until >= st.round_no:
+        flags.append(f"은신 중 (~R{f.hidden_until})")
+    if f.frozen:
+        flags.append("동결 (이동 불가)")
+    if f.hacks_disabled:
+        flags.append("덱 봉인 (퀵핵 불가)")
+    return f"""당신은 열차에 숨어든 침입자(도주자)입니다. 승무원들에게 잡히지 않고 최대한 오래 버티는 것이 목표입니다.
+승무원이 당신과 같은 구역에서 라운드를 끝내거나(수색 중이면 확실히), 같은 문을 엇갈려 지나면 체포됩니다.
+추적률이 오를수록 승무원의 추적기에 당신의 최근 위치가 정확히 표시됩니다. 퀵핵은 RAM 을 쓰고 추적률을 올리며, 사용한 장치 계열이 승무원에게 알려집니다.
+
+[퀵핵 설명]
+- doorlock: 문 하나를 이번 라운드 동안 잠금 (target = 'A1-A2' 형식). 잠글 수 있는 문: {locks}
+- distract: 지정 구역(target)에 가짜 신호를 띄움
+- blackout: 이번 라운드 승무원 보고를 잡음으로 덮음
+- hide: 이번 라운드 이동 없이 은신 ({c['hide_duration']}라운드), 같은 구역에 있어도 수색이 아니면 안 잡힘
+- overload: 현재 구역에 증기를 채워 들어오는 승무원을 다음 라운드 행동 불가로 만듦
+
+[승무원이 보는 현황판]
+{table}
+
+[지난 라운드 보고 (승무원에게 간 내용)]
+{last}
+
+[당신의 실제 상태]
+- 현재 위치: {f.room} ({S.DEVICE_KO[gmap.rooms[f.room].device]}) {' '.join(flags)}
+- RAM {f.ram}/{c['ram_max']} (라운드마다 +{c['ram_regen']}), 추적률 {f.trace}% (라운드마다 +{c['trace_passive']})
+- 이동 가능 구역 (이동 속도 {speed}): {reach_s or '없음'}
+- 라운드 R{st.round_no} / 최대 {c['max_rounds']}
+
+[퀵핵 가능 여부]
+{chr(10).join(hacks)}
+
+[승무원 위치와 제출 상황]
+{hunters}
+
+[당신의 이전 판단]
+{history}
+
+이번 라운드의 이동(또는 대기)과 퀵핵(선택)을 정하고, 왜 그렇게 판단했는지 한두 문장으로 설명하세요.
+반드시 아래 JSON 형식으로만 답하세요.
+{{"move": "이동할 구역 ID 또는 null(대기)", "hack": "doorlock|distract|blackout|hide|overload 또는 null", "target": "doorlock 이면 'A1-A2', distract 면 구역 ID, 그 외 null", "reason": "판단 이유 (한국어)"}}
+"""
+
+
+def parse_fugitive_decision(text: str) -> FugitiveDecision:
+    raw = (text or "").strip()
+    m = re.search(r"\{.*\}", raw, re.S)
+    if not m:
+        return FugitiveDecision(None, None, None, "응답에서 JSON 을 찾지 못해 대기", raw, "no_json")
+    try:
+        d = json.loads(m.group(0))
+    except json.JSONDecodeError as e:
+        return FugitiveDecision(None, None, None, f"JSON 파싱 실패로 대기 ({e})", raw, "bad_json")
+
+    def _clean(v: Any) -> Optional[str]:
+        return None if v in (None, "", "null", "none") else str(v).strip().upper()
+
+    move = _clean(d.get("move"))
+    if move in ("STAY", "대기"):
+        move = None
+    hack = d.get("hack")
+    hack = None if hack in (None, "", "null", "none") else str(hack).strip().lower()
+    if hack is not None and hack not in E.HACKS:
+        hack = None
+    target = _clean(d.get("target")) if hack in ("doorlock", "distract") else None
+    reason = str(d.get("reason", "")).strip() or "(이유 없음)"
+    return FugitiveDecision(move, hack, target, reason, raw)
+
+
+async def decide_fugitive(player: "GeminiPlayer", st: E.GameState) -> FugitiveDecision:
+    past = [r for r in st.bot_reasons if r["uid"] == FUGITIVE_UID]
+    prompt = build_fugitive_prompt(st, past)
+    try:
+        text = await player.generate_with_retry(prompt, FUGITIVE_UID)
+    except Exception as e:  # noqa: BLE001
+        logger.warning("Gemini 호출 실패 (도주자): %s", e)
+        return FugitiveDecision(None, None, None, f"Gemini 호출 실패로 대기: {str(e)[:200]}", "", "api_error")
+    d = parse_fugitive_decision(text)
+    logger.info("도주자 AI R%d → 이동 %s 핵 %s %s | %s", st.round_no, d.move or "대기", d.hack or "-", d.target or "", d.reason)
+    return d
+
+
+def record_fugitive_reason(st: E.GameState, d: FugitiveDecision, accepted: bool, note: str = "") -> None:
+    st.bot_reasons.append({
+        "round": st.round_no,
+        "uid": FUGITIVE_UID,
+        "name": FUGITIVE_NAME,
+        "order": d.hack or "stay",
+        "target": d.move,
+        "hack_target": d.target,
+        "reason": d.reason,
+        "accepted": accepted,
+        "note": note,
+        "error": d.error,
+    })
+
+
+def fugitive_decision_text(d: FugitiveDecision) -> str:
+    order = f"이동 {d.move}" if d.move else "대기"
+    if d.hack:
+        order += f" + {S.HACK_KO.get(d.hack, d.hack)}" + (f" {d.target}" if d.target else "")
+    return S.BOT_DECISION.format(name=FUGITIVE_NAME, order=order, reason=d.reason)

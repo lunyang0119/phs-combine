@@ -190,6 +190,7 @@ class Hunter:
     order: Optional[HunterOrder] = None
     dazed_until: int = -1            # 이 라운드 번호까지 행동 불가 (포함)
     joined_ts: float = 0.0
+    color: str = ""                  # 고정색 (#RRGGBB). 비어 있으면 hunter_colors 팔레트를 탑승 순서로 사용
 
 
 @dataclass
@@ -237,7 +238,8 @@ class GameState:
     seed: int = 0
     # 디버그 자동 플레이 (bot_player.py)
     debug_bots: bool = False
-    bot_reasons: List[Dict[str, Any]] = field(default_factory=list)   # {round, uid, name, order, target, reason, accepted, note}
+    debug_fugitive_ai: bool = False      # 도주자를 Gemini 가 조종
+    bot_reasons: List[Dict[str, Any]] = field(default_factory=list)   # {round, uid, name, order, target, reason, accepted, note}; 도주자는 uid="fugitive"
 
     # --- 직렬화 -----------------------------------------------------------
     def to_dict(self) -> Dict[str, Any]:
@@ -719,21 +721,24 @@ class PublicView:
     trace: int
     bar: str
     signal: str
-    hunters: List[Dict[str, Any]]           # {name, room, tag, submitted}
+    hunters: List[Dict[str, Any]]           # {name, room, tag, submitted, color}
     locks: List[str]
     markers: List[str]
     steam: List[str]
     map_rows: List[Dict[str, Any]]
     map_id: str
+    capture_room: Optional[str] = None      # 게임이 CAPTURED 로 끝난 뒤에만 채워진다 (그 전에는 항상 None)
 
 
 def public_view(st: GameState) -> PublicView:
     rep = st.last_report or {}
     show_round = rep.get("round", 0)
     hunters = []
+    palette = [c.strip() for c in str(st.config.get("hunter_colors", "")).split(",") if c.strip()]
     for i, (uid, h) in enumerate(st.hunters.items(), start=1):
         hunters.append({"name": h.name, "room": h.room, "tag": str(i),
-                        "submitted": h.order is not None, "dazed": h.dazed_until >= st.round_no})
+                        "submitted": h.order is not None, "dazed": h.dazed_until >= st.round_no,
+                        "color": h.color or (palette[(i - 1) % len(palette)] if palette else "")})
     return PublicView(
         round_no=show_round,
         status=st.status,
@@ -746,4 +751,5 @@ def public_view(st: GameState) -> PublicView:
         steam=list(rep.get("steam", [])),
         map_rows=st.map_rows,
         map_id=st.map_id,
+        capture_room=(st.fugitive.room if st.status == CAPTURED and st.fugitive else None),
     )

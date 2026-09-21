@@ -54,6 +54,7 @@ class FugitiveCog(commands.Cog):
         self.lock = asyncio.Lock()
         self.timer_task: Optional[asyncio.Task] = None
         self.bot_task: Optional[asyncio.Task] = None
+        self.fugitive_task: Optional[asyncio.Task] = None
         self.bot_player = bot_player.GeminiPlayer()
         self.sheet_map_ids: List[str] = []       # 마지막 /추적기 시작 때 시트에서 읽은 맵 ID (자동완성용)
         self.rng = random.Random()
@@ -79,13 +80,15 @@ class FugitiveCog(commands.Cog):
             self._arm_timer(remaining)
             logger.info("추적기 상태 복원: R%s, 남은 시간 %.0fs", self.state.round_no, remaining)
             self._schedule_bot_turn()
+            self._schedule_fugitive_turn()
         elif self.state and self.state.status == E.PAUSED:
             logger.info("추적기 상태 복원: 일시정지 상태")
 
     async def cog_unload(self):
         self._cancel_timer()
-        if self.bot_task and not self.bot_task.done():
-            self.bot_task.cancel()
+        for t in (self.bot_task, self.fugitive_task):
+            if t and not t.done():
+                t.cancel()
         if self.control_guild_id:
             guild = discord.Object(id=self.control_guild_id)
             self.bot.tree.remove_command(self.admin_group.name, guild=guild)
@@ -114,6 +117,29 @@ class FugitiveCog(commands.Cog):
             if member:
                 return member.display_name
         return user.display_name
+
+    def _char_color(self, user_id: str) -> str:
+        """Characters 시트의 color 열 (#RRGGBB). 열이 없거나 비어 있으면 ''."""
+        if self.sheet_handler is None:
+            return ""
+        try:
+            row = self.sheet_handler.get_char_data(str(user_id))
+            if row is None:
+                return ""
+            for key in ("color", "colour", "색상", "색"):
+                v = row.get(key) if hasattr(row, "get") else None
+                if v is not None and str(v).strip() and str(v).strip().lower() != "nan":
+                    return str(v).strip()
+        except Exception as e:  # noqa: BLE001
+            logger.warning("캐릭터 색 조회 실패 (%s): %s", user_id, e)
+        return ""
+
+    def _apply_char_colors(self, st: E.GameState) -> None:
+        for uid, h in st.hunters.items():
+            if not bot_player.is_bot(uid):
+                c = self._char_color(uid)
+                if c:
+                    h.color = c
 
     async def _channel(self, channel_id: int) -> Optional[discord.abc.Messageable]:
         ch = self.bot.get_channel(channel_id)
@@ -218,6 +244,7 @@ class FugitiveCog(commands.Cog):
         self._save()
         self._arm_timer(st.deadline_ts - time.time())
         self._schedule_bot_turn()
+        self._schedule_fugitive_turn()
 
     # ------------------------------------------------------------------ 디버그 자동 헌터
     def _schedule_bot_turn(self):
@@ -276,6 +303,51 @@ class FugitiveCog(commands.Cog):
             if self.state is st and st.status == E.ROUND_OPEN and st.round_no == round_no:
                 self._maybe_shorten_deadline()
                 self._save()
+
+    def _schedule_fugitive_turn(self):
+        """도주자 AI 모드: 라운드가 열리면 Gemini 에게 도주자 명령을 받아 제출한다."""
+        st = self.state
+        if not st or not st.debug_fugitive_ai or st.status != E.ROUND_OPEN or st.fugitive is None:
+            return
+        if st.fugitive.order is not None:
+            return
+        if self.fugitive_task and not self.fugitive_task.done():
+            return
+        self.fugitive_task = asyncio.create_task(self._run_fugitive_turn(st.round_no))
+
+    async def _run_fugitive_turn(self, round_no: int):
+        st = self.state
+        await self._control_send(S.BOT_THINKING.format(name=bot_player.FUGITIVE_NAME, round=round_no))
+        try:
+            d = await bot_player.decide_fugitive(self.bot_player, st)
+        except Exception:  # noqa: BLE001
+            logger.exception("도주자 AI R%d 판단 중 예외", round_no)
+            return
+        await self._control_send(bot_player.fugitive_decision_text(d))
+        note, accepted = "", True
+        async with self.lock:
+            if self.state is not st or st.status != E.ROUND_OPEN or st.round_no != round_no:
+                logger.info("도주자 AI R%d 판단 폐기 (라운드가 이미 넘어감)", round_no)
+                return
+            if st.fugitive.order is not None:      # 관리자가 /도주 로 먼저 제출한 경우 존중
+                logger.info("도주자 AI R%d 판단 폐기 (이미 제출됨)", round_no)
+                return
+            try:
+                E.submit_fugitive_order(st, d.move, d.hack, d.target)
+            except E.RuleError as e:
+                accepted, note = False, str(e)
+                try:                                # 퀵핵만 문제였으면 이동은 살린다
+                    E.submit_fugitive_order(st, d.move, None, None)
+                    note += " → 퀵핵 없이 이동만 제출"
+                except E.RuleError:
+                    E.submit_fugitive_order(st, None, None, None)
+                    note += " → 대기"
+            bot_player.record_fugitive_reason(st, d, accepted, note)
+            self._maybe_shorten_deadline()
+            self._save()
+        if not accepted:
+            await self._control_send(S.BOT_REJECTED.format(name=bot_player.FUGITIVE_NAME, note=note))
+        await self._control_send(render.true_state_text(st))
 
     async def _refresh_round_message(self):
         st = self.state
@@ -528,9 +600,10 @@ class FugitiveCog(commands.Cog):
                 await interaction.response.send_message(msg, ephemeral=True)
 
         @grp.command(name="개설", description="게임 채널을 지정하고 참가 모집을 시작합니다.")
-        @app_commands.describe(채널id="공개 게임 채널 ID", 디버그="Gemini 자동 헌터로 채웁니다 (테스트용)", 인원="디버그 시 자동 헌터 수 (기본 4)")
+        @app_commands.describe(채널id="공개 게임 채널 ID", 디버그="Gemini 자동 헌터로 채웁니다 (테스트용)", 인원="디버그 시 자동 헌터 수 (기본 4)",
+                               도주자ai="도주자를 Gemini 가 조종합니다 (추적자는 사람)")
         @app_commands.check(admin_only)
-        async def open_lobby(interaction: discord.Interaction, 채널id: str, 디버그: bool = False, 인원: int = 4):
+        async def open_lobby(interaction: discord.Interaction, 채널id: str, 디버그: bool = False, 인원: int = 4, 도주자ai: bool = False):
             if cog.state and cog.state.status in (E.ROUND_OPEN, E.PAUSED, E.RESOLVING):
                 await interaction.response.send_message("진행 중인 게임이 있습니다. 먼저 `/추적기 종료` 하세요.", ephemeral=True)
                 return
@@ -539,8 +612,8 @@ class FugitiveCog(commands.Cog):
             except ValueError:
                 await interaction.response.send_message("채널 ID는 숫자여야 합니다.", ephemeral=True)
                 return
-            if 디버그 and not cog.bot_player.available:
-                await interaction.response.send_message("GEMINI_API_KEY 가 설정되어 있지 않아 디버그 자동 플레이를 열 수 없습니다.", ephemeral=True)
+            if (디버그 or 도주자ai) and not cog.bot_player.available:
+                await interaction.response.send_message("GEMINI_API_KEY 가 설정되어 있지 않아 AI 플레이를 열 수 없습니다.", ephemeral=True)
                 return
             if 디버그 and not MIN_HUNTERS <= 인원 <= MAX_HUNTERS:
                 await interaction.response.send_message(f"자동 헌터 수는 {MIN_HUNTERS}~{MAX_HUNTERS}명이어야 합니다.", ephemeral=True)
@@ -551,7 +624,7 @@ class FugitiveCog(commands.Cog):
                 return
             st = E.GameState(status=E.LOBBY, guild_id=ch.guild.id, channel_id=cid,
                              control_guild_id=interaction.guild_id or 0, control_channel_id=interaction.channel_id or 0,
-                             created_ts=time.time(), debug_bots=디버그)
+                             created_ts=time.time(), debug_bots=디버그, debug_fugitive_ai=도주자ai)
             if 디버그:
                 for uid, name in bot_player.bot_hunters(인원):
                     st.hunters[uid] = E.Hunter(user_id=uid, name=name, room="", joined_ts=time.time())
@@ -560,7 +633,39 @@ class FugitiveCog(commands.Cog):
             st.round_message_id = msg.id
             cog._save()
             extra = f" — 디버그: 자동 헌터 {인원}명 탑승, `/추적기 시작` 으로 바로 시작할 수 있습니다" if 디버그 else ""
+            if 도주자ai:
+                extra += " — 도주자 AI: 라운드마다 Gemini 가 도주자 명령을 제출합니다 (`/도주` 로 덮어쓸 수 있음)"
             await interaction.response.send_message(f"참가 모집 시작: <#{cid}>{extra}", ephemeral=True)
+
+        @grp.command(name="ai추가", description="로비의 빈 자리를 Gemini 자동 헌터로 채웁니다 (사람과 함께 플레이).")
+        @app_commands.describe(목표인원="채운 뒤의 총 인원 (생략 시 4). 이미 그 이상이면 아무것도 하지 않습니다")
+        @app_commands.check(admin_only)
+        async def add_ai_hunters(interaction: discord.Interaction, 목표인원: int = 4):
+            st = cog.state
+            if st is None or st.status != E.LOBBY:
+                await interaction.response.send_message("참가 모집 중에만 가능합니다.", ephemeral=True)
+                return
+            if not cog.bot_player.available:
+                await interaction.response.send_message("GEMINI_API_KEY 가 설정되어 있지 않아 AI 헌터를 추가할 수 없습니다.", ephemeral=True)
+                return
+            if not MIN_HUNTERS <= 목표인원 <= MAX_HUNTERS:
+                await interaction.response.send_message(f"목표 인원은 {MIN_HUNTERS}~{MAX_HUNTERS}명이어야 합니다.", ephemeral=True)
+                return
+            need = 목표인원 - len(st.hunters)
+            if need <= 0:
+                await interaction.response.send_message(f"이미 {len(st.hunters)}명이라 추가할 자리가 없습니다.", ephemeral=True)
+                return
+            existing = sum(1 for uid in st.hunters if bot_player.is_bot(uid))
+            added = []
+            for uid, name in bot_player.bot_hunters(need, start=existing + 1):
+                st.hunters[uid] = E.Hunter(user_id=uid, name=name, room="", joined_ts=time.time())
+                added.append(name)
+            st.debug_bots = True          # 라운드마다 봇 명령을 받는 스위치 (이유는 관제 채널에만 게시)
+            cog._save()
+            await cog._refresh_lobby_message()
+            await interaction.response.send_message(
+                f"AI 헌터 {len(added)}명 추가: {', '.join(added)} — 현재 {len(st.hunters)}명. "
+                f"AI 의 판단 이유는 관제 채널에만 올라갑니다.", ephemeral=True)
 
         @grp.command(name="참가자", description="참가자를 수동으로 추가/제거합니다.")
         @app_commands.describe(동작="추가 또는 제거", 유저id="디스코드 사용자 ID", 이름="표시 이름 (추가 시, 생략하면 자동)")
@@ -632,12 +737,16 @@ class FugitiveCog(commands.Cog):
                 gmap = E.GameMap.from_rows(map_id, cfgmod.map_rows(map_id, maps))
                 hunters = [(uid, h.name) for uid, h in st.hunters.items()]
                 new = E.new_game(gmap, config, hunters, fugitive_start=(시작구역 or None), rng=cog.rng)
+                for uid, h in new.hunters.items():
+                    h.color = st.hunters[uid].color
+                cog._apply_char_colors(new)     # 시작 시점의 시트 값이 최종
             except (cfgmod.ConfigError, E.RuleError) as e:
                 await interaction.followup.send(f"시작 실패: {e}", ephemeral=True)
                 return
             new.guild_id, new.channel_id = st.guild_id, st.channel_id
             new.control_guild_id, new.control_channel_id = st.control_guild_id, st.control_channel_id
             new.debug_bots = st.debug_bots
+            new.debug_fugitive_ai = st.debug_fugitive_ai
             cog.state = new
             ch = await cog._channel(new.channel_id)
             if ch is None:
@@ -669,10 +778,11 @@ class FugitiveCog(commands.Cog):
         @app_commands.check(admin_only)
         async def bot_rerun(interaction: discord.Interaction):
             st = cog.state
-            if st is None or not st.debug_bots or st.status != E.ROUND_OPEN:
+            if st is None or not (st.debug_bots or st.debug_fugitive_ai) or st.status != E.ROUND_OPEN:
                 await interaction.response.send_message("자동 플레이 라운드가 열려 있지 않습니다.", ephemeral=True)
                 return
             cog._schedule_bot_turn()
+            cog._schedule_fugitive_turn()
             await interaction.response.send_message("자동 헌터 판단을 요청했습니다.", ephemeral=True)
 
         @grp.command(name="설정", description="튜너블 값을 즉시 바꿉니다.")

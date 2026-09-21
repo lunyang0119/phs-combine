@@ -142,3 +142,110 @@ def test_non_transient_error_is_not_retried():
     player = BP.GeminiPlayer(client=fake, model="m")
     d = asyncio.run(player.decide(_debug_state(1), "bot:1"))
     assert d.error == "api_error" and fake.calls == 1
+
+
+def test_parse_fugitive_decision_variants():
+    d = BP.parse_fugitive_decision('{"move": "b2", "hack": "doorlock", "target": "a1-a2", "reason": "막기"}')
+    assert (d.move, d.hack, d.target) == ("B2", "doorlock", "A1-A2")
+    d = BP.parse_fugitive_decision('{"move": null, "hack": "hide", "target": null, "reason": "숨기"}')
+    assert d.move is None and d.hack == "hide" and d.target is None
+    d = BP.parse_fugitive_decision('{"move": "stay", "hack": "teleport", "reason": "x"}')
+    assert d.move is None and d.hack is None
+    assert BP.parse_fugitive_decision("...").error == "no_json"
+
+
+def test_fugitive_prompt_contains_true_state():
+    st = _debug_state(2)
+    st.debug_fugitive_ai = True
+    p = BP.build_fugitive_prompt(st, [])
+    assert "현재 위치: A2" in p and "RAM" in p and "overload" in p and "잠글 수 있는 문" in p
+
+
+def test_fugitive_ai_turn_submits_and_reports():
+    async def body():
+        ch = FakeChannel()
+        cog = _make_cog(ch)
+        st = _debug_state(2)
+        st.debug_bots = False
+        st.debug_fugitive_ai = True
+        cog.state = st
+        cog.bot_player = BP.GeminiPlayer(client=FakeGemini([
+            {"move": "B2", "hack": "blackout", "target": None, "reason": "조명 방 아님 → 거부될 것"},
+        ]))
+        cog._schedule_fugitive_turn()
+        await asyncio.wait_for(cog.fugitive_task, 5)
+        assert st.fugitive.order is not None and st.fugitive.order.move == "B2" and st.fugitive.order.hack is None
+        row = st.bot_reasons[-1]
+        assert row["uid"] == "fugitive" and not row["accepted"] and "이동만 제출" in row["note"]
+        msgs = cog.control_msgs
+        assert "판단 중" in msgs[0] and "도주자-AI" in msgs[0]
+        assert "이동 B2" in msgs[1] and "광학 재부팅" in msgs[1]
+        assert any("규칙에 맞지 않아" in m for m in msgs)
+        assert "실제 상태" in msgs[-1]
+        cog._cancel_timer()
+
+    asyncio.run(body())
+
+
+def test_fugitive_ai_respects_manual_order():
+    async def body():
+        ch = FakeChannel()
+        cog = _make_cog(ch)
+        st = _debug_state(2)
+        st.debug_bots = False
+        st.debug_fugitive_ai = True
+        cog.state = st
+        E.submit_fugitive_order(st, "A1")           # 관리자가 먼저 제출
+        cog._schedule_fugitive_turn()
+        assert cog.fugitive_task is None            # 이미 제출됐으면 요청하지 않는다
+
+    asyncio.run(body())
+
+
+def test_char_color_read_from_characters_sheet():
+    import pandas as pd
+
+    class FakeSheets:
+        def get_char_data(self, cid):
+            rows = {"10": pd.Series({"name": "철수", "color": "#FF8800"}),
+                    "11": pd.Series({"name": "영희"}),                # 열 없음
+                    "12": pd.Series({"name": "민수", "color": ""})}
+            return rows.get(cid)
+
+    cog = _make_cog(FakeChannel())
+    cog.sheet_handler = FakeSheets()
+    assert cog._char_color("10") == "#FF8800"
+    assert cog._char_color("11") == "" and cog._char_color("12") == "" and cog._char_color("99") == ""
+    st = _debug_state(2)
+    st.hunters["10"] = E.Hunter(user_id="10", name="철수", room="A1")
+    cog._apply_char_colors(st)
+    assert st.hunters["10"].color == "#FF8800" and st.hunters["bot:1"].color == ""
+
+
+def test_bot_hunters_can_continue_numbering():
+    assert BP.bot_hunters(2, start=3) == [("bot:3", "제미나이-3"), ("bot:4", "제미나이-4")]
+    assert BP.bot_hunters(1) == [("bot:1", "제미나이-1")]
+
+
+def test_mixed_lobby_only_bots_get_ai_orders():
+    """사람 + 봇 혼합: 봇 명령만 자동 제출되고 사람 자리는 비어 있어야 한다."""
+    async def body():
+        ch = FakeChannel()
+        cog = _make_cog(ch)
+        c, _ = cfg.build_config(3)
+        st = E.new_game(E.GameMap.builtin("car2077_9"), c, [("100", "사람"), ("bot:1", "제미나이-1"), ("bot:2", "제미나이-2")],
+                        fugitive_start="A2", rng=random.Random(1))
+        st.channel_id, st.round_message_id, st.debug_bots = 1, 10, True
+        cog.state = st
+        cog.bot_player = BP.GeminiPlayer(client=FakeGemini([
+            {"order": "search", "reason": "a"}, {"order": "scan", "reason": "b"},
+        ]))
+        cog._schedule_bot_turn()
+        await asyncio.wait_for(cog.bot_task, 5)
+        assert st.hunters["100"].order is None
+        assert st.hunters["bot:1"].order.type == "search" and st.hunters["bot:2"].order.type == "scan"
+        assert not st.all_hunters_submitted()
+        assert all("판단" in m or "→" in m for m in cog.control_msgs)   # 이유는 관제 채널에만
+        assert not any("이유" in (m or "") or "→" in (m or "") for m in ch.sent)  # 공개 채널에는 없음
+
+    asyncio.run(body())

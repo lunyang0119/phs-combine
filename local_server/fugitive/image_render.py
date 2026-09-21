@@ -70,6 +70,24 @@ def available() -> bool:
     return unavailable_reason() is None
 
 
+def parse_color(s: str, fallback: tuple) -> tuple:
+    """'#RGB' / '#RRGGBB' / 'RRGGBB' → (r, g, b). 이상하면 fallback."""
+    t = str(s or "").strip().lstrip("#")
+    if len(t) == 3:
+        t = "".join(ch * 2 for ch in t)
+    if len(t) != 6:
+        return fallback
+    try:
+        return tuple(int(t[i:i + 2], 16) for i in (0, 2, 4))
+    except ValueError:
+        return fallback
+
+
+def _ink_for(bg_rgb: tuple) -> tuple:
+    r, g, b = bg_rgb
+    return (18, 20, 26) if (0.299 * r + 0.587 * g + 0.114 * b) > 140 else (240, 240, 245)
+
+
 def render(pv: PublicView) -> Optional[io.BytesIO]:
     if not available():
         return None
@@ -82,6 +100,7 @@ def render(pv: PublicView) -> Optional[io.BytesIO]:
     W = cols * cell_w + pad * 2
     H = rows * cell_h + pad * 2 + 70 + 60
     bg, fg, dim, accent, warn = (18, 20, 26), (230, 232, 240), (110, 114, 128), (0, 220, 190), (255, 90, 90)
+    captured_fill, captured_edge = (26, 120, 70), (80, 230, 140)
     img = Image.new("RGB", (W, H), bg)
     d = ImageDraw.Draw(img)
     f_big = ImageFont.truetype(fp, 26)
@@ -98,21 +117,28 @@ def render(pv: PublicView) -> Optional[io.BytesIO]:
     top = pad + 60
     by_room = {r["room"]: r for r in pv.map_rows}
     marks: Dict[str, List[str]] = {}
+    color_of: Dict[str, tuple] = {}
     for h in pv.hunters:
         marks.setdefault(h["room"], []).append(h["tag"])
+        color_of[h["tag"]] = parse_color(h.get("color", ""), accent)
     # 방
     for r in pv.map_rows:
         x = pad + (int(r["col"]) - 1) * cell_w
         y = top + (int(r["row"]) - 1) * cell_h
-        d.rectangle([x + 4, y + 4, x + cell_w - 4, y + cell_h - 4], outline=(70, 74, 90), width=2,
-                    fill=(28, 30, 38) if r["room"] not in pv.steam else (60, 48, 30))
+        is_cap = pv.capture_room == r["room"]
+        d.rectangle([x + 4, y + 4, x + cell_w - 4, y + cell_h - 4],
+                    outline=captured_edge if is_cap else (70, 74, 90), width=3 if is_cap else 2,
+                    fill=captured_fill if is_cap else (28, 30, 38) if r["room"] not in pv.steam else (60, 48, 30))
+        if is_cap:
+            d.text((x + cell_w - 40, y + 8), "★", font=f_big, fill=captured_edge)
         d.text((x + 12, y + 10), r["room"], font=f_mid, fill=fg)
         d.text((x + 12, y + 36), S.DEVICE_KO.get(r["device"], r["device"]), font=f_small, fill=dim)
         tags = marks.get(r["room"], [])
         for i, t in enumerate(tags):
             cx, cy = x + cell_w - 30 - i * 30, y + cell_h - 32
-            d.ellipse([cx - 13, cy - 13, cx + 13, cy + 13], fill=accent)
-            d.text((cx - 6, cy - 11), t, font=f_small, fill=bg)
+            col = color_of.get(t, accent)
+            d.ellipse([cx - 13, cy - 13, cx + 13, cy + 13], fill=col)
+            d.text((cx - 6, cy - 11), t, font=f_small, fill=_ink_for(col))
         if r["room"] in pv.markers:
             d.text((x + cell_w - 40, y + 8), "◎", font=f_big, fill=warn)
         if r["room"] in pv.steam:
@@ -147,9 +173,20 @@ def render(pv: PublicView) -> Optional[io.BytesIO]:
         mx, my = (ax + bx2) // 2, (ay + by2) // 2
         d.rectangle([mx - 14, my - 14, mx + 14, my + 14], fill=warn)
         d.text((mx - 8, my - 12), "X", font=f_mid, fill=bg)
-    legend = "  ".join(f"{h['tag']} {h['name']}" + ("✓" if h["submitted"] else "") for h in pv.hunters)
-    d.text((pad, H - 50), legend, font=f_small, fill=fg)
-    d.text((pad, H - 28), "◎ 신호 감지   X 잠긴 문", font=f_small, fill=dim)
+    # 범례: 번호는 각자 색으로, 이름은 기본색으로
+    lx = pad
+    for h in pv.hunters:
+        col = color_of.get(h["tag"], accent)
+        d.ellipse([lx, H - 50, lx + 18, H - 32], fill=col)
+        d.text((lx + 5, H - 49), h["tag"], font=f_small, fill=_ink_for(col))
+        label = " " + h["name"]
+        d.text((lx + 20, H - 50), label, font=f_small, fill=fg)
+        lx += 20 + int(d.textlength(label, font=f_small))
+        if h["submitted"]:   # 제출 완료 표시: 글꼴에 ✓ 가 없을 수 있어 작은 점으로 그린다
+            d.ellipse([lx + 4, H - 44, lx + 11, H - 37], fill=accent)
+            lx += 14
+        lx += 14
+    d.text((pad, H - 28), "◎ 신호 감지   X 잠긴 문" + ("   ★ 체포 지점" if pv.capture_room else ""), font=f_small, fill=dim)
     buf = io.BytesIO()
     img.save(buf, format="PNG")
     buf.seek(0)
