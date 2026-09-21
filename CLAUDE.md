@@ -9,17 +9,18 @@ python main.py
 ```
 
 There is no `requirements.txt`, linter, or CI. Install dependencies by hand:
-`discord.py` (2.x), `python-dotenv`, `gspread`, `oauth2client`, `pandas`, `numpy`, `pytz`, `google-genai` (only for `summary.py`), and optionally `Pillow` (fugitive image renderer). Python 3.11.
+`discord.py` (2.x), `python-dotenv`, `gspread`, `oauth2client`, `pandas`, `numpy`, `pytz`, `google-genai` (for `summary.py` and the fugitive debug auto-play; needs `httpx` ≥ 0.24 on Python 3.13), and optionally `Pillow` (fugitive image renderer). Python 3.11+.
 
 ```bash
-python -m pytest tests -q                 # engine tests for the fugitive minigame (the only tests)
+python -m pytest tests -q                 # fugitive engine + cog tests (the only tests)
 python -m pytest tests -q -k doorlock     # one test
+PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 python -m pytest tests -q   # if a globally installed pytest plugin breaks collection
 python -m fugitive.sim --all --games 400  # Monte Carlo pacing check, or --hunters 4 --set key=value
 ```
 
 **Environment (`.env`, see `.env.example`)**
 - `PHS_TOKEN` — Discord bot token (required)
-- `GEMINI_API_KEY` — only used by `summary.py`
+- `GEMINI_API_KEY` — used by `summary.py` and by `/추적기 개설 디버그:True` (Gemini auto-hunters); `FUGITIVE_GEMINI_MODEL` overrides the model (default `gemini-3.8-flash`); on 503/429 the bot retries with backoff (`FUGITIVE_GEMINI_RETRIES`, `FUGITIVE_GEMINI_RETRY_BASE_SEC`) then falls back through `FUGITIVE_GEMINI_FALLBACK_MODELS` (default `gemini-2.5-flash,gemini-2.0-flash`)
 - `FUGITIVE_CONTROL_GUILD_ID`, `FUGITIVE_ADMIN_IDS` — control server and admin allowlist for the fugitive minigame; without them its admin commands are not registered
 - `FUGITIVE_FONT_PATH` — optional CJK font for the fugitive PNG renderer
 
@@ -107,6 +108,8 @@ Design and rules: [docs/fugitive_game_design.md](docs/fugitive_game_design.md). 
 - Hidden state lives only in memory and `data/fugitive_state.json` (gitignored). `store.py` writes it atomically after every accepted order.
 - `cog.py` registers public hunter commands globally and the `/추적기` and `/도주` groups only on the control guild, guarded by the `FUGITIVE_ADMIN_IDS` allowlist. `views.py` is a persistent `RoundView` (fixed `custom_id`s) so buttons survive restarts.
 - The capture message is fixed text in `strings.py`; the bot posts nothing after it. All player-facing strings live in `strings.py` and never describe the intruder.
+- `bot_player.py` is the debug auto-play: `/추적기 개설 디버그:True 인원:4` fills the lobby with `bot:N` hunters, and each time a round opens the cog asks Gemini for every bot's order (built only from `PublicView`, the round message and the bot's own position, so the intruder never leaks into the prompt). Bots act one at a time: "판단 중" notice → Gemini call → the chosen order and its reason are posted to the control channel → the order is submitted (a rule-rejected choice becomes 대기 with a follow-up notice). Reasons are also kept in `GameState.bot_reasons` to feed the next prompt. `/추적기 디버그 재요청` re-asks for unsubmitted bots. It is for UI/flow testing only; balance still comes from `fugitive.sim`.
+- The cog's round timer resolves rounds inside its own task, so `_cancel_timer` must never cancel `asyncio.current_task()` (that bug silently swallowed reports and the capture line). `tests/test_cog_timer.py` drives the real timer path with a fake channel.
 
 ## Known Artifacts
 

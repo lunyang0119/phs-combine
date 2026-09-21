@@ -235,6 +235,9 @@ class GameState:
     paused_remaining: float = 0.0
     created_ts: float = 0.0
     seed: int = 0
+    # 디버그 자동 플레이 (bot_player.py)
+    debug_bots: bool = False
+    bot_reasons: List[Dict[str, Any]] = field(default_factory=list)   # {round, uid, name, order, target, reason, accepted, note}
 
     # --- 직렬화 -----------------------------------------------------------
     def to_dict(self) -> Dict[str, Any]:

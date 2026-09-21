@@ -310,8 +310,8 @@ fugitive/
   render.py      public table + round report (code block)
   store.py       JSON snapshot
   views.py       persistent round View, room select
-  cog.py         FugitiveCog: public commands, timer task, restart restore
-  admin.py       control-server commands (same Cog file or split; guild-scoped)
+  cog.py         FugitiveCog: public commands, timer task, restart restore, control-server commands
+  bot_player.py  debug auto-play: Gemini decides each bot hunter's order from public info only; reasons kept in state
   sim.py         Monte Carlo
 tests/test_engine.py
 docs/fugitive_game_design.md   (this file)

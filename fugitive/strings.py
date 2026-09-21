@@ -106,7 +106,11 @@ HELP = (
     "추적기는 매 라운드 신호 강도(가장 가까운 승무원과의 거리), 비정상 접근 시그니처, 신호 감지 표식을 보고합니다.\n"
     "추적률은 라운드마다 오르며, 높아질수록 표식이 정확해집니다."
 )
-SUMMARY_HEADER = "## 📼 추적 기록 요약 (총 {rounds}라운드)"
+# 디버그 자동 헌터 (관제 채널)
+BOT_THINKING = "🤖 **{name}** — R{round} 판단 중…"
+BOT_DECISION = "🤖 **{name}** → **{order}**\n> {reason}"
+BOT_REJECTED = "⚠ {name} 의 선택이 규칙에 맞지 않아 대기로 처리: {note}"
+SUMMARY_HEADER ="## 📼 추적 기록 요약 (총 {rounds}라운드)"
 SUMMARY_ROUND = "**R{round}** 침입자 {froom} | {orders} | {events}"
 SUMMARY_CAPTURE = "체포: {name} ({how}, R{round})"
 CAPTURE_HOW = {"search": "수색", "swap": "문에서 조우", "colocate": "같은 구역"}
