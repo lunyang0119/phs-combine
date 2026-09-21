@@ -1,0 +1,17 @@
+# 봇 런타임 의존성 (README의 설치 안내와 동일)
+discord.py
+python-dotenv
+gspread
+google-auth
+aiohttp
+
+# Kiwi 형태소 분석기 — 색인 배치/백필 전용.
+# 봇 프로세스(main.py)는 절대 import하지 않는다: 상주 메모리 ~470MB로 1GB 서버에서 봇과 공존 불가.
+# mogindex_batch.py(서버 증분 배치)와 mogindex_backfill.py(PC 백필)의 서브프로세스 안에서만 로드된다.
+# 버전 고정 이유: model_type='knlm'이 로드 ~1초 (신형 CoNg 기본값은 ~12초).
+# 20분마다 뜨는 단명 프로세스라 로드 시간이 지배적이다. tokenizer_version 문자열과
+# 색인 결과가 버전에 묶여 있으므로, 올릴 때는 전체 재색인(백필) + tokenizer_version 갱신 필요.
+kiwipiepy==0.21.0
+
+# 개발/테스트 전용 (서버 설치 불필요)
+pytest
