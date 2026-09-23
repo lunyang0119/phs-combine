@@ -121,10 +121,41 @@ def _nine() -> Dict[str, tuple]:
     return out
 
 
+def _grid_map(cols: int, rows: int, blocked: str = "", device_offset: int = 0) -> Dict[str, tuple]:
+    """cols×rows 격자 맵. 상하좌우 인접 방 사이에는 문이 있고, blocked('A1-A2,B3-C3') 로 지정한 문은 막는다.
+
+    장치는 (col + 2·row + offset) mod 4 로 깔아서 인접한 방끼리 항상 다른 장치가 되게 한다
+    (가로 이웃은 1, 세로 이웃은 2 만큼 인덱스가 어긋난다). offset 으로 맵마다 배치를 돌린다.
+    """
+    blocked_set = {tuple(sorted(e.split("-"))) for e in blocked.replace(" ", "").split(",") if e}
+    letters = "ABCDEFGH"
+    out: Dict[str, tuple] = {}
+    for r in range(1, rows + 1):
+        for c in range(1, cols + 1):
+            rid = f"{letters[r - 1]}{c}"
+            nbs = []
+            for dr, dc in ((0, -1), (0, 1), (-1, 0), (1, 0)):
+                rr, cc = r + dr, c + dc
+                if 1 <= rr <= rows and 1 <= cc <= cols:
+                    nid = f"{letters[rr - 1]}{cc}"
+                    if tuple(sorted((rid, nid))) not in blocked_set:
+                        nbs.append(nid)
+            out[rid] = (DEVICES[(c + 2 * r + device_offset) % 4], ",".join(nbs), c, r)
+    return out
+
+
 BUILTIN_MAPS: Dict[str, Dict[str, tuple]] = {
     "car2077_9": _nine(),
     "car2077_12": dict(_V0),
     "car2077_16": _with_row_d(),
+    # 6×3 긴 객차: 위/아래 통로가 가운데 몇 곳에서만 이어진다
+    "car2077_18": _grid_map(6, 3, blocked="A2-B2,A4-B4,A6-B6,B1-C1,B3-C3,B5-C5", device_offset=1),
+    # 5×4: 가운데 세로 통로(3열)가 병목이 되는 두 구획
+    "car2077_20": _grid_map(5, 4, blocked="B2-B3,B3-B4,C2-C3,C3-C4", device_offset=2),
+    # 6×4 미로형: 뱀처럼 꺾이는 통로
+    "car2077_24": _grid_map(6, 4, blocked="A3-A4,B1-B2,B5-B6,C3-C4,D2-D3,D4-D5,A2-B2,B4-C4,C1-D1,C6-D6", device_offset=3),
+    # 5×5 정사각: 중앙 방(C3)이 허브, 모서리 구획은 우회로가 하나뿐
+    "car2077_25": _grid_map(5, 5, blocked="A2-B2,A4-B4,D2-E2,D4-E4,B1-C1,B5-C5,C1-D1,C5-D5", device_offset=0),
 }
 
 

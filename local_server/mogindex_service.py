@@ -738,6 +738,20 @@ class MogIndexService:
         state.page = 0
         return state
 
+    def add_not_terms(self, state: SearchPanelState, raw: str | None) -> SearchPanelState:
+        """제외 키워드를 누적한다 — 결과 안 검색처럼 여러 번 눌러 목록을 계속 좁혀 갈 수 있다.
+
+        모드는 바꾸지 않는다(복귀자 키워드 화면에서 쓰면 그 화면에 그대로 적용). 빈 입력이면 제외 목록을 비운다.
+        """
+        new_parts = split_query_parts(raw)
+        if not new_parts:
+            state.keyword_not = None
+        else:
+            merged = list(dict.fromkeys(split_query_parts(state.keyword_not) + new_parts))
+            state.keyword_not = " ".join(merged)
+        state.page = 0
+        return state
+
     def create_detail_session(self, parent: SearchPanelState, *, persist: bool = True) -> SearchPanelState:
         current = now_kst()
         state = SearchPanelState.from_json(parent.to_json())
@@ -1140,6 +1154,9 @@ class MogIndexService:
                 source_column="d.source_id",
                 source_parent_column="s.parent_channel_id",
             )
+            # '빼고 싶은 키워드': 그 글자를 포함하는 색인어를 목록에서 뺀다 (예: '모그' 는 '모그텔' 도 뺀다).
+            not_parts = split_query_parts(state.keyword_not)
+            exclude_sql = "".join(" AND instr(d.term, ?) = 0" for _ in not_parts)
             rows = conn.execute(
                 f"""
                 SELECT d.term, SUM(d.count) AS total_count
@@ -1148,6 +1165,7 @@ class MogIndexService:
                 WHERE {" AND ".join(term_filters) if term_filters else "1 = 1"}
                   AND LENGTH(d.term) BETWEEN 2 AND 8
                   AND d.term NOT IN ({",".join("?" for _ in INDEX_EXCLUDED_TERMS)})
+                  {exclude_sql}
                   AND NOT EXISTS (
                       SELECT 1 FROM df_stopwords ds
                       WHERE ds.source_id = d.source_id AND ds.term = d.term
@@ -1157,17 +1175,20 @@ class MogIndexService:
                 ORDER BY total_count DESC, d.term
                 LIMIT ?
                 """,
-                tuple(term_params) + tuple(INDEX_EXCLUDED_TERMS) + (limit,),
+                tuple(term_params) + tuple(INDEX_EXCLUDED_TERMS) + tuple(not_parts) + (limit,),
             ).fetchall()
 
         lines = [f"{idx}. {row['term']}({int(row['total_count'])})" for idx, row in enumerate(rows, start=1)]
+        header = [f"기간: {start} .. {today}"]
+        if not_parts:
+            header.append(f"제외: {', '.join(not_parts)}")
         state.last_result_kind = "returnee"
         state.last_result_ids = []
         page = self._slice_lines(
             "복귀자 키워드",
-            [f"기간: {start} .. {today}"] + lines if lines else [],
+            header + lines if lines else [],
             state,
-            "복귀자 키워드로 표시할 색인어가 없습니다.",
+            "복귀자 키워드로 표시할 색인어가 없습니다." + (" 제외 키워드를 비우려면 '빼고 싶은 키워드'를 빈칸으로 제출하세요." if not_parts else ""),
         )
         logger.info(
             "mogindex returnee session=%s user=%s start=%s end=%s scope=%s total=%s page=%s",

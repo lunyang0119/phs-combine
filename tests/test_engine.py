@@ -263,7 +263,7 @@ def test_normalize_map_id_absorbs_typing_noise():
     n = cfg.normalize_map_id
     for raw in ("car2077_16", " CAR2077_16 ", "car2077-16", "ｃａｒ２０７７＿１６", "car2077_16​"):
         assert n(raw) == "car2077_16", raw
-    assert {n(k) for k in cfg.BUILTIN_MAPS} == {"car2077_9", "car2077_12", "car2077_16"}
+    assert {"car2077_9", "car2077_12", "car2077_16"} <= {n(k) for k in cfg.BUILTIN_MAPS}
 
 
 def test_image_renderer_finds_repo_font_even_with_foreign_env_path(monkeypatch):
@@ -314,3 +314,28 @@ def test_capture_room_only_public_after_capture():
     assert "★" in t and "체포 지점" in t
     from fugitive import image_render as R
     assert R.render(pv) is not None
+
+
+def test_builtin_maps_are_distinct_and_large_ones_have_16_plus_rooms():
+    sigs = {}
+    for mid in cfg.BUILTIN_MAPS:
+        m = E.GameMap.builtin(mid)
+        sig = tuple(sorted((r.id, r.device, tuple(sorted(r.neighbors))) for r in m.rooms.values()))
+        assert sig not in sigs, f"{mid} 은 {sigs[sig]} 와 같은 맵"
+        sigs[sig] = mid
+        # 문 구조만 봐도 서로 달라야 한다 (장치 배치만 다른 복사본 금지)
+    door_sigs = {}
+    for mid in cfg.BUILTIN_MAPS:
+        ds = tuple(E.GameMap.builtin(mid).edges())
+        assert ds not in door_sigs, f"{mid} 의 문 구조가 {door_sigs[ds]} 와 같음"
+        door_sigs[ds] = mid
+    big = [mid for mid in cfg.BUILTIN_MAPS if len(E.GameMap.builtin(mid).rooms) >= 16]
+    assert len(big) >= 4
+    for mid in big:
+        m = E.GameMap.builtin(mid)
+        # 모든 장치가 최소 3방씩은 있어야 시그니처/장치 퀵핵이 의미 있다
+        for dev in cfg.DEVICES:
+            assert len(m.rooms_with_device(dev)) >= 3, (mid, dev)
+        # 문이 하나뿐인 막다른 방이 너무 많으면 도주자가 갇힌다
+        dead_ends = [r for r in m.rooms.values() if len(r.neighbors) == 1]
+        assert len(dead_ends) <= len(m.rooms) // 4, (mid, dead_ends)

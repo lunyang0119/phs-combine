@@ -388,19 +388,31 @@ class SourceIdModal(discord.ui.Modal):
 
 class ExcludeKeywordModal(discord.ui.Modal):
     def __init__(self, cog: "MogIndexCommandsCog", state: SearchPanelState):
+        # 복귀자 키워드 화면에서는 '결과 안 검색'처럼 여러 번 눌러 누적으로 뺀다. 키워드 검색에서는 목록을 통째로 바꾼다.
+        returnee = state.mode == "returnee"
         super().__init__(
-            title="빼고 싶은 키워드",
+            title="빼고 싶은 키워드" + (" (복귀자 목록에서 제외)" if returnee else ""),
             custom_id=f"mogsearch:{state.session_id}:exclude_modal",
         )
         self.cog = cog
         self.session_id = state.session_id
-        self.not_terms = discord.ui.TextInput(
-            label="제외할 키워드",
-            placeholder="예: 공지, 시스템, 봇",
-            default=state.keyword_not or "",
-            required=False,
-            max_length=160,
-        )
+        if returnee:
+            current = f" · 현재 제외: {state.keyword_not}" if state.keyword_not else ""
+            self.not_terms = discord.ui.TextInput(
+                label="추가로 뺄 키워드 (누적됩니다)",
+                placeholder=clip("예: 공지, 시스템 — 비워서 제출하면 제외 목록을 비웁니다" + current, 100),
+                default="",
+                required=False,
+                max_length=160,
+            )
+        else:
+            self.not_terms = discord.ui.TextInput(
+                label="제외할 키워드",
+                placeholder="예: 공지, 시스템, 봇",
+                default=state.keyword_not or "",
+                required=False,
+                max_length=160,
+            )
         self.add_item(self.not_terms)
 
     async def on_submit(self, interaction: discord.Interaction) -> None:
@@ -1359,12 +1371,16 @@ class MogIndexCommandsCog(commands.Cog):
             if not await self.defer_panel_update(interaction):
                 return
             state = self.service.load_session(session_id, str(interaction.user.id))
-            self.service.set_keywords(
-                state,
-                all_terms=state.keyword_all,
-                any_terms=state.keyword_any or state.query,
-                not_terms=not_terms,
-            )
+            if state.mode == "returnee":
+                # 복귀자 목록은 모드를 유지한 채 제외어만 누적해 계속 좁힌다
+                self.service.add_not_terms(state, not_terms)
+            else:
+                self.service.set_keywords(
+                    state,
+                    all_terms=state.keyword_all,
+                    any_terms=state.keyword_any or state.query,
+                    not_terms=not_terms,
+                )
             embed, view, _page = self.render_panel(state)
             await self.run_full_index_db_write(self.service.save_session, state)
             await self.safe_edit_original_response(interaction, embed=embed, view=view)
@@ -1975,6 +1991,8 @@ class MogIndexCommandsCog(commands.Cog):
             query_text = " / ".join(query_bits) if query_bits else "없음"
         elif state.mode == "topic":
             query_text = f"`{state.query}`" if state.query else "없음"
+        elif state.mode == "returnee" and state.keyword_not:
+            query_text = f"제외 {state.keyword_not}"
         else:
             query_text = "사용 안 함"
         extra = ""
