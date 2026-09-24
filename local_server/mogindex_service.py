@@ -46,6 +46,13 @@ LOCK_RETRY_DELAYS = (0.0, 0.25, 0.5, 1.0, 2.0)
 # 스레드별로 연결 하나를 유지하고 캐시/mmap 을 키운다. 단위: cache 는 KiB, mmap 은 MiB.
 READ_CACHE_KIB = int(os.getenv("MOGINDEX_READ_CACHE_KIB", "65536"))
 READ_MMAP_MIB = int(os.getenv("MOGINDEX_READ_MMAP_MIB", "256"))
+# 복귀자 키워드: 집계 비용은 기간 길이에 비례한다 (실측: 전 구간 1.3s, 1년 0.37s, 90일 0.03s).
+# 활동 기록이 없거나 아주 오래 비운 사용자는 최근 N일로 제한하고, 집계 결과는 잠시 캐시해
+# 페이지 넘기기·제외어 추가가 재집계 없이 즉시 처리되게 한다.
+RETURNEE_MAX_DAYS = int(os.getenv("MOGINDEX_RETURNEE_MAX_DAYS", "180"))
+RETURNEE_CACHE_TTL_SEC = int(os.getenv("MOGINDEX_RETURNEE_CACHE_TTL_SEC", "600"))
+RETURNEE_FETCH_LIMIT = 500
+RETURNEE_PICK_OPTIONS = 25      # 디스코드 Select 옵션 상한
 STATE_TABLES = ("search_sessions", "full_index_runs", "full_index_days", "full_index_source_days")
 
 Mode = Literal["hub", "keyword", "recap", "topic", "participants", "recent", "returnee"]
@@ -178,6 +185,7 @@ class TextPage:
     page_size: int
     total: int
     empty_message: str = "색인된 결과가 없습니다."
+    options: list[str] = field(default_factory=list)   # 복귀자 키워드: 바로 검색할 수 있는 단어 목록 (Select 용)
 
     @property
     def has_previous(self) -> bool:
@@ -465,6 +473,8 @@ class MogIndexService:
         self._state_schema_ready = False
         self._legacy_state_copied = False
         self._read_local = threading.local()
+        self._returnee_cache: dict[tuple, tuple[float, list[tuple[str, int]]]] = {}
+        self._returnee_cache_lock = threading.Lock()
 
     def index_connect(self) -> sqlite3.Connection:
         return connect(self.index_db_path)
@@ -1227,42 +1237,57 @@ class MogIndexService:
         )
         return page
 
-    def run_returnee_keywords(self, state: SearchPanelState) -> TextPage:
-        worldmap_ids = list(dict.fromkeys(state.worldmap_category_ids))
-        if not worldmap_ids:
-            return TextPage("복귀자 키워드", [], state.page, state.page_size, 0, "월드 맵 카테고리 설정이 없습니다.")
-        limit = min(max(int(state.returnee_limit or 5), 1), 100)
-        today = now_kst().date().isoformat()
-        with self.index_open() as conn:
-            placeholders = ",".join("?" for _ in worldmap_ids)
-            row = conn.execute(
-                f"""
-                SELECT MAX(m.message_date) AS last_seen
-                FROM messages m
-                JOIN sources s ON s.source_id = m.source_id
-                WHERE m.author_id = ? AND s.category_id IN ({placeholders})
-                """,
-                (state.owner_user_id, *worldmap_ids),
-            ).fetchone()
-            last_seen = row["last_seen"] if row else None
-            if last_seen:
-                start = (date.fromisoformat(last_seen) + timedelta(days=1)).isoformat()
-            else:
-                start = RETURNEE_DEFAULT_START_DATE
+    def returnee_period(self, state: SearchPanelState) -> tuple[str, str, bool]:
+        """복귀자 기간 = 월드맵 카테고리에서 마지막으로 활동한 다음 날 .. 오늘.
 
-            filter_state = SearchPanelState.from_json(state.to_json())
-            filter_state.date_preset = "custom"
-            filter_state.start_date = start
-            filter_state.end_date = today
-            term_filters, term_params = make_filter_sql(
-                filter_state,
-                date_column="d.message_date",
-                source_column="d.source_id",
-                source_parent_column="s.parent_channel_id",
-            )
-            # '빼고 싶은 키워드': 그 글자를 포함하는 색인어를 목록에서 뺀다 (예: '모그' 는 '모그텔' 도 뺀다).
-            not_parts = split_query_parts(state.keyword_not)
-            exclude_sql = "".join(" AND instr(d.term, ?) = 0" for _ in not_parts)
+        활동 기록이 없거나 RETURNEE_MAX_DAYS 보다 오래 비웠으면 최근 RETURNEE_MAX_DAYS 일로 자른다.
+        반환: (start, today, capped)
+        """
+        worldmap_ids = list(dict.fromkeys(state.worldmap_category_ids))
+        today_d = now_kst().date()
+        today = today_d.isoformat()
+        last_seen = None
+        if worldmap_ids:
+            with self.index_open() as conn:
+                placeholders = ",".join("?" for _ in worldmap_ids)
+                row = conn.execute(
+                    f"""
+                    SELECT MAX(m.message_date) AS last_seen
+                    FROM messages m
+                    JOIN sources s ON s.source_id = m.source_id
+                    WHERE m.author_id = ? AND s.category_id IN ({placeholders})
+                    """,
+                    (state.owner_user_id, *worldmap_ids),
+                ).fetchone()
+                last_seen = row["last_seen"] if row else None
+        start = (date.fromisoformat(last_seen) + timedelta(days=1)).isoformat() if last_seen else RETURNEE_DEFAULT_START_DATE
+        capped = False
+        if RETURNEE_MAX_DAYS > 0:
+            floor = (today_d - timedelta(days=RETURNEE_MAX_DAYS)).isoformat()
+            if start < floor:
+                start, capped = floor, True
+        return start, today, capped
+
+    def _returnee_terms(self, state: SearchPanelState, start: str, today: str) -> list[tuple[str, int]]:
+        """기간·범위별 상위 색인어 집계. 제외어는 여기서 적용하지 않고(캐시 공유) 호출 쪽에서 거른다."""
+        key = (start, today, state.source_scope, tuple(scope_source_ids(state)), tuple(scope_category_ids(state)),
+               state.origin_category_id, state.origin_parent_channel_id, state.origin_channel_id)
+        now = time.monotonic()
+        with self._returnee_cache_lock:
+            hit = self._returnee_cache.get(key)
+            if hit and now - hit[0] < RETURNEE_CACHE_TTL_SEC:
+                return hit[1]
+        filter_state = SearchPanelState.from_json(state.to_json())
+        filter_state.date_preset = "custom"
+        filter_state.start_date = start
+        filter_state.end_date = today
+        term_filters, term_params = make_filter_sql(
+            filter_state,
+            date_column="d.message_date",
+            source_column="d.source_id",
+            source_parent_column="s.parent_channel_id",
+        )
+        with self.index_open() as conn:
             rows = conn.execute(
                 f"""
                 SELECT d.term, SUM(d.count) AS total_count
@@ -1271,7 +1296,6 @@ class MogIndexService:
                 WHERE {" AND ".join(term_filters) if term_filters else "1 = 1"}
                   AND LENGTH(d.term) BETWEEN 2 AND 8
                   AND d.term NOT IN ({",".join("?" for _ in INDEX_EXCLUDED_TERMS)})
-                  {exclude_sql}
                   AND NOT EXISTS (
                       SELECT 1 FROM df_stopwords ds
                       WHERE ds.source_id = d.source_id AND ds.term = d.term
@@ -1281,11 +1305,29 @@ class MogIndexService:
                 ORDER BY total_count DESC, d.term
                 LIMIT ?
                 """,
-                tuple(term_params) + tuple(INDEX_EXCLUDED_TERMS) + tuple(not_parts) + (limit,),
+                tuple(term_params) + tuple(INDEX_EXCLUDED_TERMS) + (RETURNEE_FETCH_LIMIT,),
             ).fetchall()
+        terms = [(str(row["term"]), int(row["total_count"])) for row in rows]
+        with self._returnee_cache_lock:
+            if len(self._returnee_cache) > 64:
+                self._returnee_cache.clear()
+            self._returnee_cache[key] = (now, terms)
+        return terms
 
-        lines = [f"{idx}. {row['term']}({int(row['total_count'])})" for idx, row in enumerate(rows, start=1)]
-        header = [f"기간: {start} .. {today}"]
+    def run_returnee_keywords(self, state: SearchPanelState) -> TextPage:
+        if not list(dict.fromkeys(state.worldmap_category_ids)):
+            return TextPage("복귀자 키워드", [], state.page, state.page_size, 0, "월드 맵 카테고리 설정이 없습니다.")
+        limit = min(max(int(state.returnee_limit or 5), 1), 100)
+        start, today, capped = self.returnee_period(state)
+        # '빼고 싶은 키워드': 그 글자를 포함하는 색인어를 목록에서 뺀다 (예: '모그' 는 '모그텔' 도 뺀다).
+        not_parts = split_query_parts(state.keyword_not)
+        terms = [
+            (term, count) for term, count in self._returnee_terms(state, start, today)
+            if not any(part in term for part in not_parts)
+        ][:limit]
+
+        lines = [f"{idx}. {term}({count})" for idx, (term, count) in enumerate(terms, start=1)]
+        header = [f"기간: {start} .. {today}" + (f" (최근 {RETURNEE_MAX_DAYS}일로 제한)" if capped else "")]
         if not_parts:
             header.append(f"제외: {', '.join(not_parts)}")
         state.last_result_kind = "returnee"
@@ -1296,6 +1338,7 @@ class MogIndexService:
             state,
             "복귀자 키워드로 표시할 색인어가 없습니다." + (" 제외 키워드를 비우려면 '빼고 싶은 키워드'를 빈칸으로 제출하세요." if not_parts else ""),
         )
+        page.options = [term for term, _ in terms[:RETURNEE_PICK_OPTIONS]]
         logger.info(
             "mogindex returnee session=%s user=%s start=%s end=%s scope=%s total=%s page=%s",
             state.session_id,

@@ -15,3 +15,4 @@ combat/__init__.py
 combat/편집충돌_서버___init__.py
 mogindex/
 combat/__pycache__/
+combat/__pycache__/*.pyc

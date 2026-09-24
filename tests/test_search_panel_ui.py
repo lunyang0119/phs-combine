@@ -73,7 +73,7 @@ def test_panel_rows_are_grouped_by_role_and_share_is_not_green():
     page = svc.ResultPage("키워드 검색", [], 0, 5, 12)
     rows = _buttons(_build(lambda: cmd.SearchPanelView(SimpleNamespace(), st, page)))
     labels = {row: [b.label for b in items] for row, items in rows.items()}
-    assert labels[0] == ["키워드 검색", "환장도서관", "복귀자 키워드", "범위 선택"]
+    assert labels[0] == ["키워드 검색", "둘러보기", "환장도서관", "복귀자 키워드", "범위 선택"]
     assert labels[1] == ["오늘", "7일", "30일", "전체", "기간 입력"]
     assert labels[2][:4] == ["전체 카테고리", "현재 카테고리", "현재 채널", "제외 키워드"] and labels[2][4].startswith("정렬")
     assert labels[3] == ["◀ 이전", "다음 ▶", "결과 안 검색", "내보내기", "공개 공유"]

@@ -598,6 +598,7 @@ class SearchPanelView(discord.ui.View):
         # 켜진 상태는 초록(success)으로만 표시하고, 실행 버튼(공유)은 파랑을 써서 구분한다.
         # 라벨은 모바일에서 잘리지 않게 짧게 유지한다.
         self._add_button("키워드 검색", "keyword", discord.ButtonStyle.primary, row=0, active=state.mode == "keyword")
+        self._add_button("둘러보기", "browse", discord.ButtonStyle.secondary, row=0, active=state.mode == "recent")
         self._add_button("환장도서관", "topic", discord.ButtonStyle.secondary, row=0, active=state.mode == "topic")
         self._add_button("복귀자 키워드", "returnee", discord.ButtonStyle.secondary, row=0, active=state.mode == "returnee")
         self._add_button("범위 선택", "scope_location", discord.ButtonStyle.secondary, row=0, active=state.source_scope in ("selected_categories", "selected_sources"))
@@ -616,12 +617,38 @@ class SearchPanelView(discord.ui.View):
 
         self._add_button("◀ 이전", "prev", discord.ButtonStyle.secondary, row=3, disabled=not (page and page.has_previous))
         self._add_button("다음 ▶", "next", discord.ButtonStyle.secondary, row=3, disabled=not (page and page.has_next))
-        self._add_button("결과 안 검색", "within_results", discord.ButtonStyle.secondary, row=3, disabled=not state.last_result_ids)
-        self._add_button("내보내기", "export_command", discord.ButtonStyle.secondary, row=3, disabled=state.mode == "hub")
-        self._add_button("공개 공유", "share", discord.ButtonStyle.primary, row=3, disabled=state.mode == "hub")
+        pick_options = list(getattr(page, "options", []) or []) if state.mode == "returnee" else []
+        if pick_options:
+            # 복귀자 키워드: 4번째 줄을 '이 단어로 검색' 메뉴에 내주고, 여기서 뜻 없는 버튼(결과 안 검색·내보내기)은 뺀다
+            self._add_button("공개 공유", "share", discord.ButtonStyle.primary, row=3)
+            self._add_button("필터 리셋", "reset_filters", discord.ButtonStyle.secondary, row=3)
+            self._add_button("닫기", "close", discord.ButtonStyle.danger, row=3)
+            self._add_pick_select(pick_options, row=4)
+        else:
+            self._add_button("결과 안 검색", "within_results", discord.ButtonStyle.secondary, row=3, disabled=not state.last_result_ids)
+            self._add_button("내보내기", "export_command", discord.ButtonStyle.secondary, row=3, disabled=state.mode == "hub")
+            self._add_button("공개 공유", "share", discord.ButtonStyle.primary, row=3, disabled=state.mode == "hub")
 
-        self._add_button("필터 리셋", "reset_filters", discord.ButtonStyle.secondary, row=4)
-        self._add_button("닫기", "close", discord.ButtonStyle.danger, row=4)
+            self._add_button("필터 리셋", "reset_filters", discord.ButtonStyle.secondary, row=4)
+            self._add_button("닫기", "close", discord.ButtonStyle.danger, row=4)
+
+    def _add_pick_select(self, terms: list[str], *, row: int) -> None:
+        """복귀자 키워드 목록의 단어를 골라 그 기간의 메시지를 바로 검색한다 (검색어가 없는 사람을 위한 진입로)."""
+        options = [discord.SelectOption(label=term[:100], value=term[:100]) for term in dict.fromkeys(terms)][:25]
+        select = discord.ui.Select(
+            placeholder="이 단어가 나온 메시지 보기 (복귀 기간 안에서 검색)",
+            min_values=1,
+            max_values=1,
+            options=options,
+            custom_id=f"mogsearch:{self.session_id}:returnee_pick",
+            row=row,
+        )
+
+        async def callback(interaction: discord.Interaction) -> None:
+            await self.cog.handle_action(interaction, self.session_id, "returnee_pick", {"term": select.values[0]})
+
+        select.callback = callback
+        self.add_item(select)
 
     def _sort_label(self, sort: str) -> str:
         return {"relevance": "관련", "newest": "최신", "oldest": "오래된"}.get(sort, sort)
@@ -1332,6 +1359,17 @@ class MogIndexCommandsCog(commands.Cog):
         if action == "participants":
             state.mode = "participants"
             state.page = 0
+        elif action == "browse":
+            # 검색어 없이 현재 기간/범위의 메시지를 최신순으로 훑어본다
+            state.mode = "recent"
+            state.page = 0
+        elif action == "returnee_pick":
+            term = str(extra.get("term") or "").strip()
+            if not term:
+                raise ValueError("검색할 단어를 고르지 못했습니다.")
+            start, today, _capped = self.service.returnee_period(state)
+            self.service.set_keywords(state, any_terms=term, not_terms=state.keyword_not)
+            self.service.set_custom_dates(state, start, today)
         elif action == "reset_filters":
             self.service.reset_filters(state)
         elif action.startswith("date_"):
@@ -1381,6 +1419,10 @@ class MogIndexCommandsCog(commands.Cog):
                 return
             state = self.service.load_session(session_id, str(interaction.user.id))
             self.service.set_keywords(state, all_terms=all_terms, any_terms=any_terms, not_terms=not_terms)
+            if not state.keyword_all and not state.keyword_any and not state.keyword_not:
+                # 빈 칸으로 제출 = 둘러보기 (제외어만 있으면 키워드 모드가 그 단어를 뺀 목록을 만든다)
+                state.mode = "recent"
+                state.page = 0
             logger.info(
                 "mogindex keyword modal user=%s session=%s all=%r any=%r not=%r",
                 interaction.user.id,
@@ -1959,6 +2001,7 @@ class MogIndexCommandsCog(commands.Cog):
             return (
                 f"{header}\n\n"
                 "**키워드 검색**을 눌러 검색어를 입력하세요. 다음부터는 `/검색 검색어:단어`로 바로 결과를 볼 수 있습니다.\n"
+                "찾는 단어가 없으면 **둘러보기**로 최근 메시지를 훑거나, **복귀자 키워드**에서 자리를 비운 사이 많이 나온 단어를 골라 보세요.\n"
                 "기간·범위 버튼은 언제든 바꿀 수 있고, 켜진 조건은 초록색으로 표시됩니다.\n"
                 "검색 결과는 본인에게만 보이며, 필요할 때 **공개 공유**로 채널에 올릴 수 있습니다."
             )
