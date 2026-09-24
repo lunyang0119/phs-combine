@@ -42,6 +42,17 @@ SESSION_TTL_MINUTES = 30
 KST = ZoneInfo("Asia/Seoul")
 logger = logging.getLogger(__name__)
 LOCK_RETRY_DELAYS = (0.0, 0.25, 0.5, 1.0, 2.0)
+# 읽기 연결 튜닝. 검색 쿼리마다 연결을 새로 열면 SQLite 페이지 캐시(기본 2MB)가 매번 비워지므로
+# 스레드별로 연결 하나를 유지하고 캐시/mmap 을 키운다. 단위: cache 는 KiB, mmap 은 MiB.
+READ_CACHE_KIB = int(os.getenv("MOGINDEX_READ_CACHE_KIB", "65536"))
+READ_MMAP_MIB = int(os.getenv("MOGINDEX_READ_MMAP_MIB", "256"))
+# 복귀자 키워드: 집계 비용은 기간 길이에 비례한다 (실측: 전 구간 1.3s, 1년 0.37s, 90일 0.03s).
+# 활동 기록이 없거나 아주 오래 비운 사용자는 최근 N일로 제한하고, 집계 결과는 잠시 캐시해
+# 페이지 넘기기·제외어 추가가 재집계 없이 즉시 처리되게 한다.
+RETURNEE_MAX_DAYS = int(os.getenv("MOGINDEX_RETURNEE_MAX_DAYS", "180"))
+RETURNEE_CACHE_TTL_SEC = int(os.getenv("MOGINDEX_RETURNEE_CACHE_TTL_SEC", "600"))
+RETURNEE_FETCH_LIMIT = 500
+RETURNEE_PICK_OPTIONS = 25      # 디스코드 Select 옵션 상한
 STATE_TABLES = ("search_sessions", "full_index_runs", "full_index_days", "full_index_source_days")
 
 Mode = Literal["hub", "keyword", "recap", "topic", "participants", "recent", "returnee"]
@@ -134,6 +145,7 @@ class SearchResult:
     created_at: str
     jump_url: str
     score: int = 0
+    snippet: str = ""          # 본문 미리보기 (마크다운 없음, 한 줄). 페이지에 실린 결과에만 채운다.
 
 
 @dataclass
@@ -173,6 +185,7 @@ class TextPage:
     page_size: int
     total: int
     empty_message: str = "색인된 결과가 없습니다."
+    options: list[str] = field(default_factory=list)   # 복귀자 키워드: 바로 검색할 수 있는 단어 목록 (Select 용)
 
     @property
     def has_previous(self) -> bool:
@@ -369,6 +382,37 @@ def split_query_parts(raw: str | None) -> list[str]:
     return [part for part in re.split(r"[,\s]+", raw.strip()) if part.strip()]
 
 
+SNIPPET_WIDTH = 90
+
+
+def make_snippet(content: str | None, terms: Iterable[str], width: int = SNIPPET_WIDTH) -> str:
+    """본문에서 검색어가 처음 나오는 곳 주변을 한 줄로 잘라 낸다. 검색어가 없으면 앞부분.
+
+    마크다운 처리는 하지 않는다 (표시 쪽에서 이스케이프하고 검색어를 굵게 만든다).
+    """
+    text = re.sub(r"\s+", " ", str(content or "")).strip()
+    if not text:
+        return ""
+    lowered = text.lower()
+    hit = -1
+    for term in terms:
+        term = str(term or "").strip().lower()
+        if not term:
+            continue
+        pos = lowered.find(term)
+        if pos != -1 and (hit == -1 or pos < hit):
+            hit = pos
+    if len(text) <= width:
+        return text
+    if hit == -1:
+        return text[:width].rstrip() + "…"
+    start = max(0, hit - width // 3)
+    end = min(len(text), start + width)
+    start = max(0, end - width)
+    piece = text[start:end].strip()
+    return ("…" if start > 0 else "") + piece + ("…" if end < len(text) else "")
+
+
 def make_filter_sql(
     state: SearchPanelState,
     *,
@@ -428,9 +472,57 @@ class MogIndexService:
         self._index_schema_ready = False
         self._state_schema_ready = False
         self._legacy_state_copied = False
+        self._read_local = threading.local()
+        self._returnee_cache: dict[tuple, tuple[float, list[tuple[str, int]]]] = {}
+        self._returnee_cache_lock = threading.Lock()
 
     def index_connect(self) -> sqlite3.Connection:
         return connect(self.index_db_path)
+
+    @staticmethod
+    def _file_identity(path: Path) -> tuple[int, int] | None:
+        try:
+            st = os.stat(path)
+        except OSError:
+            return None
+        return (st.st_dev, st.st_ino)
+
+    def _read_connection(self) -> sqlite3.Connection:
+        """현재 스레드의 색인 읽기 연결. 없거나 DB 파일이 교체되었으면 새로 연다.
+
+        index_open() 경로는 SELECT 만 실행하므로 query_only 로 잠근다.
+        열린 트랜잭션을 들고 있지 않아 배치의 WAL 체크포인트를 막지 않는다.
+        """
+        identity = self._file_identity(self.index_db_path)
+        conn = getattr(self._read_local, "conn", None)
+        if conn is not None and getattr(self._read_local, "identity", None) == identity:
+            return conn
+        self.close_read_connection()
+        conn = self.index_connect()
+        conn.execute(f"PRAGMA cache_size = -{max(READ_CACHE_KIB, 2048)}")
+        conn.execute(f"PRAGMA mmap_size = {max(READ_MMAP_MIB, 0) * 1024 * 1024}")
+        conn.execute("PRAGMA temp_store = MEMORY")
+        conn.execute("PRAGMA query_only = ON")
+        self._read_local.conn = conn
+        self._read_local.identity = identity
+        logger.info(
+            "mogindex read connection opened thread=%s cache_kib=%s mmap_mib=%s",
+            threading.current_thread().name,
+            READ_CACHE_KIB,
+            READ_MMAP_MIB,
+        )
+        return conn
+
+    def close_read_connection(self) -> None:
+        """현재 스레드가 들고 있는 읽기 연결을 닫는다 (오류 후 재연결, 종료 시)."""
+        conn = getattr(self._read_local, "conn", None)
+        self._read_local.conn = None
+        self._read_local.identity = None
+        if conn is not None:
+            try:
+                conn.close()
+            except sqlite3.Error:
+                pass
 
     def state_connect(self) -> sqlite3.Connection:
         return connect(self.state_db_path)
@@ -527,12 +619,15 @@ class MogIndexService:
 
     @contextmanager
     def index_open(self) -> Iterator[sqlite3.Connection]:
+        """읽기 전용 색인 연결. 스레드별로 재사용해 페이지 캐시를 유지한다. 쓰기는 index_connect() 로."""
         self.ensure_index_schema()
-        conn = self.index_connect()
+        conn = self._read_connection()
         try:
             yield conn
-        finally:
-            conn.close()
+        except sqlite3.Error:
+            # 손상/교체 등 연결 자체가 문제일 수 있으니 버리고 다음 호출에서 새로 연다
+            self.close_read_connection()
+            raise
 
     @contextmanager
     def state_open(self) -> Iterator[sqlite3.Connection]:
@@ -1026,6 +1121,7 @@ class MogIndexService:
         state.last_result_kind = "keyword"
         state.last_result_ids = cached_result_ids(item.message_pk for item in results)
         page = self._slice_results("키워드 검색", results, state)
+        self.attach_snippets(page, positive_query_parts)
         logger.info(
             "mogindex keyword session=%s query=%r scope=%s categories=%s sources=%s date=%s..%s total=%s page=%s",
             state.session_id,
@@ -1047,6 +1143,26 @@ class MogIndexService:
         start = state.page * state.page_size
         end = start + state.page_size
         return ResultPage(title, results[start:end], state.page, state.page_size, total)
+
+    def attach_snippets(self, page: ResultPage, terms: Iterable[str]) -> ResultPage:
+        """페이지에 실린 결과(≤ page_size)에만 본문 미리보기를 붙인다. 원문이 없는 옛 행은 빈 채로 둔다."""
+        if not page.results:
+            return page
+        terms = [t for t in terms if t]
+        pks = [item.message_pk for item in page.results]
+        try:
+            with self.index_open() as conn:
+                rows = conn.execute(
+                    f"SELECT message_pk, content FROM messages WHERE message_pk IN ({','.join('?' for _ in pks)})",
+                    tuple(pks),
+                ).fetchall()
+        except sqlite3.Error:
+            logger.warning("mogindex snippet fetch failed", exc_info=True)
+            return page
+        content_by_pk = {int(row["message_pk"]): row["content"] for row in rows}
+        for item in page.results:
+            item.snippet = make_snippet(content_by_pk.get(item.message_pk), terms)
+        return page
 
     def run_recap(self, state: SearchPanelState) -> TextPage:
         with self.index_open() as conn:
@@ -1306,6 +1422,7 @@ class MogIndexService:
         state.last_result_kind = "recent"
         state.last_result_ids = cached_result_ids(item.message_pk for item in results)
         page = self._slice_results("채널 보기", results, state)
+        self.attach_snippets(page, [])
         page.empty_message = "현재 기간/범위에 표시할 색인 메시지가 없습니다. 기간을 전체로 넓히거나 다른 채널을 선택해보세요."
         logger.info(
             "mogindex recent session=%s scope=%s sources=%s date=%s..%s total=%s page=%s",

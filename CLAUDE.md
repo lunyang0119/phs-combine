@@ -22,9 +22,11 @@ python -m fugitive.sim --all --games 400  # Monte Carlo pacing check, or --hunte
 - `MOG_TOKEN` — Discord bot token (required; `local_server/main.py` reads `TEST_TOKEN` instead)
 - `GSPREAD_SHEET_NAME` — spreadsheet name (defaults to `Discord_Bot`)
 - `MOG_GUILD_ID` — optional. Older builds registered guild-scoped copies of every command here; the current `main.py` no longer copies, it only re-syncs that guild so the stale copies get removed
+- `MOG_SWEEP_GUILD_IDS` — optional. After connecting, `on_ready` also pushes the tree's guild-scoped list to these guilds (`all` = every guild the bot is in, or a comma-separated id list) to clear stale copies. Unset = only the control guild and `MOG_GUILD_ID` are touched; other guilds are listed in the log as skipped
 - `GEMINI_API_KEY` — used by `summary.py` and by `/추적기 개설 디버그:True` (Gemini auto-hunters); `FUGITIVE_GEMINI_MODEL` overrides the model (default `gemini-3.8-flash`); on 503/429 the bot retries with backoff (`FUGITIVE_GEMINI_RETRIES`, `FUGITIVE_GEMINI_RETRY_BASE_SEC`) then falls back through `FUGITIVE_GEMINI_FALLBACK_MODELS` (default `gemini-2.5-flash,gemini-2.0-flash`)
 - `FUGITIVE_CONTROL_GUILD_ID`, `FUGITIVE_ADMIN_IDS` — control server and admin allowlist for the fugitive minigame; without them its admin commands are not registered
 - `FUGITIVE_FONT_PATH` — optional CJK font for the fugitive PNG renderer
+- `MOGINDEX_READ_CACHE_KIB` (default 65536), `MOGINDEX_READ_MMAP_MIB` (default 256) — SQLite page cache / mmap for the search read connection. `MogIndexService.index_open()` keeps one read-only (`query_only`) connection per thread and reopens it if the DB file's inode changes or a query raises; anything that writes to the index DB must use `index_connect()` instead. `mogindex_backfill.py` runs `ANALYZE` before `VACUUM INTO` so the deployed file carries planner stats, and each batch run ends with `PRAGMA optimize`.
 
 **Credential file:** `dogwood-method-448216-f4-4023cd31106c.json` (Google service account) must sit in the repo root; `SheetsHandler.__init__` raises if it is missing. Both it and `.env` are gitignored.
 
@@ -36,7 +38,7 @@ A Final Fantasy VII–themed Discord RPG bot on `discord.py`, with Google Sheets
 
 ### Entry point
 
-[main.py](main.py) defines `BattleManager(commands.Bot)`. `setup_hook` creates one `SheetsHandler`, loads the Cogs in `COGS_TO_LOAD` (`character_commands`, `combat_commands`, `utility_commands`, `shop_commands`, `archive`, `mogindex_commands`, `fugitive.cog`; all but the last live in the repo root, not a `cogs/` folder), then runs `sync_commands()`: a global `tree.sync()` plus `tree.sync(guild=...)` for `FUGITIVE_CONTROL_GUILD_ID` and `MOG_GUILD_ID`. `on_ready` additionally syncs every other guild the bot is in once, so a guild that only has stale copies gets an empty list pushed and the copies disappear. A command that Discord still lists but the tree does not know raises `CommandNotFound`; the custom `CommandTree.on_error` answers the user ephemerally instead of only logging. The owner-only prefix command `!동기화` re-runs the sync without a restart and reports Cogs that failed to load (`bot.failed_cogs`). Never call `copy_global_to` again: it is what left the orphaned guild copies behind.
+[main.py](main.py) defines `BattleManager(commands.Bot)`. `setup_hook` creates one `SheetsHandler`, loads the Cogs in `COGS_TO_LOAD` (`character_commands`, `combat_commands`, `utility_commands`, `shop_commands`, `archive`, `mogindex_commands`, `fugitive.cog`; all but the last live in the repo root, not a `cogs/` folder), then runs `sync_commands()`: a global `tree.sync()` plus `tree.sync(guild=...)` for `FUGITIVE_CONTROL_GUILD_ID` and `MOG_GUILD_ID`. `on_ready` additionally syncs the guilds named by `MOG_SWEEP_GUILD_IDS` once (see Environment), so a guild that only has stale copies gets an empty list pushed and the copies disappear. A command that Discord still lists but the tree does not know raises `CommandNotFound`; the custom `CommandTree.on_error` answers the user ephemerally instead of only logging. The owner-only prefix command `!동기화` re-runs the sync without a restart and reports Cogs that failed to load (`bot.failed_cogs`). Never call `copy_global_to` again: it is what left the orphaned guild copies behind.
 
 `summary.py` (Gemini-backed chat summariser, `SummaryCommandsCog`) is a complete Cog that is **not** in the load list; add it to `cogs_to_load` to enable it.
 
@@ -74,7 +76,7 @@ Each Cog receives `bot` and reads `bot.sheet_handler`. Slash commands are declar
 | [utility_commands.py](utility_commands.py) | Dice, roleplay action rolls, fishing/dance/book mini-games, ServerChannel registration, out-of-combat DMW |
 | [shop_commands.py](shop_commands.py) | Shop items and shop-point currency |
 | [fugitive/cog.py](fugitive/cog.py) | 침입자 추적 hidden-movement minigame (see below) |
-| [mogindex_commands.py](mogindex_commands.py) | 검색 engine: `/검색`, `/고오급검색`, raw-message capture into SQLite and the Kiwi batch/backfill pipeline (see [DEPLOY.md](DEPLOY.md)); helpers in `mogindex_service.py`, `mogindex_debug.py`, `mogindex_discord_debug.py` |
+| [mogindex_commands.py](mogindex_commands.py) | 검색 engine: `/검색 [검색어]` (ephemeral panel, `SearchPanelView` rows = mode / period / scope+refine / paging+share / reset+close; active state is green, action buttons blue), `/고오급검색`, raw-message capture into SQLite and the Kiwi batch/backfill pipeline (see [DEPLOY.md](DEPLOY.md)); helpers in `mogindex_service.py` (`make_snippet` + `attach_snippets` fill `SearchResult.snippet` for the page's rows only), `mogindex_debug.py`, `mogindex_discord_debug.py`. UI tests: `tests/test_search_panel_ui.py` |
 | [archive.py](archive.py) | Dump a channel's chat for a date range to a txt file |
 | [summary.py](summary.py) | Same, plus Gemini summarisation (not loaded by default) |
 

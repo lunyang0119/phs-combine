@@ -214,6 +214,13 @@ def export_clean_copy(conn: sqlite3.Connection, export_path: Path) -> bool:
         return False
     export_path.parent.mkdir(parents=True, exist_ok=True)
     conn.commit()
+    # 통계(sqlite_stat1)를 배포 파일에 실어 보낸다. 없으면 서버의 쿼리 플래너가
+    # term IN (...) / GROUP BY 에서 인덱스를 잘못 고를 수 있다. 큰 DB 에서는 몇 분 걸린다.
+    print("ANALYZE 실행 중 (쿼리 플래너 통계)…", flush=True)
+    started = time.perf_counter()
+    conn.execute("ANALYZE")
+    conn.commit()
+    print(f"ANALYZE 완료: {time.perf_counter() - started:.0f}초")
     conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
     conn.execute("VACUUM INTO ?", (str(export_path),))
     print(f"클린 DB를 내보냈습니다: {export_path}")

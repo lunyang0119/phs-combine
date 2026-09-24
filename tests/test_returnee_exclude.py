@@ -14,7 +14,8 @@ def _service(tmp_path) -> svc.MogIndexService:
 
 def _seed_terms(service: svc.MogIndexService, terms: dict[str, int]) -> None:
     today = date.today().isoformat()
-    with service.index_open() as conn:
+    conn = service.index_connect()          # index_open() 은 읽기 전용이라 쓰기는 index_connect() 로
+    try:
         conn.execute(
             "INSERT INTO sources (source_id, source_kind, guild_id, category_id, parent_channel_id, name) VALUES (?,?,?,?,?,?)",
             ("src1", "channel", "g1", "cat-world", None, "광장"),
@@ -24,6 +25,8 @@ def _seed_terms(service: svc.MogIndexService, terms: dict[str, int]) -> None:
             [("src1", today, term, count) for term, count in terms.items()],
         )
         conn.commit()
+    finally:
+        conn.close()
 
 
 def _state() -> svc.SearchPanelState:

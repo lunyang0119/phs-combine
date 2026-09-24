@@ -149,6 +149,9 @@ def main(argv: list[str] | None = None) -> int:
         set_meta(conn, "last_batch_run", datetime.now(timezone.utc).isoformat())
         set_meta(conn, "tokenizer_version", mogindex_kiwi.TOKENIZER_VERSION)
         conn.commit()
+        # 증분으로 늘어난 만큼만 통계를 손본다 (필요할 때만 ANALYZE 를 돌리는 가벼운 호출).
+        conn.execute("PRAGMA optimize")
+        conn.commit()
         print(f"[mogindex_batch] 처리 완료: {processed}건")
         return 0
 

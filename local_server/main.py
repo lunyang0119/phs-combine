@@ -17,6 +17,10 @@ GSPREAD_SHEET_NAME = os.getenv("GSPREAD_SHEET_NAME") or "Discord_Bot"
 # 예전 버전은 이 길드에 전역 명령의 사본(copy_global_to)을 등록했다. 지금은 사본을 만들지 않고,
 # 시작 시 이 길드의 등록 목록을 트리와 맞춰(=사본 삭제) "목록에는 보이는데 CommandNotFound" 상태를 푼다.
 GUILD_ID = os.getenv("MOG_GUILD_ID")
+# 접속 후 추가로 길드 범위를 맞출 길드. 비우면 위의 명시된 길드(관제 서버, MOG_GUILD_ID)만 건드린다.
+#   MOG_SWEEP_GUILD_IDS=all            → 봇이 들어가 있는 모든 길드 (예전 사본을 전부 청소)
+#   MOG_SWEEP_GUILD_IDS=123,456        → 이 길드들만
+SWEEP_GUILD_IDS = os.getenv("MOG_SWEEP_GUILD_IDS", "").strip()
 
 # 검색 엔진(mogindex)과 침입자 추적(fugitive)은 둘 다 로드한다. 하나라도 빠지면 그 Cog 의 명령어는
 # 디스코드 목록에서 사라지거나(동기화 후) 남아 있어도 CommandNotFound 가 난다.
@@ -114,12 +118,20 @@ class BattleManager(commands.Bot):
         if self._guild_sweep_done:
             return
         self._guild_sweep_done = True
-        # setup_hook 시점에는 길드 목록을 모른다. 봇이 들어가 있는 모든 길드에 대해 길드 범위를 한 번 맞춰
-        # 어느 길드에 남았든 예전 사본을 청소한다 (트리에 길드 명령이 없는 길드는 빈 목록이 올라간다).
+        # setup_hook 시점에는 길드 목록을 모른다. MOG_SWEEP_GUILD_IDS 로 지정한 길드에 대해 길드 범위를 한 번 맞춰
+        # 예전 사본을 청소한다 (트리에 길드 명령이 없는 길드는 빈 목록이 올라간다). 비어 있으면 아무 길드도 건드리지 않는다.
         explicit = set(self._explicit_guild_ids())
-        for guild in self.guilds:
-            if guild.id in explicit:
-                continue
+        if not SWEEP_GUILD_IDS:
+            others = [f"{g.id}({g.name})" for g in self.guilds if g.id not in explicit]
+            if others:
+                logging.info("길드 범위 정리 건너뜀 (MOG_SWEEP_GUILD_IDS 미설정): %s", ", ".join(others))
+            return
+        if SWEEP_GUILD_IDS.lower() == "all":
+            targets = [g for g in self.guilds if g.id not in explicit]
+        else:
+            wanted = {int(x) for x in SWEEP_GUILD_IDS.replace(" ", "").split(",") if x.isdigit()}
+            targets = [g for g in self.guilds if g.id in wanted and g.id not in explicit]
+        for guild in targets:
             try:
                 synced = await self.tree.sync(guild=guild)
                 logging.info("길드 범위 정리 guild=%s(%s) commands=%s", guild.id, guild.name, sorted(c.name for c in synced))

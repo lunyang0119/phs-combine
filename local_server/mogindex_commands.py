@@ -12,7 +12,7 @@ import traceback
 import uuid
 from collections import deque
 from dataclasses import dataclass
-from datetime import date, timedelta
+from datetime import date, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
@@ -52,6 +52,7 @@ from mogindex_service import (
     SourceScope,
     TextPage,
     now_kst,
+    split_query_parts,
 )
 
 
@@ -276,22 +277,22 @@ class KeywordSearchModal(discord.ui.Modal):
         self.cog = cog
         self.session_id = state.session_id
         self.all_terms = discord.ui.TextInput(
-            label="반드시 포함",
-            placeholder="모두 포함해야 하는 단어. 예: 개발실 살려줘",
+            label="반드시 포함 (쉼표나 띄어쓰기로 구분)",
+            placeholder="모두 들어 있어야 하는 단어. 예: 개발실, 살려줘",
             default=state.keyword_all or "",
             required=False,
             max_length=160,
         )
         self.any_terms = discord.ui.TextInput(
-            label="하나라도 포함",
-            placeholder="하나라도 있으면 되는 단어. 예: 커피, 미스트렌드",
+            label="하나라도 포함 (쉼표나 띄어쓰기로 구분)",
+            placeholder="하나라도 들어 있으면 되는 단어. 예: 커피, 미스트렌드",
             default=state.keyword_any or state.query or "",
             required=False,
             max_length=160,
         )
         self.not_terms = discord.ui.TextInput(
-            label="빼고 싶은 키워드",
-            placeholder="제외할 단어. 예: 공지 봇",
+            label="제외 키워드 (쉼표나 띄어쓰기로 구분)",
+            placeholder="이 단어가 있는 메시지는 뺍니다. 예: 공지, 봇",
             default=state.keyword_not or "",
             required=False,
             max_length=160,
@@ -407,8 +408,8 @@ class ExcludeKeywordModal(discord.ui.Modal):
             )
         else:
             self.not_terms = discord.ui.TextInput(
-                label="제외할 키워드",
-                placeholder="예: 공지, 시스템, 봇",
+                label="제외 키워드 (쉼표나 띄어쓰기로 구분)",
+                placeholder="이 단어가 있는 메시지는 뺍니다. 예: 공지, 시스템, 봇",
                 default=state.keyword_not or "",
                 required=False,
                 max_length=160,
@@ -489,6 +490,22 @@ class SourceNameModal(discord.ui.Modal):
         await self.cog.handle_source_name_modal(interaction, self.session_id, self.query.value)
 
 
+def add_back_button(view: discord.ui.View, cog: "MogIndexCommandsCog", session_id: str) -> None:
+    """범위 선택 화면에서 고르지 않고 검색 패널로 돌아가는 버튼."""
+    button = discord.ui.Button(
+        label="◀ 패널로 돌아가기",
+        style=discord.ButtonStyle.secondary,
+        custom_id=f"mogsearch:{session_id}:back",
+        row=1,
+    )
+
+    async def callback(interaction: discord.Interaction) -> None:
+        await cog.handle_action(interaction, session_id, "back", {})
+
+    button.callback = callback
+    view.add_item(button)
+
+
 class CategorySelectView(discord.ui.View):
     def __init__(self, cog: "MogIndexCommandsCog", state: SearchPanelState):
         super().__init__(timeout=30 * 60)
@@ -512,6 +529,7 @@ class CategorySelectView(discord.ui.View):
 
         select.callback = callback
         self.add_item(select)
+        add_back_button(self, cog, state.session_id)
 
 
 class ChannelSelectView(discord.ui.View):
@@ -536,6 +554,7 @@ class ChannelSelectView(discord.ui.View):
 
         select.callback = callback
         self.add_item(select)
+        add_back_button(self, cog, state.session_id)
 
 
 class ThreadSelectView(discord.ui.View):
@@ -562,6 +581,7 @@ class ThreadSelectView(discord.ui.View):
 
         select.callback = callback
         self.add_item(select)
+        add_back_button(self, cog, state.session_id)
 
 
 class SearchPanelView(discord.ui.View):
@@ -574,9 +594,13 @@ class SearchPanelView(discord.ui.View):
         super().__init__(timeout=30 * 60)
         self.cog = cog
         self.session_id = state.session_id
+        # 줄마다 역할 하나: 0 무엇을 / 1 언제 / 2 어디서·다듬기 / 3 결과 넘기기 / 4 패널 관리.
+        # 켜진 상태는 초록(success)으로만 표시하고, 실행 버튼(공유)은 파랑을 써서 구분한다.
+        # 라벨은 모바일에서 잘리지 않게 짧게 유지한다.
         self._add_button("키워드 검색", "keyword", discord.ButtonStyle.primary, row=0, active=state.mode == "keyword")
-        self._add_button("카테고리·채널·스레드", "scope_location", discord.ButtonStyle.primary, row=0, active=state.source_scope in ("selected_categories", "selected_sources"))
         self._add_button("환장도서관", "topic", discord.ButtonStyle.secondary, row=0, active=state.mode == "topic")
+        self._add_button("복귀자 키워드", "returnee", discord.ButtonStyle.secondary, row=0, active=state.mode == "returnee")
+        self._add_button("범위 선택", "scope_location", discord.ButtonStyle.secondary, row=0, active=state.source_scope in ("selected_categories", "selected_sources"))
 
         self._add_button("오늘", "date_today", discord.ButtonStyle.secondary, row=1, active=state.date_preset == "today")
         self._add_button("7일", "date_7d", discord.ButtonStyle.secondary, row=1, active=state.date_preset == "7d")
@@ -587,17 +611,16 @@ class SearchPanelView(discord.ui.View):
         self._add_button("전체 카테고리", "scope_all", discord.ButtonStyle.secondary, row=2, active=state.source_scope == "all_indexed")
         self._add_button("현재 카테고리", "scope_current_category", discord.ButtonStyle.secondary, row=2, active=state.source_scope == "current_category", disabled=not state.origin_category_id)
         self._add_button("현재 채널", "scope_current", discord.ButtonStyle.secondary, row=2, active=state.source_scope == "current_channel")
-        self._add_button("빼고 싶은 키워드", "exclude", discord.ButtonStyle.secondary, row=2, active=bool(state.keyword_not))
-        self._add_button("복귀자 키워드", "returnee", discord.ButtonStyle.secondary, row=2, active=state.mode == "returnee")
+        self._add_button("제외 키워드", "exclude", discord.ButtonStyle.secondary, row=2, active=bool(state.keyword_not))
+        self._add_button(f"정렬: {self._sort_label(state.sort)}", "sort_toggle", discord.ButtonStyle.secondary, row=2, disabled=state.mode in ("hub", "returnee", "topic", "recap", "participants"))
 
+        self._add_button("◀ 이전", "prev", discord.ButtonStyle.secondary, row=3, disabled=not (page and page.has_previous))
+        self._add_button("다음 ▶", "next", discord.ButtonStyle.secondary, row=3, disabled=not (page and page.has_next))
         self._add_button("결과 안 검색", "within_results", discord.ButtonStyle.secondary, row=3, disabled=not state.last_result_ids)
-        self._add_button("이전", "prev", discord.ButtonStyle.secondary, row=3, disabled=not (page and page.has_previous))
-        self._add_button("다음", "next", discord.ButtonStyle.secondary, row=3, disabled=not (page and page.has_next))
-        self._add_button(f"정렬:{self._sort_label(state.sort)}", "sort_toggle", discord.ButtonStyle.secondary, row=3)
-        self._add_button("명령어 내보내기", "export_command", discord.ButtonStyle.secondary, row=3, disabled=state.mode == "hub")
+        self._add_button("내보내기", "export_command", discord.ButtonStyle.secondary, row=3, disabled=state.mode == "hub")
+        self._add_button("공개 공유", "share", discord.ButtonStyle.primary, row=3, disabled=state.mode == "hub")
 
         self._add_button("필터 리셋", "reset_filters", discord.ButtonStyle.secondary, row=4)
-        self._add_button("공개 공유", "share", discord.ButtonStyle.success, row=4, disabled=state.mode == "hub")
         self._add_button("닫기", "close", discord.ButtonStyle.danger, row=4)
 
     def _sort_label(self, sort: str) -> str:
@@ -681,6 +704,7 @@ class MogIndexCommandsCog(commands.Cog):
             self.full_index_task.cancel()
         self.batch_index_loop.cancel()
         self.db_write_queue.close()
+        self.service.close_read_connection()
 
     # ------------------------------------------------------------------
     # 실시간 원문 수집 + 증분 색인 배치
@@ -1047,12 +1071,17 @@ class MogIndexCommandsCog(commands.Cog):
             return list(self.index_categories)
 
     @app_commands.command(name="검색", description="색인된 커뮤 로그를 검색합니다.")
-    async def search_panel(self, interaction: discord.Interaction) -> None:
+    @app_commands.describe(keyword="바로 검색할 단어 (쉼표나 띄어쓰기로 여러 개). 비우면 검색 패널만 엽니다")
+    @app_commands.rename(keyword="검색어")
+    async def search_panel(self, interaction: discord.Interaction, keyword: str | None = None) -> None:
         if not interaction.guild_id:
             await interaction.response.send_message("서버 안에서만 사용할 수 있습니다.", ephemeral=True)
             return
         state = self.service.create_session(interaction, persist=False)
         state.worldmap_category_ids = [category.category_id for category in self.index_categories if category.worldmap]
+        if keyword and keyword.strip():
+            # 패널을 거치지 않고 바로 결과로 들어간다 (기본 기간 30일, 전체 범위)
+            self.service.set_keywords(state, any_terms=keyword)
         await self.run_full_index_db_write(self.service.save_session, state)
         logger.info(
             "mogindex panel opened session=%s user=%s guild=%s channel=%s",
@@ -1248,6 +1277,10 @@ class MogIndexCommandsCog(commands.Cog):
             if action == "close":
                 await self.run_full_index_db_write(self.service.close_session, state)
                 await self.safe_edit_original_response(interaction, content="검색 패널을 닫았습니다.", embed=None, view=None)
+                return
+            if action == "back":
+                embed, view, _page = self.render_panel(state)
+                await self.safe_edit_original_response(interaction, embed=embed, view=view)
                 return
             if action == "scope_location":
                 embed = discord.Embed(title="카테고리·채널·스레드 검색", color=discord.Color.dark_teal())
@@ -1925,11 +1958,15 @@ class MogIndexCommandsCog(commands.Cog):
         if page is None:
             return (
                 f"{header}\n\n"
-                "원하는 기능을 골라주세요.\n"
-                "검색 결과는 기본적으로 본인에게만 보이며, 필요할 때 공개로 공유할 수 있습니다."
+                "**키워드 검색**을 눌러 검색어를 입력하세요. 다음부터는 `/검색 검색어:단어`로 바로 결과를 볼 수 있습니다.\n"
+                "기간·범위 버튼은 언제든 바꿀 수 있고, 켜진 조건은 초록색으로 표시됩니다.\n"
+                "검색 결과는 본인에게만 보이며, 필요할 때 **공개 공유**로 채널에 올릴 수 있습니다."
             )
         if isinstance(page, ResultPage):
-            lines = self.format_search_results(page)
+            highlight = split_query_parts(state.keyword_all) + split_query_parts(state.keyword_any)
+            if not highlight and state.query:
+                highlight = [state.query]
+            lines = self.format_search_results(page, highlight)
         else:
             lines = page.lines
         note = ""
@@ -1940,17 +1977,27 @@ class MogIndexCommandsCog(commands.Cog):
         body = "\n".join(lines)
         return clip(f"{header}{note}\n\n{body}", 3900)
 
-    def format_search_results(self, page: ResultPage) -> list[str]:
+    def format_search_results(self, page: ResultPage, highlight_terms: list[str] | None = None) -> list[str]:
         start = page.page * page.page_size
         lines: list[str] = []
         for offset, result in enumerate(page.results, start=1):
             idx = start + offset
             source = clip(result.source_name, 80)
             author = clip(result.author_name, 40)
-            lines.append(
-                f"{idx}. [{result.message_date}] {source} / {author}\n{result.jump_url}"
-            )
+            line = f"{idx}. [{result.message_date}] {source} / {author}"
+            if result.snippet:
+                line += "\n> " + self.format_snippet(result.snippet, highlight_terms or [])
+            lines.append(line + f"\n{result.jump_url}")
         return lines
+
+    @staticmethod
+    def format_snippet(snippet: str, terms: list[str]) -> str:
+        """미리보기를 마크다운 이스케이프하고 검색어를 굵게. 한 줄 유지."""
+        text = discord.utils.escape_markdown(snippet.replace("\n", " "))
+        for term in sorted({t for t in terms if t}, key=len, reverse=True):
+            escaped = discord.utils.escape_markdown(term)
+            text = re.sub(re.escape(escaped), lambda m: f"**{m.group(0)}**", text, flags=re.IGNORECASE)
+        return text
 
     def make_filter_summary(self, state: SearchPanelState) -> str:
         start_date, end_date = self.service_date_bounds(state)
@@ -1965,7 +2012,8 @@ class MogIndexCommandsCog(commands.Cog):
 
         scope_text = {
             "all_indexed": "전체 색인",
-            "current_channel": "현재 채널",
+            # 스레드에서 열었으면 상위 채널과 그 스레드 전부를 뒤진다 (scope_source_ids 참고)
+            "current_channel": "현재 채널(스레드 포함)" if state.origin_parent_channel_id else "현재 채널",
             "current_category": "현재 카테고리",
             "selected_categories": "선택한 카테고리",
             "selected_sources": "선택한 채널/스레드",
@@ -2008,12 +2056,18 @@ class MogIndexCommandsCog(commands.Cog):
         return date_bounds(state)
 
     def make_footer(self, state: SearchPanelState, page: ResultPage | TextPage | None) -> str:
+        expiry = ""
+        try:
+            if state.expires_at:
+                expiry = " · 패널은 " + datetime.fromisoformat(state.expires_at).strftime("%H:%M") + "까지"
+        except ValueError:
+            expiry = ""
         if page is None:
-            return "기본 기간은 최근 30일입니다."
+            return "기본 기간은 최근 30일입니다" + expiry
         if page.total == 0:
-            return "0 results"
+            return "결과 0건" + expiry
         page_count = (page.total - 1) // page.page_size + 1
-        return f"{page.page + 1}/{page_count} page, {page.total} results"
+        return f"{page_count}쪽 중 {page.page + 1}쪽 · {page.total}건" + expiry
 
     @app_commands.command(name="전체색인", description="[관리자] 전체색인 상태를 확인하거나 천천히 이어서 실행합니다.")
     @app_commands.default_permissions(manage_roles=True)
