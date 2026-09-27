@@ -20,6 +20,7 @@ import discord
 from discord import app_commands
 from discord.ext import commands, tasks
 
+import help_option
 from mogindex_debug import (
     FULL_INDEX_DISCORD_RETRY_ATTEMPTS,
     FULL_INDEX_DISCORD_RETRY_SECONDS,
@@ -57,6 +58,7 @@ from mogindex_service import (
 
 
 logger = logging.getLogger(__name__)
+RETURNEE_PICK_MORE = "__more__"   # 복귀자 단어 선택 메뉴의 '여기 없음' 옵션 값 (색인어는 2~8글자라 겹치지 않는다)
 
 
 def env_bool(name: str, default: bool) -> bool:
@@ -623,7 +625,7 @@ class SearchPanelView(discord.ui.View):
             self._add_button("공개 공유", "share", discord.ButtonStyle.primary, row=3)
             self._add_button("필터 리셋", "reset_filters", discord.ButtonStyle.secondary, row=3)
             self._add_button("닫기", "close", discord.ButtonStyle.danger, row=3)
-            self._add_pick_select(pick_options, row=4)
+            self._add_pick_select(pick_options, getattr(page, "pick_more", None), row=4)
         else:
             self._add_button("결과 안 검색", "within_results", discord.ButtonStyle.secondary, row=3, disabled=not state.last_result_ids)
             self._add_button("내보내기", "export_command", discord.ButtonStyle.secondary, row=3, disabled=state.mode == "hub")
@@ -632,9 +634,14 @@ class SearchPanelView(discord.ui.View):
             self._add_button("필터 리셋", "reset_filters", discord.ButtonStyle.secondary, row=4)
             self._add_button("닫기", "close", discord.ButtonStyle.danger, row=4)
 
-    def _add_pick_select(self, terms: list[str], *, row: int) -> None:
-        """복귀자 키워드 목록의 단어를 골라 그 기간의 메시지를 바로 검색한다 (검색어가 없는 사람을 위한 진입로)."""
-        options = [discord.SelectOption(label=term[:100], value=term[:100]) for term in dict.fromkeys(terms)][:25]
+    def _add_pick_select(self, terms: list[str], more_label: str | None, *, row: int) -> None:
+        """복귀자 키워드 목록의 단어를 골라 그 기간의 메시지를 바로 검색한다 (검색어가 없는 사람을 위한 진입로).
+
+        단어가 25개를 넘으면 서비스가 24개씩 잘라 주고, 마지막 칸(more_label)은 다음 묶음으로 넘어가는 '여기 없음' 이 된다.
+        """
+        options = [discord.SelectOption(label=term[:100], value=term[:100]) for term in dict.fromkeys(terms)][:24 if more_label else 25]
+        if more_label:
+            options.append(discord.SelectOption(label=more_label[:100], value=RETURNEE_PICK_MORE, emoji="🔽"))
         select = discord.ui.Select(
             placeholder="이 단어가 나온 메시지 보기 (복귀 기간 안에서 검색)",
             min_values=1,
@@ -645,7 +652,11 @@ class SearchPanelView(discord.ui.View):
         )
 
         async def callback(interaction: discord.Interaction) -> None:
-            await self.cog.handle_action(interaction, self.session_id, "returnee_pick", {"term": select.values[0]})
+            picked = select.values[0]
+            if picked == RETURNEE_PICK_MORE:
+                await self.cog.handle_action(interaction, self.session_id, "returnee_pick_more", {})
+            else:
+                await self.cog.handle_action(interaction, self.session_id, "returnee_pick", {"term": picked})
 
         select.callback = callback
         self.add_item(select)
@@ -1098,9 +1109,11 @@ class MogIndexCommandsCog(commands.Cog):
             return list(self.index_categories)
 
     @app_commands.command(name="검색", description="색인된 커뮤 로그를 검색합니다.")
-    @app_commands.describe(keyword="바로 검색할 단어 (쉼표나 띄어쓰기로 여러 개). 비우면 검색 패널만 엽니다")
+    @app_commands.describe(keyword="바로 검색할 단어 (쉼표나 띄어쓰기로 여러 개). 비우면 검색 패널만 엽니다", 도움말=help_option.HELP_OPTION_DESC)
     @app_commands.rename(keyword="검색어")
-    async def search_panel(self, interaction: discord.Interaction, keyword: str | None = None) -> None:
+    async def search_panel(self, interaction: discord.Interaction, keyword: str | None = None, 도움말: bool = False) -> None:
+        if await help_option.maybe_help(interaction, 도움말):
+            return
         if not interaction.guild_id:
             await interaction.response.send_message("서버 안에서만 사용할 수 있습니다.", ephemeral=True)
             return
@@ -1133,6 +1146,7 @@ class MogIndexCommandsCog(commands.Cog):
         sort="정렬 방식",
         result_set="검색 결과 안 검색 세션 ID",
         public="결과를 공개 메시지로 표시할지 여부",
+        도움말=help_option.HELP_OPTION_DESC,
     )
     @app_commands.rename(
         keyword="키워드",
@@ -1174,7 +1188,10 @@ class MogIndexCommandsCog(commands.Cog):
         sort: app_commands.Choice[str] | None = None,
         result_set: str | None = None,
         public: bool = False,
+        도움말: bool = False,
     ) -> None:
+        if await help_option.maybe_help(interaction, 도움말):
+            return
         if not interaction.guild_id:
             await interaction.response.send_message("서버 안에서만 사용할 수 있습니다.", ephemeral=True)
             return
@@ -1363,11 +1380,17 @@ class MogIndexCommandsCog(commands.Cog):
             # 검색어 없이 현재 기간/범위의 메시지를 최신순으로 훑어본다
             state.mode = "recent"
             state.page = 0
+        elif action == "returnee_pick_more":
+            # 선택 메뉴의 '여기 없음': 다음 24개 묶음으로 넘어간다 (끝이면 run_returnee_keywords 가 처음으로 되돌린다)
+            state.returnee_pick_page = int(state.returnee_pick_page or 0) + 1
         elif action == "returnee_pick":
             term = str(extra.get("term") or "").strip()
             if not term:
                 raise ValueError("검색할 단어를 고르지 못했습니다.")
-            start, today, _capped = self.service.returnee_period(state)
+            # 목록을 그릴 때 쓴 기간을 그대로 쓴다 — 지금 다시 계산하면 그 사이 월드맵에 글을 쓴 경우 헤더와 어긋나거나 시작일이 내일이 된다
+            start, today = state.returnee_start, state.returnee_end
+            if not (start and today):
+                start, today, _capped = self.service.returnee_period(state)
             self.service.set_keywords(state, any_terms=term, not_terms=state.keyword_not)
             self.service.set_custom_dates(state, start, today)
         elif action == "reset_filters":
@@ -1475,6 +1498,7 @@ class MogIndexCommandsCog(commands.Cog):
             state.returnee_limit = min(max(int(clean_limit or "5"), 1), 100)
             state.mode = "returnee"
             state.page = 0
+            state.returnee_pick_page = 0
             embed, view, _page = self.render_panel(state)
             await self.run_full_index_db_write(self.service.save_session, state)
             await self.safe_edit_original_response(interaction, embed=embed, view=view)

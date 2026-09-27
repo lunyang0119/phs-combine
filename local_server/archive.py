@@ -16,6 +16,7 @@ from dotenv import load_dotenv
 
 from google_sheets_handler import SheetsHandler
 from view import ChannelSelectView
+import help_option
 
 logger = logging.getLogger(__name__)
 
@@ -76,17 +77,23 @@ class ArchiveCommandsCog(commands.Cog):
         시작일="시작 날짜 (YY-MM-DD 형식, 예: 26-01-20)",
         종료일="[선택] 종료 날짜 (YY-MM-DD 형식). 미입력 시 시작일 하루만 저장",
         시작시간="[선택] 시작 시간 (0-23). 기본값: 0. 단일 날짜에서만 적용",
-        종료시간="[선택] 종료 시간 (0-24). 기본값: 24(=23:59). 단일 날짜에서만 적용. 시작시간보다 작으면 다음날까지 저장"
+        종료시간="[선택] 종료 시간 (0-24). 기본값: 24(=23:59). 단일 날짜에서만 적용. 시작시간보다 작으면 다음날까지 저장",
+        도움말=help_option.HELP_OPTION_DESC,
     )
     async def archive(
         self,
         interaction: discord.Interaction,
-        시작일: str,
+        시작일: Optional[str] = None,
         종료일: Optional[str] = None,
         시작시간: Optional[app_commands.Range[int, 0, 23]] = None,
-        종료시간: Optional[app_commands.Range[int, 0, 24]] = None
+        종료시간: Optional[app_commands.Range[int, 0, 24]] = None,
+        도움말: bool = False,
     ):
         """채팅 내용을 txt 파일로 저장"""
+        if await help_option.maybe_help(interaction, 도움말):
+            return
+        if not await help_option.require(interaction, 시작일=시작일):
+            return
         
         # 1. 시작일 파싱
         try:

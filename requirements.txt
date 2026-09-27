@@ -1,9 +1,19 @@
-# 봇 런타임 의존성 (README의 설치 안내와 동일)
-discord.py
+# 봇 런타임 의존성 (Python 3.11+)
+discord.py>=2.0
 python-dotenv
 gspread
-google-auth
-aiohttp
+oauth2client            # google_sheets_handler.py의 서비스 계정 인증
+pandas
+numpy
+pytz                    # shop_commands.py
+
+# Gemini — summary.py, 추적기 디버그 자동 플레이(fugitive/bot_player.py).
+# 없어도 봇은 뜬다(지연 임포트). Python 3.13에서는 httpx 0.24 이상 필요.
+google-genai
+httpx>=0.24
+
+# 추적기 PNG 렌더러(fugitive/image_render.py). 선택 사항: 없으면 이미지 렌더만 비활성화된다.
+Pillow
 
 # Kiwi 형태소 분석기 — 색인 배치/백필 전용.
 # 봇 프로세스(main.py)는 절대 import하지 않는다: 상주 메모리 ~470MB로 1GB 서버에서 봇과 공존 불가.

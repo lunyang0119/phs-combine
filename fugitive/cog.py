@@ -1,6 +1,6 @@
 """침입자 추적 미니게임 — Discord 코그.
 
-공개 명령(헌터, 게임 서버): /탑승 /이동 /수색 /추적 /대기 /현황 /추적기도움말
+공개 명령(헌터, 게임 서버): /탑승 /이동 /수색 /추적 /대기 /현황 (각 명령의 `도움말:True` 옵션으로 규칙 안내)
 관제 명령(어드민, 관제 서버 + 사용자 허용 목록): /추적기 … , /도주 …
 
 숨겨진 상태(도주자 위치·RAM·명령)는 메모리와 data/fugitive_state.json 에만 있다.
@@ -19,6 +19,7 @@ import discord
 from discord import app_commands
 from discord.ext import commands
 
+import help_option
 import utils
 from . import config as cfgmod
 from . import engine as E
@@ -494,8 +495,15 @@ class FugitiveCog(commands.Cog):
             await self._control_send(f"📡 핑: {st.hunters[uid].name} → {label}")
 
     # ------------------------------------------------------------------ 공개 슬래시 명령
+    def _help_extra(self) -> str:
+        budget = self.state.config["scan_budget"] if self.state and self.state.config else cfgmod.DEFAULTS["scan_budget"]
+        return S.HELP.format(scan_budget=budget)
+
     @app_commands.command(name="탑승", description="침입자 추적에 참가합니다 (참가 모집 중에만).")
-    async def join(self, interaction: discord.Interaction):
+    @app_commands.describe(도움말=help_option.HELP_OPTION_DESC)
+    async def join(self, interaction: discord.Interaction, 도움말: bool = False):
+        if await help_option.maybe_help(interaction, 도움말, self._help_extra()):
+            return
         st = self.state
         if st is None or st.status != E.LOBBY:
             await interaction.response.send_message(S.ERR_LOBBY_ONLY, ephemeral=True)
@@ -540,25 +548,41 @@ class FugitiveCog(commands.Cog):
         return [app_commands.Choice(name=f"{r} ({S.DEVICE_KO[st.game_map.rooms[r].device]})", value=r) for r in rooms][:25]
 
     @app_commands.command(name="이동", description="인접한 구역으로 이동 명령을 제출합니다.")
-    @app_commands.describe(구역="이동할 구역 (예: B2)")
+    @app_commands.describe(구역="이동할 구역 (예: B2)", 도움말=help_option.HELP_OPTION_DESC)
     @app_commands.autocomplete(구역=_room_autocomplete)
-    async def move(self, interaction: discord.Interaction, 구역: str):
+    async def move(self, interaction: discord.Interaction, 구역: Optional[str] = None, 도움말: bool = False):
+        if await help_option.maybe_help(interaction, 도움말, self._help_extra()):
+            return
+        if not await help_option.require(interaction, 구역=구역):
+            return
         await self.handle_order(interaction, "move", 구역.strip().upper())
 
     @app_commands.command(name="수색", description="현재 구역을 수색합니다. 숨은 침입자를 잡는 유일한 방법.")
-    async def search(self, interaction: discord.Interaction):
+    @app_commands.describe(도움말=help_option.HELP_OPTION_DESC)
+    async def search(self, interaction: discord.Interaction, 도움말: bool = False):
+        if await help_option.maybe_help(interaction, 도움말, self._help_extra()):
+            return
         await self.handle_order(interaction, "search", None)
 
     @app_commands.command(name="추적", description="추적기를 조작해 침입자가 있는 구역의 장치 계열을 알아냅니다.")
-    async def scan(self, interaction: discord.Interaction):
+    @app_commands.describe(도움말=help_option.HELP_OPTION_DESC)
+    async def scan(self, interaction: discord.Interaction, 도움말: bool = False):
+        if await help_option.maybe_help(interaction, 도움말, self._help_extra()):
+            return
         await self.handle_order(interaction, "scan", None)
 
     @app_commands.command(name="대기", description="이번 라운드는 제자리에 머뭅니다.")
-    async def stay(self, interaction: discord.Interaction):
+    @app_commands.describe(도움말=help_option.HELP_OPTION_DESC)
+    async def stay(self, interaction: discord.Interaction, 도움말: bool = False):
+        if await help_option.maybe_help(interaction, 도움말, self._help_extra()):
+            return
         await self.handle_order(interaction, "stay", None)
 
     @app_commands.command(name="현황", description="추적기 현황판을 다시 보여줍니다.")
-    async def status(self, interaction: discord.Interaction):
+    @app_commands.describe(도움말=help_option.HELP_OPTION_DESC)
+    async def status(self, interaction: discord.Interaction, 도움말: bool = False):
+        if await help_option.maybe_help(interaction, 도움말, self._help_extra()):
+            return
         st = self.state
         if st is None or st.status in (E.IDLE, E.LOBBY):
             await interaction.response.send_message(S.ERR_NO_GAME, ephemeral=True)
@@ -573,11 +597,6 @@ class FugitiveCog(commands.Cog):
                 await interaction.response.send_message(file=discord.File(buf, "tracker.png"), ephemeral=True)
                 return
         await interaction.response.send_message(render.table_text(pv), ephemeral=True)
-
-    @app_commands.command(name="추적기도움말", description="침입자 추적 미니게임 규칙 안내.")
-    async def help_cmd(self, interaction: discord.Interaction):
-        budget = self.state.config["scan_budget"] if self.state and self.state.config else cfgmod.DEFAULTS["scan_budget"]
-        await interaction.response.send_message(S.HELP.format(scan_budget=budget), ephemeral=True)
 
     # ------------------------------------------------------------------ 관제 명령: /추적기
     def _build_admin_group(self) -> app_commands.Group:

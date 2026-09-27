@@ -170,7 +170,7 @@ The round message carries buttons **[이동] [수색] [추적] [대기]**; [이�
 | `/이동 <room>` | Autocomplete offers only adjacent rooms. |
 | `/수색` `/추적` `/대기` | As §3.3 |
 | `/현황` | Re-post the current public table. |
-| `/추적기 도움말` | Rules in Korean. |
+| any of the above with `도움말:True` | Rules in Korean (per-command help; there is no separate help command). |
 
 ### 5.2 Admin (control guild only + user allowlist)
 | Command | Notes |

@@ -18,6 +18,10 @@ import constants
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
+# Characters 시트의 점수 열 (O열)
+SCORE_COLUMN_LETTER = 'O'
+SCORE_COLUMN_INDEX = 15
+
 class SheetsHandler:
     def __init__(self, sheet_name):
         SCOPE = [
@@ -153,6 +157,40 @@ class SheetsHandler:
             logger.error(f"캐릭터 추가 중 오류 발생: {e}")
             return False
 
+    def register_members_basic(self, members: List[tuple]) -> tuple:
+        """[(discord_id, 닉네임), ...] 중 Characters 시트 A열에 없는 사람만 A열(ID)·B열(닉네임)로 추가합니다.
+        시트 A열을 직접 읽어 중복을 거르므로 캐시에 없는 기존 행도 건너뜁니다.
+        (추가된 [(id, 닉네임)], 이미 있던 인원 수)를 반환합니다."""
+        ids_col = self.characters_sheet.col_values(1)
+        existing = {str(v).strip() for v in ids_col[1:] if str(v).strip()}
+
+        new_rows = []
+        for discord_id, name in members:
+            discord_id = str(discord_id)
+            if discord_id in existing:
+                continue
+            existing.add(discord_id)
+            new_rows.append([discord_id, name])
+
+        if new_rows:
+            # RAW: 18~19자리 ID가 숫자로 해석되어 정밀도를 잃지 않도록 문자열 그대로 기록
+            self.characters_sheet.append_rows(new_rows, value_input_option='RAW', table_range='A1')
+
+            # 캐시에도 추가해 두어야 /시트갱신 cache2g가 새 행을 지우지 않음
+            headers = self.characters_sheet_headers
+            if len(headers) >= 2:
+                cache = self.characters_sheet_cache
+                columns = cache.columns if len(cache.columns) else pd.Index(headers[1:])
+                new_df = pd.DataFrame(
+                    [{headers[1]: name} for _, name in new_rows],
+                    index=pd.Index([rid for rid, _ in new_rows], name='discord_id'),
+                    columns=columns,
+                ).fillna('')
+                self.characters_sheet_cache = pd.concat([self.characters_sheet_cache, new_df])
+
+        logger.info(f"서버 멤버 일괄 등록: {len(new_rows)}명 추가, {len(members) - len(new_rows)}명 건너뜀")
+        return [tuple(r) for r in new_rows], len(members) - len(new_rows)
+
     def get_char_data(self, char_id: str):
         """캐시에서 id로 캐릭터 정보(행) 조회"""
         char_id = str(char_id)
@@ -198,6 +236,54 @@ class SheetsHandler:
         except Exception as e:
             logger.error(f"스탯 업데이트 실패: {e}")
             return False
+
+    @staticmethod
+    def _parse_score(raw) -> float:
+        """시트에 표시된 점수 문자열('1,234', '', '12.5')을 숫자로 변환"""
+        text = str(raw).replace(',', '').strip()
+        return float(text) if text else 0
+
+    def find_characters_by_name_in_sheet(self, query: str) -> List[tuple]:
+        """캐시에 없는 캐릭터를 찾기 위해 시트 A:B열을 직접 읽어 닉네임을 검색합니다. [(discord_id, name), ...]"""
+        ids_col, names_col = self.characters_sheet.batch_get(['A:A', 'B:B'])
+        rows = []
+        for i in range(1, len(ids_col)):
+            discord_id = str(ids_col[i][0]).strip() if ids_col[i] else ''
+            name = str(names_col[i][0]).strip() if i < len(names_col) and names_col[i] else ''
+            if discord_id and name:
+                rows.append((discord_id, name))
+        return utils.match_names(rows, query)
+
+    def add_score(self, discord_id: str, amount: int) -> Optional[tuple]:
+        """Characters 시트 O열의 현재 값에 amount를 더합니다.
+        시트에서 직접 현재 값을 읽어(읽기 1회) 한 칸만 쓰므로(쓰기 1회) 시트를 수동으로 고친 경우에도 안전합니다.
+        (이전 값, 새 값)을 반환하고, 캐릭터가 없으면 None."""
+        discord_id = str(discord_id)
+        ids_col, score_col = self.characters_sheet.batch_get(['A:A', f'{SCORE_COLUMN_LETTER}:{SCORE_COLUMN_LETTER}'])
+
+        row_idx = next(
+            (i for i in range(1, len(ids_col)) if ids_col[i] and str(ids_col[i][0]).strip() == discord_id),
+            None
+        )
+        if row_idx is None:
+            return None
+
+        raw = score_col[row_idx][0] if row_idx < len(score_col) and score_col[row_idx] else ''
+        old_value = self._parse_score(raw)
+        new_value = old_value + amount
+        if float(new_value).is_integer():
+            old_value, new_value = int(old_value), int(new_value)
+
+        self.characters_sheet.update_cell(row_idx + 1, SCORE_COLUMN_INDEX, new_value)
+
+        # 다른 명령어가 캐시 전체를 시트에 덮어써도 점수가 되돌아가지 않도록 캐시도 갱신
+        if len(self.characters_sheet_headers) >= SCORE_COLUMN_INDEX:
+            score_header = self.characters_sheet_headers[SCORE_COLUMN_INDEX - 1]
+            if score_header in self.characters_sheet_cache.columns and discord_id in self.characters_sheet_cache.index:
+                self.characters_sheet_cache.at[discord_id, score_header] = new_value
+
+        logger.info(f"'{discord_id}' 점수 {old_value} -> {new_value} ({amount:+})")
+        return old_value, new_value
         
     def prepare_battle(self, participant_ids: list):
         """전투 시작을 위해 참여자 데이터를 새로운 Combat_Status 구조에 맞게 가공하여 전투 캐시를 생성합니다."""

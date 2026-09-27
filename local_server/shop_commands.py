@@ -12,6 +12,9 @@ import numpy as np
 from collections import Counter
 from view import ItemSelectView
 from utils import get_korean_particle
+from typing import Optional
+import help_option
+import help_texts
 
 logger = logging.getLogger(__name__)
 
@@ -127,12 +130,14 @@ class ShopCog(commands.Cog):
             await interaction.followup.send("랜덤 선정 가능한 상품이 5개 미만이라 초기화가 불가해, 쿠뽀.\n시트에 상품을 추가하거나 '안나와용' 설정을 확인해줘, 쿠뽀.")
 
     @app_commands.command(name="매점", description="현재 매점 상품 리스트를 보여줍니다.")
-    @app_commands.describe(종류="매점 종류를 선택하세요")
+    @app_commands.describe(종류="매점 종류를 선택하세요", 도움말=help_option.HELP_OPTION_DESC)
     @app_commands.choices(종류=[
         app_commands.Choice(name="일반", value="일반"),
         app_commands.Choice(name="특수", value="특수")
     ])
-    async def 매점(self, interaction: discord.Interaction, 종류: str = "일반"):
+    async def 매점(self, interaction: discord.Interaction, 종류: str = "일반", 도움말: bool = False):
+        if await help_option.maybe_help(interaction, 도움말, help_texts.SHOP):
+            return
         await self.update_selected_items()  # 항상 최신 정보를 반영
 
         purchases = await asyncio.to_thread(self.sheet_handler.user_purchases_sheet.get_all_records)
@@ -194,13 +199,18 @@ class ShopCog(commands.Cog):
     @app_commands.command(name="구매", description="매점 상품을 구매합니다.")
     @app_commands.describe(
         item_no="구매할 상품 번호 (특수: 0=티켓, 1-5=상품 / 일반: 1-5=상품)",
-        종류="매점 종류를 선택하세요"
+        종류="매점 종류를 선택하세요",
+        도움말=help_option.HELP_OPTION_DESC,
     )
     @app_commands.choices(종류=[
         app_commands.Choice(name="일반", value="일반"),
         app_commands.Choice(name="특수", value="특수")
     ])
-    async def 구매(self, interaction: discord.Interaction, item_no: int, 종류: str = "일반"):
+    async def 구매(self, interaction: discord.Interaction, item_no: Optional[int] = None, 종류: str = "일반", 도움말: bool = False):
+        if await help_option.maybe_help(interaction, 도움말, help_texts.SHOP):
+            return
+        if not await help_option.require(interaction, item_no=item_no):
+            return
         display_name = interaction.user.display_name
 
         await self.update_selected_items()
@@ -316,9 +326,14 @@ class ShopCog(commands.Cog):
     @app_commands.command(name="포인트", description="다른 유저에게 매점 포인트를 지급합니다.")
     @app_commands.describe(
         user="포인트를 지급할 유저",
-        amount="지급할 포인트 금액"
+        amount="지급할 포인트 금액",
+        도움말=help_option.HELP_OPTION_DESC,
     )
-    async def 포인트(self, interaction: discord.Interaction, user: discord.Member, amount: int):
+    async def 포인트(self, interaction: discord.Interaction, user: Optional[discord.Member] = None, amount: Optional[int] = None, 도움말: bool = False):
+        if await help_option.maybe_help(interaction, 도움말, help_texts.SHOP):
+            return
+        if not await help_option.require(interaction, user=user, amount=amount):
+            return
         await interaction.response.defer(ephemeral=False)
 
         target_id = str(user.id)
@@ -362,7 +377,10 @@ class ShopCog(commands.Cog):
         await interaction.followup.send(embed=embed, ephemeral=False)
 
     @app_commands.command(name="인벤토리", description="구매한 매점 아이템 목록을 확인합니다.")
-    async def 인벤토리(self, interaction: discord.Interaction):
+    @app_commands.describe(도움말=help_option.HELP_OPTION_DESC)
+    async def 인벤토리(self, interaction: discord.Interaction, 도움말: bool = False):
+        if await help_option.maybe_help(interaction, 도움말, help_texts.SHOP):
+            return
         await interaction.response.defer(ephemeral=True)
 
         user_id = str(interaction.user.id)
@@ -399,7 +417,10 @@ class ShopCog(commands.Cog):
         await interaction.followup.send(embed=embed, ephemeral=True)
 
     @app_commands.command(name="사용", description="인벤토리의 아이템을 사용합니다.")
-    async def 사용(self, interaction: discord.Interaction):
+    @app_commands.describe(도움말=help_option.HELP_OPTION_DESC)
+    async def 사용(self, interaction: discord.Interaction, 도움말: bool = False):
+        if await help_option.maybe_help(interaction, 도움말, help_texts.SHOP):
+            return
         await interaction.response.defer(ephemeral=True)
 
         user_id = str(interaction.user.id)
@@ -466,26 +487,6 @@ class ShopCog(commands.Cog):
 
         # 채널에 공개 메시지
         await interaction.channel.send(embed=embed)
-
-    @app_commands.command(name="매점도움말", description="매점 시스템 사용법을 안내합니다.")
-    async def 매점도움말(self, interaction: discord.Interaction):
-        msg = (
-            "**매점 시스템 도움말**\n\n"
-            "**[일반 매점]** (기본)\n"
-            "- `/매점` : 현재 매점 상품을 확인합니다.\n"
-            "- `/구매 [상품번호]` : 상품을 1회만 구매할 수 있습니다. (선착순, 품절 있음)\n"
-            "- 포인트가 필요하지 않습니다.\n\n"
-            "**[특수 매점]**\n"
-            "- `/매점 종류:특수` : 특수 매점 상품을 확인합니다.\n"
-            "- `/구매 [상품번호] 종류:특수` : 포인트를 사용하여 구매합니다. (제한 없음)\n"
-            "  - 0번 '티켓'은 상시 구매 가능합니다.\n"
-            "- `/포인트 @유저 금액` : 다른 유저에게 포인트를 지급합니다.\n"
-            "- `/인벤토리` : 구매한 아이템 목록과 보유 포인트를 확인합니다.\n"
-            "- `/사용` : 인벤토리의 아이템을 사용합니다.\n\n"
-            "**[관리자용]**\n"
-            "- `/매점초기화` : 상품 5개를 새로 뽑고 모든 구매 기록을 초기화합니다.\n"
-        )
-        await interaction.response.send_message(msg, ephemeral=True)
 
     @app_commands.command(name="매점숨김갱신", description="[관리자] '안나와용'으로 표시된 상품을 매점에서 숨깁니다.")
     @app_commands.default_permissions(administrator=True)

@@ -107,4 +107,4 @@ def test_scope_select_views_have_back_button():
 
 def test_search_command_accepts_keyword_argument():
     params = cmd.MogIndexCommandsCog.search_panel.parameters
-    assert [p.display_name for p in params] == ["검색어"] and not params[0].required
+    assert [p.display_name for p in params] == ["검색어", "도움말"] and not params[0].required

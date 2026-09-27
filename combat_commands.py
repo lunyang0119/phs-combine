@@ -16,6 +16,8 @@ import json
 import pandas as pd
 import numpy as np
 import constants
+import help_option
+import help_texts
 
 # 리팩토링: 유틸리티 함수 모듈화 (Phase 1, 2, 3, 4 완료)
 from combat.combat_utils import CombatUtils
@@ -346,7 +348,8 @@ class CombatCog(commands.Cog):
         players="참여할 플레이어들을 멘션하세요 (예: @유저1 @유저2)",
         monsters="몬스터 ID를 쉼표로 구분하여 입력하세요 (예: monster_id1, monster_id2)",
         m_no="음악의 번호를 입력하세요",
-        difficulty="난이도를 선택하세요 (쉬움/보통/어려움/극악)"
+        difficulty="난이도를 선택하세요 (쉬움/보통/어려움/극악)",
+        도움말=help_option.HELP_OPTION_DESC,
     )
     @app_commands.choices(difficulty=[
         app_commands.Choice(name="쉬움", value="쉬움"),
@@ -354,7 +357,11 @@ class CombatCog(commands.Cog):
         app_commands.Choice(name="어려움", value="어려움"),
         app_commands.Choice(name="극악", value="극악")
     ])
-    async def start_battle(self, interaction: discord.Interaction, players: str, monsters: str, m_no: int = 1, difficulty: str = "보통") -> None:
+    async def start_battle(self, interaction: discord.Interaction, players: Optional[str] = None, monsters: Optional[str] = None, m_no: int = 1, difficulty: str = "보통", 도움말: bool = False) -> None:
+        if await help_option.maybe_help(interaction, 도움말, help_texts.COMBAT):
+            return
+        if not await help_option.require(interaction, players=players, monsters=monsters):
+            return
         await interaction.response.defer()
 
         channel_id = interaction.channel_id
@@ -593,8 +600,12 @@ class CombatCog(commands.Cog):
         await self.battle_loop(interaction)
 
     @app_commands.command(name="난입", description="진행 중인 전투에 난입합니다.")
-    @app_commands.describe(intruder_id="난입할 캐릭터 또는 몬스터의 ID")
-    async def join_battle(self, interaction: discord.Interaction, intruder_id: str) -> None:
+    @app_commands.describe(intruder_id="난입할 캐릭터 또는 몬스터의 ID", 도움말=help_option.HELP_OPTION_DESC)
+    async def join_battle(self, interaction: discord.Interaction, intruder_id: Optional[str] = None, 도움말: bool = False) -> None:
+        if await help_option.maybe_help(interaction, 도움말, help_texts.COMBAT):
+            return
+        if not await help_option.require(interaction, intruder_id=intruder_id):
+            return
         await interaction.response.defer()
         channel_id = interaction.channel_id
         intruder_id = intruder_id.strip()
@@ -625,8 +636,11 @@ class CombatCog(commands.Cog):
         await interaction.followup.send(f"**{intruder_name}** (이)가 전투에 난입했습니다! 다음 턴부터 행동할 수 있습니다.")
 
     @app_commands.command(name="전투종료", description="현재 채널의 전투를 강제로 종료합니다.")
-    async def end_battle(self, interaction: discord.Interaction):
+    @app_commands.describe(도움말=help_option.HELP_OPTION_DESC)
+    async def end_battle(self, interaction: discord.Interaction, 도움말: bool = False):
         """현재 채널의 전투를 강제로 종료합니다."""
+        if await help_option.maybe_help(interaction, 도움말, help_texts.COMBAT):
+            return
         await interaction.response.defer(ephemeral=False)
 
         channel_id = interaction.channel_id
@@ -2195,12 +2209,14 @@ class CombatCog(commands.Cog):
                     logger.info(f"채널 {channel_id}: 전투 루프 종료, 동시성 플래그 해제")
 
     @app_commands.command(name="전투일시정지", description="현재 또는 지정한 채널의 전투를 일시정지합니다.")
-    @app_commands.describe(channel_id="일시정지할 전투가 진행 중인 채널/스레드 ID (선택사항)")
-    async def pause_battle(self, interaction: discord.Interaction, channel_id: str = None):
+    @app_commands.describe(channel_id="일시정지할 전투가 진행 중인 채널/스레드 ID (선택사항)", 도움말=help_option.HELP_OPTION_DESC)
+    async def pause_battle(self, interaction: discord.Interaction, channel_id: str = None, 도움말: bool = False):
         """
         전투를 일시정지합니다.
         channel_id를 지정하지 않으면 현재 채널의 전투를 정지합니다.
         """
+        if await help_option.maybe_help(interaction, 도움말, help_texts.COMBAT):
+            return
         # 대상 채널 ID 결정
         target_channel_id = int(channel_id) if channel_id else interaction.channel_id
         
@@ -2237,12 +2253,14 @@ class CombatCog(commands.Cog):
 
         
     @app_commands.command(name="전투재개", description="일시정지된 전투를 재개합니다.")
-    @app_commands.describe(channel_id="재개할 전투가 진행 중인 채널/스레드 ID (선택사항)")
-    async def resume_battle(self, interaction: discord.Interaction, channel_id: str = None):
+    @app_commands.describe(channel_id="재개할 전투가 진행 중인 채널/스레드 ID (선택사항)", 도움말=help_option.HELP_OPTION_DESC)
+    async def resume_battle(self, interaction: discord.Interaction, channel_id: str = None, 도움말: bool = False):
         """
         일시정지된 전투를 재개합니다.
         channel_id를 지정하지 않으면 현재 채널의 전투를 재개합니다.
         """
+        if await help_option.maybe_help(interaction, 도움말, help_texts.COMBAT):
+            return
         # 대상 채널 ID 결정
         target_channel_id = int(channel_id) if channel_id else interaction.channel_id
         
@@ -2271,8 +2289,11 @@ class CombatCog(commands.Cog):
         logger.info(f"[RESUME] 채널 {target_channel_id}: 전투 재개됨. paused={battle_state['paused']}, event_set=True")
 
     @app_commands.command(name="전투목록", description="현재 진행 중인 모든 전투를 조회합니다.")
-    async def list_battles(self, interaction: discord.Interaction):
+    @app_commands.describe(도움말=help_option.HELP_OPTION_DESC)
+    async def list_battles(self, interaction: discord.Interaction, 도움말: bool = False):
         """진행 중인 전투 목록을 표시합니다."""
+        if await help_option.maybe_help(interaction, 도움말, help_texts.COMBAT):
+            return
         if not self.active_battles:
             await interaction.response.send_message("현재 진행 중인 전투가 없습니다.", ephemeral=True)
             return
@@ -2347,352 +2368,6 @@ class CombatCog(commands.Cog):
             self.active_battles,
             self.sheet_handler
         )
-
-    async def help_command(self, interaction: discord.Interaction, option: app_commands.Choice[str] = None):
-        """모든 명령어의 사용법을 표시합니다."""
-        await interaction.response.defer(ephemeral=True)
-
-        # 기본 Embed 생성
-        embed = discord.Embed(
-            title="명령어 도움말",
-            color=discord.Color.blue()
-        )
-
-        selected = option.value if option else "quickstart"
-
-        # 빠른 시작 가이드
-        if selected == "quickstart":
-            embed.title = "🏁 빠른 시작 가이드"
-            embed.description = "라이프 스트림을 여행하는 히치하이커를 위한 PHS"
-
-            embed.add_field(
-                name="1️⃣ 캐릭터 만들기",
-                value=(
-                    "**`/등록`** 명령어로 캐릭터를 생성합니다.\n"
-                    "• **스트라이커**: 물리 공격 특화 (근력 높음)\n"
-                    "• **마테리아 위버**: 마법 사용 특화 (마법 높음)\n\n"
-                    "등록 후 **보너스 포인트 10점**을 받습니다."
-                ),
-                inline=False
-            )
-
-            embed.add_field(
-                name="2️⃣ 스탯 분배하기",
-                value=(
-                    "**`/스탯분배`** 명령어로 보너스 포인트를 분배하세요.\n"
-                    "• **근력**: HP 증가, 물리 공격력 상승\n"
-                    "• **마법**: MP 증가, 마법 위력 상승\n"
-                    "• **민첩**: 턴 순서 우선, 회피율 증가\n"
-                    "• **매력**: DMW(슬롯머신) 성공률 상승"
-                ),
-                inline=False
-            )
-
-            embed.add_field(
-                name="3️⃣ 전투 준비하기",
-                value=(
-                    "**`/리스트`**로 채널의 플레이어/몬스터 ID를 확인하세요.\n"
-                    "**`/전투시작 participants:[ID들]`**로 전투를 시작합니다.\n"
-                    "예시: `/전투시작 participants:123456, 789012, monster_goblin`"
-                ),
-                inline=False
-            )
-
-            embed.add_field(
-                name="4️⃣ 전투 중 행동",
-                value=(
-                    "자신의 턴이 되면 행동 버튼이 표시됩니다:\n"
-                    "⚔️ **물리공격**: 근력 기반 단일 공격\n"
-                    "✨ **마법**: 마테리아 필요, 다양한 효과\n"
-                    "💥 **리미트 브레이크**: 강력한 필살기\n"
-                    "🛡️ **방어**: 데미지 경감\n"
-                    "💨 **회피**: 민첩 10 이상 필요, 공격 회피"
-                ),
-                inline=False
-            )
-
-            embed.add_field(
-                name="5️⃣ DMW 시스템",
-                value=(
-                    "매 턴마다 **DMW(Digital Mind Wave)** 슬롯이 돌아갑니다!\n"
-                    "• 3개가 일치하면 특수 효과 발동\n"
-                    "• **세피로스**: 전체 적 공격\n"
-                    "• **앤질**: 리미트 브레이크 재사용 가능\n"
-                    "• **라켈**: 전체 아군 회복\n"
-                    "• 매력 스탯이 높을수록 성공 확률 증가\n"
-                    "이외에도 여러 DMW가 있습니다."
-                ),
-                inline=False
-            )
-
-            embed.add_field(
-                name="유용한 팁",
-                value=(
-                    "• **`/내상태`**로 현재 HP/MP 확인\n"
-                    "• **`/인벤토리`**로 마테리아 관리\n"
-                    "• **`/전투현황`**로 현재 전투 상태 확인\n"
-                    "• 자세한 설명: `/도움말 option:[카테고리]`"
-                ),
-                inline=False
-            )
-
-        # 캐릭터 관리 명령어
-        elif selected == "character":
-            embed.title = "캐릭터 관리 명령어"
-            embed.description = "캐릭터 생성, 스탯 관리와 관련된 명령어입니다."
-
-            embed.add_field(
-                name="캐릭터 생성 & 조회",
-                value=(
-                    "**`/등록`**\n"
-                    "• 새로운 캐릭터를 생성합니다\n"
-                    "• 직업 선택: 스트라이커 또는 마테리아 위버\n\n"
-                    "**`/내상태`**\n"
-                    "• 현재 캐릭터의 모든 정보를 확인합니다\n"
-                    "• HP, MP, 스탯, 장착 마테리아 등"
-                ),
-                inline=False
-            )
-
-            embed.add_field(
-                name="스탯 관리",
-                value=(
-                    "**`/스탯분배 stat:[스탯] points:[숫자]`**\n"
-                    "• 보너스 포인트를 스탯에 분배합니다\n"
-                    "• 스탯 종류: 근력, 마법, 민첩, 매력\n"
-                    "• 등록 시 10점의 보너스 포인트 지급"
-                ),
-                inline=False
-            )
-
-            embed.add_field(
-                name="스탯 효과",
-                value=(
-                    "**근력**: HP 증가 (+3 근력 = +10 HP), 물리 공격력 ↑\n"
-                    "**마법**: MP 증가 (+1 마법 = +10 MP), 마법 위력 ↑\n"
-                    "**민첩**: 턴 순서 우선, 회피율 ↑\n"
-                    "**매력**: DMW 성공률 ↑"
-                ),
-                inline=False
-            )
-
-        # 전투 시스템
-        elif selected == "combat":
-            embed.title = "전투 시스템 명령어"
-            embed.description = "전투 시작, 관리와 관련된 명령어입니다."
-
-            embed.add_field(
-                name="전투 관리",
-                value=(
-                    "**`/전투시작 participants:[ID] m_no:[음악번호]`**\n"
-                    "• 전투를 시작합니다\n"
-                    "• participants: 쉼표로 구분된 ID\n"
-                    "• m_no: 0(랜덤) 또는 1~N(지정)\n\n"
-                    "**`/난입 intruder_id:[ID]`**\n"
-                    "• 진행 중인 전투에 난입합니다\n\n"
-                    "**`/전투종료`** | **`/전투일시정지`** | **`/전투재개`**\n"
-                    "• 전투를 강제 종료/일시정지/재개합니다\n\n"
-                    "**`/전투목록`** | **`/전투현황`**\n"
-                    "• 진행 중 전투 조회 및 상세 현황 확인"
-                ),
-                inline=False
-            )
-
-            embed.add_field(
-                name="전투 중 행동",
-                value=(
-                    "⚔️ **물리공격**: (근력-10)/2 + 1d10 데미지\n"
-                    "✨ **마법**: 마테리아 장착 필요, MP 소모\n"
-                    "💥 **리미트 브레이크**: 직업별 강력한 필살기\n"
-                    "🛡️ **방어**: (근력-10)/2 + 1d10 데미지 경감\n"
-                    "💨 **회피**: 민첩 10 이상 필요, 완전 회피"
-                ),
-                inline=False
-            )
-
-            embed.add_field(
-                name="DMW 시스템",
-                value=(
-                    "매 턴마다 **슬롯머신**이 돌아갑니다!\n"
-                    "• 계산식: (매력-10)/2 + 4d10\n"
-                    "• 7 = 세피로스 (전체 공격)\n"
-                    "• 30 이상 = 다른 피규어 랜덤\n\n"
-                    "**효과**: 세피로스(전체 공격), 앤질(리미트 재사용), 잭스(근력+1), 라켈(전체 회복) 등"
-                ),
-                inline=False
-            )
-
-            embed.add_field(
-                name="🎲 고급 전투 시스템",
-                value=(
-                    "**환경 효과** (20% 확률)\n"
-                    "☢️ 마황 지대: HP -5%/턴\n"
-                    "⚡ 라이프스트림: MP +3/턴\n"
-                    "🌀 중력 이상: 회피율 -50%\n"
-                    "⏰ 시간 왜곡: 턴 순서 무작위\n\n"
-                    "**연계 공격**: 2연타 +20%, 3연타 +50% 데미지\n"
-                    "**보스전**: `/도움말 option: 보스전 가이드` 참조"
-                ),
-                inline=False
-            )
-
-        # 보스전 가이드
-        elif selected == "boss":
-            embed.title = "보스전 가이드"
-            embed.description = (
-                "보스는 일반 몬스터보다 강력하며, 특수한 스킬과 메커니즘을 가지고 있습니다.\n"
-                "자세한 내용은 `boss_battle.md` 문서를 참조하세요."
-            )
-
-            embed.add_field(
-                name="보스 특징",
-                value=(
-                    "• **높은 HP/스탯**: 일반 몬스터의 수배\n"
-                    "• **보스 스킬**: HP 조건 달성 시 자동 발동\n"
-                    "• **페이즈 전환**: HP가 일정 이하로 떨어지면 패턴 변화\n"
-                    "• **특수 메커니즘**: 소환, 공생, 버프/디버프 등\n"
-                    "• **강력한 보상**: 경험치, 레어 마테리아 획득 가능"
-                ),
-                inline=False
-            )
-
-            embed.add_field(
-                name="보스 스킬 시스템",
-                value=(
-                    "보스는 **HP 임계값**에 도달하면 강력한 스킬을 사용합니다:\n\n"
-                    "**트리거 방식**\n"
-                    "• HP 80% 이하: Phase 1 스킬 발동\n"
-                    "• HP 50% 이하: Phase 2 스킬 발동\n"
-                    "• HP 20% 이하: 최종 발악 스킬\n\n"
-                    "**주요 스킬 타입**\n"
-                    "💀 **죽음의 선고**: 3턴 후 즉사 (tokura 상태)\n"
-                    "👥 **소환**: 새로운 몬스터 추가 소환\n"
-                    "💥 **전체 공격**: 모든 플레이어에게 대미지\n"
-                    "🩸 **생명력 흡수**: 데미지 + HP 회복\n"
-                    "⚡ **MP 흡수**: 데미지 + MP 감소\n"
-                    "📉 **스탯 디버프**: 근력/마법/민첩 감소\n"
-                    "💪 **자기 강화**: 공격력/방어력 증가"
-                ),
-                inline=False
-            )
-
-        # 마테리아
-        elif selected == "materia":
-            embed.title = "마테리아 시스템"
-            embed.description = "마테리아 장착 및 관리 명령어입니다."
-
-            embed.add_field(
-                name="마테리아 관리",
-                value=(
-                    "**`/인벤토리`**\n"
-                    "• 소유한 마테리아 목록을 확인합니다\n\n"
-                    "**`/마테리아`**\n"
-                    "• 마테리아를 장착하거나 해제합니다\n"
-                    "• 장착: 인벤토리에서 드롭다운으로 선택\n"
-                    "• 자동 교체: 이미 장착된 경우 자동으로 인벤토리로 복귀\n"
-                    "• 해제: 장착 중인 마테리아를 인벤토리로 복귀"
-                ),
-                inline=False
-            )
-
-            embed.add_field(
-                name="마테리아 사용법",
-                value=(
-                    "• 한 번에 **하나의 마테리아만** 장착 가능\n"
-                    "• 전투 중에는 장착/해제 불가\n"
-                    "• 마법 사용 시 **MP 소모**\n"
-                    "• 마테리아 위버는 마법 위력 +1d5 보너스"
-                ),
-                inline=False
-            )
-
-            embed.add_field(
-                name="마테리아 종류",
-                value=(
-                    "**DAMAGE**: 적 대상 공격 마법\n"
-                    "• ENEMY: 단일 적\n"
-                    "• ALL_ENEMY: 모든 적\n\n"
-                    "**HEAL**: 아군 대상 회복 마법\n"
-                    "• ALLY: 단일 아군\n"
-                    "• ALL_ALLY: 모든 아군\n\n"
-                    "위력: (마법-10)/2 + 1dPower + (위버시 +1d5)"
-                ),
-                inline=False
-            )
-
-        # 유틸리티
-        elif selected == "utility":
-            embed.title = "유틸리티 명령어"
-            embed.description = "편의 기능 및 관리 명령어입니다."
-
-            embed.add_field(
-                name="데이터 동기화",
-                value=(
-                    "**`/시트갱신 option:[g2cache/cache2g]`**\n"
-                    "• 구글 시트 ↔ 봇 캐시 동기화\n"
-                    "• **g2cache**: 시트 → 봇 (데이터 불러오기)\n"
-                    "• **cache2g**: 봇 → 시트 (데이터 저장)\n\n"
-                    "**`/캐시확인 sheet_name:[시트] user_id:[ID]`**\n"
-                    "• 현재 캐시 데이터를 확인합니다"
-                ),
-                inline=False
-            )
-        # 전체 명령어
-        else:
-            embed.description = (
-                "**PHS 명령어 목록**\n"
-                "자세한 설명을 보려면 `/도움말 option:[카테고리]`를 사용하세요.\n\n"
-                "처음 사용하신다면 **🏁 빠른 시작 가이드**를 확인하세요!"
-            )
-
-            embed.add_field(
-                name="👤 캐릭터 관리",
-                value=(
-                    "`/등록` `/내상태` `/스탯분배`"
-                ),
-                inline=False
-            )
-
-
-            embed.add_field(
-                name="⚔️ 전투 시스템",
-                value=(
-                    "`/전투시작` `/난입` `/전투종료`\n"
-                    "`/전투일시정지` `/전투재개` `/전투목록` `/전투현황`"
-                ),
-                inline=False
-            )
-
-
-            embed.add_field(
-                name="💎 마테리아",
-                value=(
-                    "`/인벤토리` `/마테리아장착` `/마테리아해제`"
-                ),
-                inline=False
-            )
-
-            embed.add_field(
-                name="🔧 유틸리티",
-                value=(
-                    "`/시트갱신` `/캐시확인` `/리스트` `/프렐류드`"
-                ),
-                inline=False
-            )
-
-            embed.add_field(
-                name="📚 카테고리별 상세 가이드",
-                value=(
-                    "🏁 `/도움말 option:빠른 시작 가이드` - 처음 사용자용\n"
-                    "👤 `/도움말 option:캐릭터 관리` - 캐릭터 생성/관리\n"
-                    "⚔️ `/도움말 option:전투 시스템` - 전투 룰 & DMW\n"
-                    "💎 `/도움말 option:마테리아` - 마테리아 사용법\n"
-                    "🔧 `/도움말 option:유틸리티` - 편의 기능"
-                ),
-                inline=False
-            )
-
-        await interaction.followup.send(embed=embed, ephemeral=True)
 
     @app_commands.command(name="디버그", description="[개발자] 시스템 상태를 확인합니다.")
     @app_commands.default_permissions(manage_roles=True)
@@ -2790,8 +2465,11 @@ class CombatCog(commands.Cog):
 
 
     @app_commands.command(name="전투현황", description="현재 전투의 상세 정보를 확인합니다.")
-    async def battle_status(self, interaction: discord.Interaction):
+    @app_commands.describe(도움말=help_option.HELP_OPTION_DESC)
+    async def battle_status(self, interaction: discord.Interaction, 도움말: bool = False):
         """현재 채널의 전투 상태를 상세히 표시합니다."""
+        if await help_option.maybe_help(interaction, 도움말, help_texts.COMBAT):
+            return
         await interaction.response.defer(ephemeral=True)
         
         channel_id = interaction.channel_id

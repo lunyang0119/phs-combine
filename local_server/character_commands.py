@@ -11,6 +11,8 @@ import utils
 import json
 import numpy as np
 import constants
+import help_option
+import help_texts
 
 logger = logging.getLogger(__name__)
 
@@ -135,14 +137,150 @@ class JobSelectView(discord.ui.View):
         super().__init__(timeout=constants.ACTION_VIEW_TIMEOUT)
         self.add_item(JobSelect(sheet_handler))
 
+SCORE_NOT_FOUND_MESSAGE = "캐릭터가 없습니다. 디스코드 아이디로 찾거나 스프레드 시트에 추가해주세요."
+SCORE_MAX_CANDIDATES = 25  # Select 옵션 최대 개수
+
+
+class ScoreConfirmView(discord.ui.View):
+    """닉네임으로 찾은 캐릭터가 맞는지 확인하는 ephemeral 뷰.
+    후보가 1명이면 예/아니오 버튼, 여러 명이면 후보 선택 메뉴 + 아니오 버튼."""
+
+    def __init__(self, cog: "CharacterCog", candidates: List[tuple], amount: int):
+        super().__init__(timeout=constants.ACTION_VIEW_TIMEOUT)
+        self.cog = cog
+        self.candidates = candidates
+        self.amount = amount
+
+        if len(candidates) == 1:
+            yes_button = discord.ui.Button(label="예", style=discord.ButtonStyle.success)
+            yes_button.callback = self._on_yes
+            self.add_item(yes_button)
+        else:
+            select = discord.ui.Select(
+                placeholder="점수를 줄 캐릭터를 선택해주세요.",
+                options=[
+                    discord.SelectOption(label=name[:100], value=cid, description=cid)
+                    for cid, name in candidates[:SCORE_MAX_CANDIDATES]
+                ]
+            )
+            select.callback = self._on_select
+            self.add_item(select)
+
+        no_button = discord.ui.Button(label="아니오", style=discord.ButtonStyle.secondary)
+        no_button.callback = self._on_no
+        self.add_item(no_button)
+
+    async def _apply(self, interaction: discord.Interaction, discord_id: str, name: str):
+        self.stop()
+        # 즉시 버튼을 없애 중복 클릭을 막고, 시트 반영은 그 뒤에 진행
+        await interaction.response.edit_message(content=f"⏳ **{name}**에게 점수를 반영하는 중...", view=None)
+        result = await self.cog.apply_score(discord_id, self.amount, name)
+        await interaction.edit_original_response(content=result)
+
+    async def _on_yes(self, interaction: discord.Interaction):
+        discord_id, name = self.candidates[0]
+        await self._apply(interaction, discord_id, name)
+
+    async def _on_select(self, interaction: discord.Interaction):
+        discord_id = interaction.data["values"][0]  # type: ignore
+        name = next((n for cid, n in self.candidates if cid == discord_id), discord_id)
+        await self._apply(interaction, discord_id, name)
+
+    async def _on_no(self, interaction: discord.Interaction):
+        self.stop()
+        await interaction.response.edit_message(content="점수 부여를 취소했습니다.", view=None)
+
+
 class CharacterCog(commands.Cog):
     def __init__(self, bot: commands.Bot, sheet_handler: SheetsHandler):
         self.bot = bot
         self.sheet_handler = sheet_handler
         self.combat_cog = None  # CombatCog 참조 (나중에 설정됨)
+        self._score_lock = asyncio.Lock()  # 동시에 들어온 /점수가 서로의 값을 덮어쓰지 않도록
+
+    def _find_characters_by_name(self, query: str) -> List[tuple]:
+        """캐시(Characters 시트 A열=ID, B열=닉네임)에서 닉네임 검색"""
+        cache = self.sheet_handler.characters_sheet_cache
+        headers = self.sheet_handler.characters_sheet_headers
+        if len(headers) < 2 or headers[1] not in cache.columns:
+            return []
+        names = cache[headers[1]]
+        rows = [(str(cid), str(name).strip()) for cid, name in names.items() if str(name).strip()]
+        return utils.match_names(rows, query)
+
+    async def apply_score(self, discord_id: str, amount: int, name: Optional[str] = None) -> str:
+        """O열에 점수를 더하고 결과 메시지를 돌려줍니다."""
+        try:
+            async with self._score_lock:
+                result = await asyncio.to_thread(self.sheet_handler.add_score, discord_id, amount)
+        except Exception as e:
+            logger.error(f"점수 반영 중 오류: {e}", exc_info=True)
+            return f"❌ 점수 반영 중 오류가 발생했습니다.\n```{e}```"
+
+        if result is None:
+            return SCORE_NOT_FOUND_MESSAGE
+        old_value, new_value = result
+        label = f"**{name}** (`{discord_id}`)" if name else f"`{discord_id}`"
+        return f"✅ {label}에게 **{amount:+}점**을 반영했습니다. ({old_value} → {new_value})"
+
+    @app_commands.command(name="점수", description="캐릭터의 점수(Characters 시트 O열)에 점수를 더합니다.")
+    @app_commands.default_permissions(manage_roles=True)
+    @app_commands.describe(
+        대상="닉네임(일부만 입력해도 검색) 또는 디스코드 아이디(숫자)",
+        점수="더할 점수 (음수면 차감)"
+    )
+    async def 점수(self, interaction: discord.Interaction, 대상: str, 점수: int):
+        query = 대상.strip()
+        kind = utils.classify_character_query(query)
+
+        if kind is None:
+            await interaction.response.send_message(
+                "닉네임(한글/영문 포함) 또는 디스코드 아이디(숫자만)를 입력해주세요.", ephemeral=True
+            )
+            return
+
+        if kind == 'id':
+            await interaction.response.defer(ephemeral=True, thinking=True)
+            name = None
+            char_data = self.sheet_handler.get_char_data(query)
+            headers = self.sheet_handler.characters_sheet_headers
+            if char_data is not None and len(headers) >= 2 and headers[1] in char_data.index:
+                name = str(char_data[headers[1]])
+            result = await self.apply_score(query, 점수, name)
+            await interaction.followup.send(result, ephemeral=True)
+            return
+
+        # 닉네임: 캐시에서 먼저 찾고(API 호출 없음), 없을 때만 시트를 직접 읽음
+        candidates = self._find_characters_by_name(query)
+        if not candidates:
+            await interaction.response.defer(ephemeral=True, thinking=True)
+            try:
+                candidates = await asyncio.to_thread(self.sheet_handler.find_characters_by_name_in_sheet, query)
+            except Exception as e:
+                logger.error(f"시트에서 닉네임 검색 중 오류: {e}", exc_info=True)
+                candidates = []
+            if not candidates:
+                await interaction.followup.send(SCORE_NOT_FOUND_MESSAGE, ephemeral=True)
+                return
+            send = lambda **kw: interaction.followup.send(ephemeral=True, **kw)
+        else:
+            send = lambda **kw: interaction.response.send_message(ephemeral=True, **kw)
+
+        view = ScoreConfirmView(self, candidates, 점수)
+        if len(candidates) == 1:
+            cid, name = candidates[0]
+            content = f"**{name}** (`{cid}`) 이 인물이 맞나요? **{점수:+}점**을 반영합니다."
+        else:
+            content = f"'{query}'(으)로 {len(candidates)}명이 검색되었습니다. **{점수:+}점**을 줄 캐릭터를 선택해주세요."
+            if len(candidates) > SCORE_MAX_CANDIDATES:
+                content += f"\n(앞의 {SCORE_MAX_CANDIDATES}명만 표시됩니다. 더 자세히 입력해주세요.)"
+        await send(content=content, view=view)
 
     @app_commands.command(name="등록", description="새로운 캐릭터를 생성하고 시트에 등록합니다.")
-    async def register(self, interaction: discord.Interaction):
+    @app_commands.describe(도움말=help_option.HELP_OPTION_DESC)
+    async def register(self, interaction: discord.Interaction, 도움말: bool = False):
+        if await help_option.maybe_help(interaction, 도움말, help_texts.CHARACTER):
+            return
         # 중복 등록을 한 번 더 확인
         if self.sheet_handler.get_char_data(str(interaction.user.id)) is not None:
             await interaction.response.send_message("이미 등록된 캐릭터가 있습니다. 자신의 상태를 확인하려면 `/내상태`를 이용해주세요.", ephemeral=True)
@@ -152,7 +290,10 @@ class CharacterCog(commands.Cog):
         await interaction.response.send_message("직업을 선택해주세요.", view=view, ephemeral=True)        
     
     @app_commands.command(name="내상태", description="상태를 확인합니다.")
-    async def 내상태(self, interaction: discord.Interaction):
+    @app_commands.describe(도움말=help_option.HELP_OPTION_DESC)
+    async def 내상태(self, interaction: discord.Interaction, 도움말: bool = False):
+        if await help_option.maybe_help(interaction, 도움말, help_texts.CHARACTER):
+            return
         await interaction.response.defer(ephemeral=True)
         user_id = str(interaction.user.id)
         char_data = self.sheet_handler.get_char_data(user_id)
@@ -206,7 +347,8 @@ class CharacterCog(commands.Cog):
     @app_commands.command(name="스탯분배", description="남은 보너스 포인트를 스탯에 투자합니다.")
     @app_commands.describe(
         stat="포인트를 투자할 스탯을 선택하세요.",
-        points="투자할 포인트의 양을 입력하세요."
+        points="투자할 포인트의 양을 입력하세요.",
+        도움말=help_option.HELP_OPTION_DESC,
     )
     @app_commands.choices(stat=[
         app_commands.Choice(name="근력", value="근력"),
@@ -215,7 +357,11 @@ class CharacterCog(commands.Cog):
         app_commands.Choice(name="매력", value="매력"),
         app_commands.Choice(name="리셋", value="리셋"),
     ])
-    async def distribute_stats(self, interaction: discord.Interaction, stat: app_commands.Choice[str], points: int):
+    async def distribute_stats(self, interaction: discord.Interaction, stat: Optional[app_commands.Choice[str]] = None, points: Optional[int] = None, 도움말: bool = False):
+        if await help_option.maybe_help(interaction, 도움말, help_texts.CHARACTER):
+            return
+        if not await help_option.require(interaction, stat=stat, points=points):
+            return
         await interaction.response.defer(ephemeral=True)
         user_id = str(interaction.user.id)
 
@@ -363,11 +509,16 @@ class CharacterCog(commands.Cog):
         await interaction.followup.send(embed=embed, ephemeral=True)
 
     @app_commands.command(name="시트갱신", description="구글 시트와 봇의 캐시를 강제로 동기화합니다.")
+    @app_commands.describe(option="동기화 방향", 도움말=help_option.HELP_OPTION_DESC)
     @app_commands.choices(option=[
         app_commands.Choice(name="구글시트 -> 봇 캐시 (g2cache)", value="g2cache"),
         app_commands.Choice(name="봇 캐시 -> 구글시트 (cache2g)", value="cache2g"),
     ])
-    async def sync_sheet(self, interaction: discord.Interaction, option: app_commands.Choice[str]):
+    async def sync_sheet(self, interaction: discord.Interaction, option: Optional[app_commands.Choice[str]] = None, 도움말: bool = False):
+        if await help_option.maybe_help(interaction, 도움말, help_texts.SHEET):
+            return
+        if not await help_option.require(interaction, option=option):
+            return
         await interaction.response.defer(ephemeral=True)
 
         if option.value == "g2cache":
@@ -426,7 +577,10 @@ class CharacterCog(commands.Cog):
                 await interaction.followup.send(f"❌ 전투 캐시 동기화 중 오류가 발생했습니다: {e}", ephemeral=True)
 
     @app_commands.command(name="마테리아목록", description="소유한 마테리아 목록을 확인합니다.")
-    async def 마테리아목록(self, interaction: discord.Interaction):
+    @app_commands.describe(도움말=help_option.HELP_OPTION_DESC)
+    async def 마테리아목록(self, interaction: discord.Interaction, 도움말: bool = False):
+        if await help_option.maybe_help(interaction, 도움말, help_texts.MATERIA):
+            return
         await interaction.response.defer(ephemeral=True)
         user_id = str(interaction.user.id)
         char_data = self.sheet_handler.get_char_data(user_id)
@@ -459,10 +613,13 @@ class CharacterCog(commands.Cog):
         await interaction.followup.send(embed=embed, ephemeral=True)
 
     @app_commands.command(name="마테리아", description="마테리아를 장착하거나 해제합니다.")
-    async def materia(self, interaction: discord.Interaction):
+    @app_commands.describe(도움말=help_option.HELP_OPTION_DESC)
+    async def materia(self, interaction: discord.Interaction, 도움말: bool = False):
         """통합 마테리아 관리 명령어: 장착/해제 선택 후 처리"""
         from view import MateriaActionView, MateriaSelectView
 
+        if await help_option.maybe_help(interaction, 도움말, help_texts.MATERIA):
+            return
         await interaction.response.defer(ephemeral=True)
         user_id = str(interaction.user.id)
         char_data = self.sheet_handler.get_char_data(user_id)
@@ -792,13 +949,56 @@ class CharacterCog(commands.Cog):
         # 요약 정보
         summary = f"총 {len(players_info)}명의 플레이어, {len(monsters_info)}개의 몬스터"
         embed.set_footer(text=summary)
-        
+
+        await interaction.followup.send(embed=embed, ephemeral=True)
+
+    @app_commands.command(name="서버원등록", description="[관리자] 이 서버의 모든 멤버를 Characters 시트에 ID·닉네임만 등록합니다.")
+    @app_commands.default_permissions(manage_roles=True)
+    @app_commands.guild_only()
+    async def register_guild_members(self, interaction: discord.Interaction):
+        await interaction.response.defer(ephemeral=True, thinking=True)
+        guild = interaction.guild
+
+        try:
+            if not guild.chunked:
+                await guild.chunk()
+        except discord.HTTPException as e:
+            logger.warning(f"길드 멤버 청크 요청 실패: {e}")
+
+        # 봇 계정은 제외, 닉네임은 서버 별명 > 전역 이름 > 사용자명 순
+        members = [(str(m.id), m.display_name) for m in guild.members if not m.bot]
+        if not members:
+            await interaction.followup.send("❌ 멤버 목록을 가져오지 못했습니다. 봇의 서버 멤버 인텐트를 확인해주세요.", ephemeral=True)
+            return
+
+        try:
+            added, skipped = await asyncio.to_thread(self.sheet_handler.register_members_basic, members)
+        except Exception as e:
+            logger.error(f"서버 멤버 일괄 등록 중 오류: {e}", exc_info=True)
+            await interaction.followup.send(f"❌ 시트 등록 중 오류가 발생했습니다.\n```{e}```", ephemeral=True)
+            return
+
+        embed = discord.Embed(
+            title="📋 서버 멤버 일괄 등록",
+            description=f"**{guild.name}** 멤버 {len(members)}명 중 **{len(added)}명** 추가, {skipped}명은 이미 등록되어 건너뛰었습니다.",
+            color=discord.Color.green() if added else discord.Color.light_grey()
+        )
+        if added:
+            lines = [f"{name} (`{cid}`)" for cid, name in added]
+            text = ""
+            for i, line in enumerate(lines):
+                if len(text) + len(line) + 1 > 1000:
+                    text += f"… 외 {len(lines) - i}명"
+                    break
+                text += line + "\n"
+            embed.add_field(name="추가된 멤버", value=text, inline=False)
         await interaction.followup.send(embed=embed, ephemeral=True)
 
     @app_commands.command(name="캐시확인", description="현재 봇 메모리에 저장된 캐시 데이터를 확인합니다.")
     @app_commands.describe(
         sheet_name="확인할 시트",
-        user_id="특정 사용자 ID (선택사항)"
+        user_id="특정 사용자 ID (선택사항)",
+        도움말=help_option.HELP_OPTION_DESC,
     )
     @app_commands.choices(sheet_name=[
         app_commands.Choice(name="캐릭터 (Characters)", value="characters"),
@@ -808,8 +1008,12 @@ class CharacterCog(commands.Cog):
         app_commands.Choice(name="전투 상태 (Combat_Status)", value="combat"),
         app_commands.Choice(name="음악 (Musics)", value="music"),
     ])
-    async def check_cache(self, interaction: discord.Interaction, sheet_name: app_commands.Choice[str], user_id: str = None):
+    async def check_cache(self, interaction: discord.Interaction, sheet_name: Optional[app_commands.Choice[str]] = None, user_id: str = None, 도움말: bool = False):
         """현재 캐시 상태를 확인합니다."""
+        if await help_option.maybe_help(interaction, 도움말, help_texts.SHEET):
+            return
+        if not await help_option.require(interaction, sheet_name=sheet_name):
+            return
         await interaction.response.defer(ephemeral=True)
         
         cache_map = {
@@ -911,14 +1115,17 @@ class CharacterCog(commands.Cog):
         await interaction.followup.send(embed=embed, ephemeral=True)
 
     @app_commands.command(name="스탯주사위", description="자신의 캐릭터의 스탯을 조회하여 주사위를 굴립니다.")
+    @app_commands.describe(option="굴릴 스탯 (비우면 전체)", 도움말=help_option.HELP_OPTION_DESC)
     @app_commands.choices(option=[
         app_commands.Choice(name="근력", value="physics"),
         app_commands.Choice(name="마법", value="magic"),
         app_commands.Choice(name="민첩", value="agility"),
         app_commands.Choice(name="매력", value="charm"),
     ])
-    async def stat_die(self, interaction: discord.Interaction, option: app_commands.Choice[str] = None):
+    async def stat_die(self, interaction: discord.Interaction, option: app_commands.Choice[str] = None, 도움말: bool = False):
         """캐릭터의 스탯을 조회하여 주사위를 굴림(dnd)"""
+        if await help_option.maybe_help(interaction, 도움말, help_texts.CHARACTER):
+            return
         await interaction.response.defer(ephemeral=False)
         
         user_name = interaction.user.display_name
@@ -970,8 +1177,11 @@ class CharacterCog(commands.Cog):
         await interaction.followup.send(embed=embed, ephemeral=False)
 
     @app_commands.command(name="리셋", description="자신의 캐릭터 정보를 완전히 삭제합니다.")
-    async def reset_character(self, interaction: discord.Interaction):
+    @app_commands.describe(도움말=help_option.HELP_OPTION_DESC)
+    async def reset_character(self, interaction: discord.Interaction, 도움말: bool = False):
         """캐릭터 정보를 시트와 캐시에서 완전히 삭제"""
+        if await help_option.maybe_help(interaction, 도움말, help_texts.CHARACTER):
+            return
         user_id = str(interaction.user.id)
 
         # 1. 캐릭터 존재 확인

@@ -8,7 +8,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 python main.py
 ```
 
-There is no `requirements.txt`, linter, or CI. Install dependencies by hand:
+There is no linter or CI. Install dependencies with `pip install -r requirements.txt`:
 `discord.py` (2.x), `python-dotenv`, `gspread`, `oauth2client`, `pandas`, `numpy`, `pytz`, `google-genai` (for `summary.py` and the fugitive debug auto-play; needs `httpx` ≥ 0.24 on Python 3.13), and optionally `Pillow` (fugitive image renderer). Python 3.11+.
 
 ```bash
@@ -27,7 +27,7 @@ python -m fugitive.sim --all --games 400  # Monte Carlo pacing check, or --hunte
 - `FUGITIVE_CONTROL_GUILD_ID`, `FUGITIVE_ADMIN_IDS` — control server and admin allowlist for the fugitive minigame; without them its admin commands are not registered
 - `FUGITIVE_FONT_PATH` — optional CJK font for the fugitive PNG renderer
 - `MOGINDEX_READ_CACHE_KIB` (default 65536), `MOGINDEX_READ_MMAP_MIB` (default 256) — SQLite page cache / mmap for the search read connection. `MogIndexService.index_open()` keeps one read-only (`query_only`) connection per thread and reopens it if the DB file's inode changes or a query raises; anything that writes to the index DB must use `index_connect()` instead. `mogindex_backfill.py` runs `ANALYZE` before `VACUUM INTO` so the deployed file carries planner stats, and each batch run ends with `PRAGMA optimize`.
-- `MOGINDEX_RETURNEE_MAX_DAYS` (default 180), `MOGINDEX_RETURNEE_CACHE_TTL_SEC` (default 600) — 복귀자 키워드 aggregates `daily_terms` over the period since the user's last worldmap message (cost grows with the period: measured 1.3 s for the full history, 0.03 s for 90 days), so users with no activity or a longer absence are capped to the last N days (the header says so), and the top-500 term list is cached per (period, scope) so paging, exclusions (`add_not_terms`, applied in Python) and the pick menu never re-aggregate. Keyword search with all three fields empty, or the `둘러보기` button, switches to the `recent` browse mode; the returnee page carries a `Select` (`TextPage.options`) whose pick runs a keyword search restricted to the returnee period (`apply_action("returnee_pick")`).
+- `MOGINDEX_RETURNEE_MAX_DAYS` (default 180), `MOGINDEX_RETURNEE_CACHE_TTL_SEC` (default 600) — 복귀자 키워드 aggregates `daily_terms` over the period since the user's last worldmap message (cost grows with the period: measured 1.3 s for the full history, 0.03 s for 90 days), so users with no activity or a longer absence are capped to the last N days (the header says so), and the top-500 term list is cached per (period, scope) so paging, exclusions (`add_not_terms`, applied in Python) and the pick menu never re-aggregate. Keyword search with all three fields empty, or the `둘러보기` button, switches to the `recent` browse mode; the returnee page carries a `Select` (`TextPage.options`) whose pick runs a keyword search restricted to the period the list was rendered with (`SearchPanelState.returnee_start/returnee_end`, `apply_action("returnee_pick")`); with more than 25 terms the menu shows 24 at a time and the 25th option (`TextPage.pick_more`, value `RETURNEE_PICK_MORE`) advances `returnee_pick_page` to the next chunk, wrapping to the first. The term cache key includes the index DB file identity, so a replaced deploy file misses the cache immediately.
 
 **Credential file:** `dogwood-method-448216-f4-4023cd31106c.json` (Google service account) must sit in the repo root; `SheetsHandler.__init__` raises if it is missing. Both it and `.env` are gitignored.
 
@@ -69,6 +69,8 @@ Conventions that matter:
 ### Cogs
 
 Each Cog receives `bot` and reads `bot.sheet_handler`. Slash commands are declared with `@app_commands.command(name="한글이름", ...)`; admin-only ones use `@app_commands.default_permissions(...)`. There is no user-ID allowlist anywhere yet.
+
+**Help convention:** there are no standalone help commands. Every non-admin command (not `/추적기 *`, `/도주 *`, or `[관리자]`/`[개발자]` ones) takes a trailing `도움말: bool = False` option and starts with `if await help_option.maybe_help(interaction, 도움말, extra): return`, which answers ephemerally with help auto-rendered from the command's description and `@app_commands.describe` texts (`help_option.render_help`) plus a family summary from `help_texts.py` (or `fugitive/strings.py` `HELP`). Because Discord cannot send `도움말:True` alone when other options are required, none of these commands has a required option; formerly required ones are `Optional[...] = None` and checked with `help_option.require(interaction, name=value)` right after the help guard. `tests/test_help_option.py` enforces both rules, so a new public command must follow the pattern.
 
 | File | Purpose |
 |---|---|

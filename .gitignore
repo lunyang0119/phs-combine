@@ -16,3 +16,8 @@ combat/편집충돌_서버___init__.py
 mogindex/
 combat/__pycache__/
 combat/__pycache__/*.pyc
+combat/__pycache__/battle_manager.cpython-313.pyc
+combat/__pycache__/battle_manager.cpython-313.pyc
+combat/__pycache__/*
+combat/__pycache__/battle_manager.cpython-313.pyc
+combat/__pycache__/boss_skill_system.cpython-313.pyc

@@ -13,6 +13,8 @@ import logging
 import asyncio
 from google_sheets_handler import SheetsHandler
 from view import ChannelSelectView
+from typing import Optional
+import help_option
 
 logger = logging.getLogger(__name__)
 
@@ -28,8 +30,10 @@ class UtilityCommandsCog(commands.Cog):
     # ==================== 주사위 명령어 ====================
 
     @app_commands.command(name="주사위", description="원하는 주사위를 출력합니다. 예시: 1d20 -> 20면체 주사위 하나")
-    @app_commands.describe(dice="주사위 표기법 (예: 1d20, 3d6)")
-    async def custom_dice(self, interaction: discord.Interaction, dice: str = "1d20"):
+    @app_commands.describe(dice="주사위 표기법 (예: 1d20, 3d6)", 도움말=help_option.HELP_OPTION_DESC)
+    async def custom_dice(self, interaction: discord.Interaction, dice: str = "1d20", 도움말: bool = False):
+        if await help_option.maybe_help(interaction, 도움말):
+            return
         # 주사위 표기법 파싱 (예: "1d20" -> amount=1, sides=20)
         try:
             dice = dice.lower().strip()
@@ -96,7 +100,10 @@ class UtilityCommandsCog(commands.Cog):
     # ==================== 행동 판정 명령어 ====================
 
     @app_commands.command(name="행동", description="효과가 없다 / 있다의 결과가 나오는 1d2 주사위를 굴립니다.")
-    async def action(self, interaction: discord.Interaction):
+    @app_commands.describe(도움말=help_option.HELP_OPTION_DESC)
+    async def action(self, interaction: discord.Interaction, 도움말: bool = False):
+        if await help_option.maybe_help(interaction, 도움말):
+            return
         result = random_utils.choice(["효과가 있어보여 쿠뽀!", "아무 일도 일어나지지 않았어 쿠뽀...."])
         embed = discord.Embed(
             title=f"{interaction.user.display_name}이(가) 행동했어, 쿠뽀!",
@@ -106,8 +113,10 @@ class UtilityCommandsCog(commands.Cog):
         await interaction.response.send_message(embed=embed)
 
     @app_commands.command(name="일반행동", description="일반 행동을 수행합니다.")
-    @app_commands.describe(option="응답에서 하나만 무작위로 선택할지 여부 (y: 하나만 선택, n: 전체 문자열; 기본값은 n)")
-    async def general_action(self, interaction: discord.Interaction, option: str = "n"):
+    @app_commands.describe(option="응답에서 하나만 무작위로 선택할지 여부 (y: 하나만 선택, n: 전체 문자열; 기본값은 n)", 도움말=help_option.HELP_OPTION_DESC)
+    async def general_action(self, interaction: discord.Interaction, option: str = "n", 도움말: bool = False):
+        if await help_option.maybe_help(interaction, 도움말):
+            return
         roll = random_utils.randint(1, 10)
         responses = {
             1: "기대보다 효과적이었다 / 사람이 더 필요하다 / 사라졌다",
@@ -136,8 +145,10 @@ class UtilityCommandsCog(commands.Cog):
         await interaction.response.send_message(embed=embed)
 
     @app_commands.command(name="전투행동", description="전투 행동을 수행합니다.")
-    @app_commands.describe(option="응답에서 하나만 무작위로 선택할지 여부 (y: 하나만 선택, n: 전체 문자열; 기본값은 n)")
-    async def combat_action(self, interaction: discord.Interaction, option: str = "n"):
+    @app_commands.describe(option="응답에서 하나만 무작위로 선택할지 여부 (y: 하나만 선택, n: 전체 문자열; 기본값은 n)", 도움말=help_option.HELP_OPTION_DESC)
+    async def combat_action(self, interaction: discord.Interaction, option: str = "n", 도움말: bool = False):
+        if await help_option.maybe_help(interaction, 도움말):
+            return
         roll = random_utils.randint(1, 10)
         responses = {
             1: "적중했다 / 숨겼다 / 떨어졌다",
@@ -166,8 +177,10 @@ class UtilityCommandsCog(commands.Cog):
         await interaction.response.send_message(embed=embed)
 
     @app_commands.command(name="대인행동", description="대인행동을 수행합니다.")
-    @app_commands.describe(option="응답에서 하나만 무작위로 선택할지 여부 (y: 하나만 선택, n: 전체 문자열; 기본값은 n)")
-    async def interpersonal_action(self, interaction: discord.Interaction, option: str = "n"):
+    @app_commands.describe(option="응답에서 하나만 무작위로 선택할지 여부 (y: 하나만 선택, n: 전체 문자열; 기본값은 n)", 도움말=help_option.HELP_OPTION_DESC)
+    async def interpersonal_action(self, interaction: discord.Interaction, option: str = "n", 도움말: bool = False):
+        if await help_option.maybe_help(interaction, 도움말):
+            return
         roll = random_utils.randint(1, 10)
         responses = {
             1: "협력한다 / 애원한다 / 웃는다",
@@ -198,7 +211,10 @@ class UtilityCommandsCog(commands.Cog):
     # ==================== 책찾기 명령어 ====================
 
     @app_commands.command(name="책찾기", description="랜덤 책을 뽑습니다.")
-    async def book_search(self, interaction: discord.Interaction):
+    @app_commands.describe(도움말=help_option.HELP_OPTION_DESC)
+    async def book_search(self, interaction: discord.Interaction, 도움말: bool = False):
+        if await help_option.maybe_help(interaction, 도움말):
+            return
         display_name = interaction.user.display_name
         roll = random_utils.randint(1, 10)
         responses = {
@@ -233,7 +249,10 @@ class UtilityCommandsCog(commands.Cog):
     # ==================== 낚시 명령어 ====================
 
     @app_commands.command(name="낚시", description="낚시를 위한 명령어입니다.")
-    async def fishing(self, interaction: discord.Interaction):
+    @app_commands.describe(도움말=help_option.HELP_OPTION_DESC)
+    async def fishing(self, interaction: discord.Interaction, 도움말: bool = False):
+        if await help_option.maybe_help(interaction, 도움말):
+            return
         view = FishingView(self.sheet_handler)
         embed = discord.Embed(
             title="🎣 낚시터 선택",
@@ -245,7 +264,10 @@ class UtilityCommandsCog(commands.Cog):
     # ==================== 보존서고 명령어 ====================
 
     @app_commands.command(name="보존서고", description="위험한 책이 가득한 보존서고에서 책을 뽑을 수 있는 명령어.")
-    async def forbidden_library(self, interaction: discord.Interaction):
+    @app_commands.describe(도움말=help_option.HELP_OPTION_DESC)
+    async def forbidden_library(self, interaction: discord.Interaction, 도움말: bool = False):
+        if await help_option.maybe_help(interaction, 도움말):
+            return
         view = ForbiddenView(self.sheet_handler)
         embed = discord.Embed(
             title="📕 보존서고",
@@ -255,7 +277,10 @@ class UtilityCommandsCog(commands.Cog):
         await interaction.response.send_message(embed=embed, view=view, ephemeral=True)
 
     @app_commands.command(name="보존서고책찾기", description="보존서고에서 원하는 책을 찾을 수 있는 기능")
-    async def forbidden_library_cheat(self, interaction: discord.Interaction):
+    @app_commands.describe(도움말=help_option.HELP_OPTION_DESC)
+    async def forbidden_library_cheat(self, interaction: discord.Interaction, 도움말: bool = False):
+        if await help_option.maybe_help(interaction, 도움말):
+            return
         view = ForbiddenCheatView()
         embed = discord.Embed(
             title="📕 보존서고",
@@ -267,7 +292,10 @@ class UtilityCommandsCog(commands.Cog):
     # ==================== 연회 명령어 ====================
 
     @app_commands.command(name="연회", description="무도회를 위한 명령어입니다.")
-    async def dancing(self, interaction: discord.Interaction):
+    @app_commands.describe(도움말=help_option.HELP_OPTION_DESC)
+    async def dancing(self, interaction: discord.Interaction, 도움말: bool = False):
+        if await help_option.maybe_help(interaction, 도움말):
+            return
         view = DancingView(self.sheet_handler)
         embed = discord.Embed(
             title="🩰 연회 옷차림",
@@ -279,8 +307,12 @@ class UtilityCommandsCog(commands.Cog):
     # ==================== 랜덤 선택 명령어 ====================
 
     @app_commands.command(name="골라", description="공백으로 구분된 선택지 중 하나를 랜덤으로 골라줍니다")
-    @app_commands.describe(choices="선택지들을 공백으로 구분하여 입력 (예: 짜장 짬뽕)")
-    async def random_choice(self, interaction: discord.Interaction, choices: str):
+    @app_commands.describe(choices="선택지들을 공백으로 구분하여 입력 (예: 짜장 짬뽕)", 도움말=help_option.HELP_OPTION_DESC)
+    async def random_choice(self, interaction: discord.Interaction, choices: Optional[str] = None, 도움말: bool = False):
+        if await help_option.maybe_help(interaction, 도움말):
+            return
+        if not await help_option.require(interaction, choices=choices):
+            return
         # 공백으로 분리
         options = choices.split()
 
@@ -311,9 +343,13 @@ class UtilityCommandsCog(commands.Cog):
     # ==================== 채널 추가 명령어 ====================
 
     @app_commands.command(name="채널추가", description="현재 채널을 ServerChannel 시트에 등록합니다.")
-    @app_commands.describe(이름="채널의 표시 이름 (예: 일반, 공지)")
-    async def add_channel(self, interaction: discord.Interaction, 이름: str):
+    @app_commands.describe(이름="채널의 표시 이름 (예: 일반, 공지)", 도움말=help_option.HELP_OPTION_DESC)
+    async def add_channel(self, interaction: discord.Interaction, 이름: Optional[str] = None, 도움말: bool = False):
         """현재 채널/스레드 정보를 ServerChannel 시트에 추가"""
+        if await help_option.maybe_help(interaction, 도움말):
+            return
+        if not await help_option.require(interaction, 이름=이름):
+            return
         try:
             # 현재 채널/스레드 정보 수집
             channel = interaction.channel
@@ -384,9 +420,13 @@ class UtilityCommandsCog(commands.Cog):
     # ==================== 채널 메시지 전송 명령어 ====================
 
     @app_commands.command(name="챗", description="지정한 채널에 메시지를 전송합니다.")
-    @app_commands.describe(메세지="전송할 메시지 내용")
-    async def 챗(self, interaction: discord.Interaction, 메세지: str):
+    @app_commands.describe(메세지="전송할 메시지 내용", 도움말=help_option.HELP_OPTION_DESC)
+    async def 챗(self, interaction: discord.Interaction, 메세지: Optional[str] = None, 도움말: bool = False):
         """ServerChannel 시트에서 채널을 선택하여 메시지 전송"""
+        if await help_option.maybe_help(interaction, 도움말):
+            return
+        if not await help_option.require(interaction, 메세지=메세지):
+            return
         # 1. ServerChannel 시트에서 채널 목록 가져오기
         try:
             all_channels = await asyncio.to_thread(
@@ -474,8 +514,11 @@ class UtilityCommandsCog(commands.Cog):
     # ==================== DMW 명령어 (전투 외 실행) ====================
 
     @app_commands.command(name="dmw", description="전투 외에 DMW (Digital Mind Wave)를 실행합니다. 버프 효과는 없습니다.")
-    async def dmw_standalone(self, interaction: discord.Interaction):
+    @app_commands.describe(도움말=help_option.HELP_OPTION_DESC)
+    async def dmw_standalone(self, interaction: discord.Interaction, 도움말: bool = False):
         """전투 외 DMW 실행 (연출만, 버프 없음)"""
+        if await help_option.maybe_help(interaction, 도움말):
+            return
         user_id = str(interaction.user.id)
 
         # 캐릭터 존재 여부 확인

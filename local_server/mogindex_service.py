@@ -119,6 +119,9 @@ class SearchPanelState:
     last_result_ids: list[int] = field(default_factory=list)
     base_result_ids: list[int] = field(default_factory=list)
     returnee_limit: int = 5
+    returnee_start: str | None = None      # 마지막으로 그린 복귀자 목록의 기간 — 단어 선택 검색은 이 기간을 그대로 쓴다
+    returnee_end: str | None = None
+    returnee_pick_page: int = 0            # 복귀자 단어 선택 메뉴의 묶음 번호 (24개씩)
     worldmap_category_ids: list[str] = field(default_factory=list)
     created_at: str = ""
     updated_at: str = ""
@@ -186,6 +189,7 @@ class TextPage:
     total: int
     empty_message: str = "색인된 결과가 없습니다."
     options: list[str] = field(default_factory=list)   # 복귀자 키워드: 바로 검색할 수 있는 단어 목록 (Select 용)
+    pick_more: str | None = None                        # 목록이 한 메뉴에 다 안 들어갈 때 마지막 칸에 넣는 '여기 없음' 라벨
 
     @property
     def has_previous(self) -> bool:
@@ -767,6 +771,9 @@ class MogIndexService:
         state.parent_session_id = None
         state.panel_kind = "main"
         state.returnee_limit = 5
+        state.returnee_start = None
+        state.returnee_end = None
+        state.returnee_pick_page = 0
         return state
 
     def set_date_preset(self, state: SearchPanelState, preset: DatePreset) -> SearchPanelState:
@@ -845,6 +852,7 @@ class MogIndexService:
             merged = list(dict.fromkeys(split_query_parts(state.keyword_not) + new_parts))
             state.keyword_not = " ".join(merged)
         state.page = 0
+        state.returnee_pick_page = 0
         return state
 
     def create_detail_session(self, parent: SearchPanelState, *, persist: bool = True) -> SearchPanelState:
@@ -1261,6 +1269,9 @@ class MogIndexService:
                 ).fetchone()
                 last_seen = row["last_seen"] if row else None
         start = (date.fromisoformat(last_seen) + timedelta(days=1)).isoformat() if last_seen else RETURNEE_DEFAULT_START_DATE
+        if start > today:
+            # 오늘 이미 월드맵에 글을 썼으면 '다음 날' 이 내일이 된다 — 기간은 오늘 하루로 둔다
+            start = today
         capped = False
         if RETURNEE_MAX_DAYS > 0:
             floor = (today_d - timedelta(days=RETURNEE_MAX_DAYS)).isoformat()
@@ -1270,7 +1281,9 @@ class MogIndexService:
 
     def _returnee_terms(self, state: SearchPanelState, start: str, today: str) -> list[tuple[str, int]]:
         """기간·범위별 상위 색인어 집계. 제외어는 여기서 적용하지 않고(캐시 공유) 호출 쪽에서 거른다."""
-        key = (start, today, state.source_scope, tuple(scope_source_ids(state)), tuple(scope_category_ids(state)),
+        # DB 파일이 교체되면(배포 파일 갱신) 키가 달라져 TTL 이 남아 있어도 다시 집계한다
+        key = (self._file_identity(self.index_db_path), start, today, state.source_scope,
+               tuple(scope_source_ids(state)), tuple(scope_category_ids(state)),
                state.origin_category_id, state.origin_parent_channel_id, state.origin_channel_id)
         now = time.monotonic()
         with self._returnee_cache_lock:
@@ -1332,13 +1345,15 @@ class MogIndexService:
             header.append(f"제외: {', '.join(not_parts)}")
         state.last_result_kind = "returnee"
         state.last_result_ids = []
+        state.returnee_start = start
+        state.returnee_end = today
         page = self._slice_lines(
             "복귀자 키워드",
             header + lines if lines else [],
             state,
             "복귀자 키워드로 표시할 색인어가 없습니다." + (" 제외 키워드를 비우려면 '빼고 싶은 키워드'를 빈칸으로 제출하세요." if not_parts else ""),
         )
-        page.options = [term for term, _ in terms[:RETURNEE_PICK_OPTIONS]]
+        page.options, page.pick_more = self._returnee_pick_chunk(state, [term for term, _ in terms])
         logger.info(
             "mogindex returnee session=%s user=%s start=%s end=%s scope=%s total=%s page=%s",
             state.session_id,
@@ -1350,6 +1365,28 @@ class MogIndexService:
             page.page,
         )
         return page
+
+    @staticmethod
+    def _returnee_pick_chunk(state: SearchPanelState, pick_terms: list[str]) -> tuple[list[str], str | None]:
+        """Select 는 옵션이 25개까지라, 단어가 더 많으면 24개씩 묶고 25번째 칸을 '여기 없음' 으로 쓴다.
+
+        state.returnee_pick_page 가 현재 묶음이고, 묶음 수를 넘으면 처음으로 돌아간다.
+        반환: (이번 묶음의 단어, '여기 없음' 라벨 또는 None)
+        """
+        total = len(pick_terms)
+        if total <= RETURNEE_PICK_OPTIONS:
+            state.returnee_pick_page = 0
+            return pick_terms, None
+        per = RETURNEE_PICK_OPTIONS - 1
+        chunks = (total + per - 1) // per
+        idx = state.returnee_pick_page % chunks
+        state.returnee_pick_page = idx
+        nxt = (idx + 1) % chunks
+        if nxt == 0:
+            more = f"여기 없음 → 처음 단어로 (1~{per}번)"
+        else:
+            more = f"여기 없음 → 다음 단어 보기 ({nxt * per + 1}~{min((nxt + 1) * per, total)}번)"
+        return pick_terms[idx * per:(idx + 1) * per], more
 
     def run_topic_search(self, state: SearchPanelState) -> TextPage:
         query = normalize_text(state.query or "")

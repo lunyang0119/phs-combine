@@ -149,3 +149,25 @@ def get_korean_particle(word: str, particle_batchim: str, particle_no_batchim: s
 
 def ends_with_hangul(word: str) -> bool:
     return bool(word) and '가' <= word[-1] <= '힣'
+
+
+def classify_character_query(query: str) -> str | None:
+    """점수 명령어 입력 구분: 숫자로만 이루어지면 'id', 한글/영문이 있으면 'name', 둘 다 아니면 None"""
+    query = query.strip()
+    if re.fullmatch(r'[0-9]+', query):
+        return 'id'
+    if re.search(r'[가-힣ㄱ-ㅎㅏ-ㅣA-Za-z]', query):
+        return 'name'
+    return None
+
+
+def match_names(rows, query: str) -> list:
+    """(discord_id, name) 목록에서 닉네임 부분 일치 검색(대소문자·공백 무시). 이름이 완전히 같은 캐릭터를 앞에 둡니다."""
+    def norm(s):
+        return re.sub(r'\s+', '', str(s)).casefold()
+
+    q = norm(query)
+    if not q:
+        return []
+    matches = [(cid, name) for cid, name in rows if q in norm(name)]
+    return sorted(matches, key=lambda row: norm(row[1]) != q)
