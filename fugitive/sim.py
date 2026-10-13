@@ -211,6 +211,8 @@ def play(hunters: int, style: str, rng: random.Random, map_id: Optional[str] = N
     st = E.new_game(gmap, c, [(str(i), f"h{i}") for i in range(hunters)], rng=rng)
     brain = HunterBrain(gmap, list(st.hunters))
     brain.candidates = set(gmap.rooms)
+    extra = {"hide_casts": 0, "hide_saves": 0}     # 은신 사용 횟수 / 은신 덕에 같은 방 조우가 체포 판정으로 가지 않은 라운드 수
+    contact = str(c.get("capture_mode", "contact")) == "contact"
     while st.status != E.CAPTURED:
         mv, hk, tg = fugitive_order(st, style, rng)
         try:
@@ -220,32 +222,42 @@ def play(hunters: int, style: str, rng: random.Random, map_id: Optional[str] = N
         for uid, (t, tgt) in brain.orders(st, rng).items():
             E.submit_hunter_order(st, uid, t, tgt)
         rep = E.resolve_round(st, rng)
+        entry = st.log[-1]
+        if "퀵핵 hide" in entry["hidden_events"]:
+            extra["hide_casts"] += 1
+        if (contact and st.status != E.CAPTURED and st.fugitive.hidden_until >= entry["round"]
+                and any(h["room"] == st.fugitive.room for h in rep["hunters"].values())):
+            extra["hide_saves"] += 1
         brain.observe(st, rep)
         if st.round_no > 200:
             break
-    return len(st.log), st.capture_how, st.fugitive.frozen, st.fugitive.trace
+    return len(st.log), st.capture_how, st.fugitive.frozen, st.fugitive.trace, extra
 
 
 def run(hunters: int, games: int, seed: int, style: str, map_id=None, overrides=None, scaling=None) -> Dict:
     rng = random.Random(seed)
-    rounds, hows, frozen, traces = [], Counter(), 0, []
+    rounds, hows, frozen, traces, extra = [], Counter(), 0, [], Counter()
     for _ in range(games):
-        n, how, fz, tr = play(hunters, style, rng, map_id, overrides, scaling)
+        n, how, fz, tr, ex = play(hunters, style, rng, map_id, overrides, scaling)
         rounds.append(n)
         hows[how] += 1
         frozen += fz
         traces.append(tr)
+        extra.update(ex)
     rounds.sort()
     q = lambda p: rounds[min(len(rounds) - 1, int(p * len(rounds)))]
     return {"hunters": hunters, "style": style, "games": games,
             "p10": q(0.1), "p25": q(0.25), "p50": statistics.median(rounds), "p75": q(0.75), "p90": q(0.9),
             "mean": round(statistics.mean(rounds), 1), "how": dict(hows),
             "frozen": frozen, "frozen_pct": round(100 * frozen / games, 1),      # 동결 뒤에 끝난 비율
-            "trace_mean": round(statistics.mean(traces), 1)}                      # 체포 시점 평균 추적률
+            "trace_mean": round(statistics.mean(traces), 1),                      # 체포 시점 평균 추적률
+            "hide_casts": extra["hide_casts"], "hide_saves": extra["hide_saves"]}  # contact 모드: 은신이 같은 방 판정을 막은 횟수
 
 
 def format_row(r: Dict) -> str:
     how = " ".join(f"{k}={v}" for k, v in sorted(r["how"].items(), key=lambda kv: -kv[1]))
+    if r.get("hide_casts"):
+        how += f"  hide {r['hide_saves']}/{r['hide_casts']}"
     return (f"{r['hunters']:>2} {r['style']:>7} {r['p25']:>4} {r['p50']:>5} {r['p75']:>4} {r['mean']:>5} "
             f"{r['frozen_pct']:>6.1f} {r['trace_mean']:>6.1f}  {how}")
 

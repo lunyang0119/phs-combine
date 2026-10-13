@@ -272,6 +272,7 @@ hide_cost=4 hide_trace=20 hide_duration=2
 overload_cost=2 overload_trace=15 overload_daze_rounds=1
 render_mode=text            # image = PNG via Pillow when a CJK font is available
 hunter_spawn_rooms=auto  fugitive_start=auto
+vote_skip_after_sec=600     # server-side policy for the web port (skip-vote on non-submitters); the engine ignores it
 lockdown_enabled=false lockdown_start=8 lockdown_every=3   # TODO, not implemented (§11-8)
 ```
 

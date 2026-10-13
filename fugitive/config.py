@@ -70,6 +70,8 @@ DEFAULTS: Dict[str, Any] = {
     # 배치
     "hunter_spawn_rooms": "auto",
     "fugitive_start": "auto",
+    # 서버 정책 (엔진은 읽지 않는다): 웹 포트에서 미제출자를 건너뛰는 투표를 열 수 있게 되는 시점(초)
+    "vote_skip_after_sec": 600,
     # 추후 과제(§11-8): 격리 프로토콜
     "lockdown_enabled": False,
     "lockdown_start": 8,

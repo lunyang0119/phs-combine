@@ -366,6 +366,17 @@ def test_config_coerce():
     assert mid == "car2077_16" and c["scan_budget"] == 2
 
 
+def test_scaling_row_passes_capture_keys_and_policy_default():
+    # 인원별 표(시트/JSON)의 capture_mode, contact_capture_chance 는 DEFAULTS 키라서 그대로 config 에 들어간다
+    row = {2: {"map_id": "car2077_9", "capture_mode": "contact", "contact_capture_chance": "0.35"}}
+    c, mid = cfg.build_config(2, sheet_scaling=row)
+    assert mid == "car2077_9" and c["capture_mode"] == "contact" and c["contact_capture_chance"] == 0.35
+    with pytest.raises(cfg.ConfigError):
+        cfg.build_config(2, sheet_scaling={2: {"capture_mode": "nope"}})
+    # 서버 정책 값: 엔진은 쓰지 않지만 설정 키로 존재하고 정수로 강제된다
+    assert cfg.DEFAULTS["vote_skip_after_sec"] == 600 and cfg.coerce("vote_skip_after_sec", "900") == 900
+
+
 def test_doorlock_range_message_lists_adjacent_doors():
     st = make(map_id="car2077_9", start="A2", doorlock_range=0)
     st.fugitive.ram = 10
