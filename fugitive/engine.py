@@ -625,9 +625,10 @@ def resolve_round(st: GameState, rng: Optional[random.Random] = None, timed_out:
             result_of.setdefault(uid, "dazed")
 
     # 4c. 목격 (search 모드): 체포 없이 도주자의 최종 방에서 라운드를 마친 헌터는 침입자를 목격한다.
-    #     의도된 노출(contact 모드의 contact_miss 와 같은 급). 은신 중이면 목격 없음.
-    #     정전(blackout)은 추적기 센서만 가리므로 물리적 목격은 막지 않는다.
-    if not contact_mode and not captured and not hidden:
+    #     의도된 노출(contact 모드의 contact_miss 와 같은 급). 은신 중이거나 그 방이 증기로 가득하면
+    #     (수색이 실패하는 것과 같은 이유로) 목격 없음. 정전(blackout)은 추적기 센서만 가리므로
+    #     물리적 목격은 막지 않는다.
+    if not contact_mode and not captured and not hidden and f_new not in steam_now:
         for uid in order_ids:
             if new_rooms[uid] == f_new:
                 events.append({"type": "glimpse", "uid": uid, "room": f_new})

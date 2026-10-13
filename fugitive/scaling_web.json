@@ -1,0 +1,8 @@
+{
+  "_comment": "웹 포트용 인원별 오버라이드. config.SCALING 과 같은 모양(인원 → 튠값). 디스코드 봇은 이 파일을 읽지 않는다. 목표: 1시간 라운드·조기 정산 기준 p50 8~10 라운드. 재현: python -m fugitive.sim --all --games 400 --seed 1 --scaling fugitive/scaling_web.json",
+  "2": {"map_id": "car2077_9",  "ram_max": 8,  "ram_regen": 1, "trace_passive": 14, "scan_budget": 2, "overheat_rounds": 1, "max_rounds": 12},
+  "3": {"map_id": "car2077_9",  "ram_max": 8,  "ram_regen": 1, "trace_passive": 12, "scan_budget": 2, "overheat_rounds": 1, "max_rounds": 12},
+  "4": {"map_id": "car2077_9",  "ram_max": 10, "ram_regen": 1, "trace_passive": 10, "scan_budget": 1, "overheat_rounds": 2, "max_rounds": 12},
+  "5": {"map_id": "car2077_12", "ram_max": 12, "ram_regen": 1, "trace_passive": 10, "scan_budget": 2, "overheat_rounds": 1, "max_rounds": 12},
+  "6": {"map_id": "car2077_12", "ram_max": 12, "ram_regen": 2, "trace_passive": 8,  "scan_budget": 1, "overheat_rounds": 1, "max_rounds": 12}
+}

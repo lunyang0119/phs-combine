@@ -328,6 +328,22 @@ def test_hide_suppresses_glimpse():
     assert any(e["type"] == "glimpse" and e["room"] == "B2" for e in rep["events"])
 
 
+def test_steam_suppresses_glimpse():
+    st = make(start="A2", capture_mode="search")                 # A2 = coffeepot
+    place(st, "1", "A1"); place(st, "2", "C4")
+    E.submit_hunter_order(st, "1", "move", "A2")                 # 증기 방으로 들어가 도주자와 같은 방에서 라운드를 마친다
+    E.submit_fugitive_order(st, None, "overload")                # 도주자는 제자리에서 과부하
+    rep = E.resolve_round(st, random.Random(0))
+    assert st.status == E.ROUND_OPEN and rep["steam"] == ["A2"]
+    assert any(e["type"] == "dazed" and e["uid"] == "1" for e in rep["events"])
+    assert not any(e["type"] == "glimpse" for e in rep["events"])
+    assert E.public_view(st).glimpses == []
+    # 증기가 걷힌 다음 라운드, 같은 방이면 다시 목격된다 (헌터 1 은 기절 → 자동 대기)
+    E.submit_fugitive_order(st, None)
+    rep = E.resolve_round(st, random.Random(0))
+    assert any(e["type"] == "glimpse" and e["uid"] == "1" and e["room"] == "A2" for e in rep["events"])
+
+
 def test_blackout_does_not_suppress_glimpse():
     st = make(start="A3", capture_mode="search")                 # A3 = light
     place(st, "1", "A2"); place(st, "2", "C4")

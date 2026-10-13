@@ -191,9 +191,19 @@ def fugitive_order(st: E.GameState, style: str, rng: random.Random) -> tuple:
 
 
 # ---------------------------------------------------------------------------
+def load_scaling(path: str) -> Dict[int, Dict]:
+    """--scaling 파일: SCALING 과 같은 모양의 JSON ({"2": {"map_id": ..., "trace_passive": ...}, ...})."""
+    import json
+    with open(path, encoding="utf-8") as fh:
+        raw = json.load(fh)
+    # 숫자가 아닌 키("_comment" 등)는 설명용으로 무시한다
+    return {int(k): dict(v) for k, v in raw.items() if str(k).strip().isdigit()}
+
+
 def play(hunters: int, style: str, rng: random.Random, map_id: Optional[str] = None,
-         overrides: Optional[Dict] = None) -> tuple:
-    c, mid = cfg.build_config(hunters)
+         overrides: Optional[Dict] = None, scaling: Optional[Dict[int, Dict]] = None) -> tuple:
+    """한 판. 반환: (라운드 수, 체포 방식, 동결 여부, 체포 시점 추적률)."""
+    c, mid = cfg.build_config(hunters, sheet_scaling=scaling)
     c["round_timer_sec"] = 1
     if overrides:
         c.update(overrides)
@@ -213,21 +223,34 @@ def play(hunters: int, style: str, rng: random.Random, map_id: Optional[str] = N
         brain.observe(st, rep)
         if st.round_no > 200:
             break
-    return len(st.log), st.capture_how, st.fugitive.frozen
+    return len(st.log), st.capture_how, st.fugitive.frozen, st.fugitive.trace
 
 
-def run(hunters: int, games: int, seed: int, style: str, map_id=None, overrides=None) -> Dict:
+def run(hunters: int, games: int, seed: int, style: str, map_id=None, overrides=None, scaling=None) -> Dict:
     rng = random.Random(seed)
-    rounds, hows, frozen = [], Counter(), 0
+    rounds, hows, frozen, traces = [], Counter(), 0, []
     for _ in range(games):
-        n, how, fz = play(hunters, style, rng, map_id, overrides)
+        n, how, fz, tr = play(hunters, style, rng, map_id, overrides, scaling)
         rounds.append(n)
         hows[how] += 1
         frozen += fz
+        traces.append(tr)
     rounds.sort()
     q = lambda p: rounds[min(len(rounds) - 1, int(p * len(rounds)))]
-    return {"hunters": hunters, "style": style, "games": games, "p10": q(0.1), "p50": statistics.median(rounds),
-            "p90": q(0.9), "mean": round(statistics.mean(rounds), 1), "how": dict(hows), "frozen": frozen}
+    return {"hunters": hunters, "style": style, "games": games,
+            "p10": q(0.1), "p25": q(0.25), "p50": statistics.median(rounds), "p75": q(0.75), "p90": q(0.9),
+            "mean": round(statistics.mean(rounds), 1), "how": dict(hows),
+            "frozen": frozen, "frozen_pct": round(100 * frozen / games, 1),      # 동결 뒤에 끝난 비율
+            "trace_mean": round(statistics.mean(traces), 1)}                      # 체포 시점 평균 추적률
+
+
+def format_row(r: Dict) -> str:
+    how = " ".join(f"{k}={v}" for k, v in sorted(r["how"].items(), key=lambda kv: -kv[1]))
+    return (f"{r['hunters']:>2} {r['style']:>7} {r['p25']:>4} {r['p50']:>5} {r['p75']:>4} {r['mean']:>5} "
+            f"{r['frozen_pct']:>6.1f} {r['trace_mean']:>6.1f}  {how}")
+
+
+HEADER = f"{'N':>2} {'style':>7} {'p25':>4} {'p50':>5} {'p75':>4} {'mean':>5} {'frz%':>6} {'trace':>6}  how"
 
 
 def main():
@@ -239,17 +262,19 @@ def main():
     ap.add_argument("--map", default=None)
     ap.add_argument("--all", action="store_true")
     ap.add_argument("--set", action="append", default=[], help="key=value 오버라이드")
+    ap.add_argument("--scaling", default=None,
+                    help="인원별 오버라이드 JSON (config.SCALING 과 같은 모양, 예: fugitive/scaling_web.json). 생략 시 내장 SCALING")
     a = ap.parse_args()
     overrides = {}
     for kv in a.set:
         k, v = kv.split("=", 1)
         overrides[k] = cfg.coerce(k, v)
+    scaling = load_scaling(a.scaling) if a.scaling else None
     ns = range(2, 7) if a.all else [a.hunters]
-    print(f"{'N':>2} {'style':>7} {'p10':>4} {'p50':>5} {'p90':>4} {'mean':>5}  how / frozen")
+    print(HEADER)
     for n in ns:
         for style in (["hacker", "stealth"] if a.all else [a.style]):
-            r = run(n, a.games, a.seed, style, a.map, overrides)
-            print(f"{n:>2} {style:>7} {r['p10']:>4} {r['p50']:>5} {r['p90']:>4} {r['mean']:>5}  {r['how']} / {r['frozen']}")
+            print(format_row(run(n, a.games, a.seed, style, a.map, overrides, scaling)))
 
 
 if __name__ == "__main__":
