@@ -106,6 +106,8 @@ def report_text(rep: Dict[str, Any], names: Dict[str, str]) -> str:
             lines.append(S.REPORT_SEARCH_EMPTY.format(name=n, room=ev["room"]))
         elif t == "contact_miss":
             lines.append(S.REPORT_CONTACT_MISS.format(name=n, room=ev["room"]))
+        elif t == "glimpse":
+            lines.append(S.REPORT_GLIMPSE.format(name=n, room=ev["room"]))
         elif t == "scan":
             lines.append(S.REPORT_SCAN.format(name=n, device=S.DEVICE_KO.get(ev["device"], ev["device"])))
         elif t == "scan_noise":
@@ -192,7 +194,7 @@ def summary_chunks(st: GameState) -> List[str]:
                            for u, o in entry["hunter_orders"].items())
         evs = []
         for ev in entry["report"]["events"]:
-            if ev["type"] in ("scan", "contact_miss", "door_locked", "dazed"):
+            if ev["type"] in ("scan", "contact_miss", "glimpse", "door_locked", "dazed"):
                 evs.append(f"{names.get(ev.get('uid'), '?')}:{ev['type']}")
         if entry["report"].get("signature"):
             evs.append(f"sig={entry['report']['signature']}")

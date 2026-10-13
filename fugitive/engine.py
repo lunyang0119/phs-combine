@@ -479,11 +479,22 @@ def _bar(pct: int, width: int = 10) -> str:
     return "▓" * filled + "░" * (width - filled)
 
 
-def resolve_round(st: GameState, rng: Optional[random.Random] = None, timed_out: bool = False) -> Dict[str, Any]:
-    """라운드를 정산하고 공개 보고(dict)를 반환한다. 상태는 제자리에서 갱신된다."""
+def resolve_round(st: GameState, rng: Optional[random.Random] = None, timed_out: bool = False,
+                  seed: Optional[int] = None) -> Dict[str, Any]:
+    """라운드를 정산하고 공개 보고(dict)를 반환한다. 상태는 제자리에서 갱신된다.
+
+    난수: 이 라운드 전용 시드를 정해 `random.Random(seed)` 로 정산한다. seed 가 None 이면 넘겨받은
+    rng(없으면 무작위)에서 하나 뽑는다. 쓰인 시드는 log[-1]["seed"] 에 남으므로, 같은 상태에
+    `seed=` 로 다시 호출하면 같은 보고가 재현된다 (웹 포트의 리플레이용).
+
+    보고의 `playback` 블록: `playback["hunters"]` 는 공개(PublicView.playback 으로 노출),
+    `playback["fugitive_path"]` 는 **관제 전용** — public_view 는 절대 내보내지 않는다.
+    """
     if st.status not in (ROUND_OPEN, PAUSED, RESOLVING):
         raise RuleError("정산할 라운드가 없습니다")
-    rng = rng or random.Random()
+    if seed is None:
+        seed = (rng or random.Random()).randrange(1 << 62)
+    rng = random.Random(seed)
     gmap = st.game_map
     c = st.config
     f = st.fugitive
@@ -539,12 +550,15 @@ def resolve_round(st: GameState, rng: Optional[random.Random] = None, timed_out:
     # 2. 헌터 이동
     old_rooms = {uid: st.hunters[uid].room for uid in order_ids}
     new_rooms = dict(old_rooms)
+    blocked_edge: Dict[str, str] = {}            # playback: 잠긴 문에 막힌 헌터 → 문
+    result_of: Dict[str, str] = {}               # playback: 헌터별 결과 (우선순위 순으로 먼저 기록된 값이 남는다)
     for uid in order_ids:
         h = st.hunters[uid]
         if h.order.type == "move":
             e = edge_key(h.room, h.order.target)
             if st.is_locked(e, R):
                 events.append({"type": "door_locked", "uid": uid, "edge": e})
+                blocked_edge[uid] = e
             else:
                 new_rooms[uid] = h.order.target
 
@@ -591,18 +605,32 @@ def resolve_round(st: GameState, rng: Optional[random.Random] = None, timed_out:
         if captured:
             break
 
+    if captured:
+        result_of[captured[0]] = "captured"
+
     # 4b. 수색 결과 / 증기
     for uid in order_ids:
         h = st.hunters[uid]
         if h.order.type == "search" and not (captured and captured[0] == uid):
             if old_rooms[uid] in steam_now:
                 events.append({"type": "search_steam", "uid": uid, "room": old_rooms[uid]})
+                result_of[uid] = "search_steam"
             else:
                 events.append({"type": "search_empty", "uid": uid, "room": old_rooms[uid]})
+                result_of[uid] = "search_empty"
     for uid in order_ids:
         if new_rooms[uid] in steam_now:
             st.hunters[uid].dazed_until = R + int(c["overload_daze_rounds"])
             events.append({"type": "dazed", "uid": uid, "room": new_rooms[uid]})
+            result_of.setdefault(uid, "dazed")
+
+    # 4c. 목격 (search 모드): 체포 없이 도주자의 최종 방에서 라운드를 마친 헌터는 침입자를 목격한다.
+    #     의도된 노출(contact 모드의 contact_miss 와 같은 급). 은신 중이면 목격 없음.
+    #     정전(blackout)은 추적기 센서만 가리므로 물리적 목격은 막지 않는다.
+    if not contact_mode and not captured and not hidden:
+        for uid in order_ids:
+            if new_rooms[uid] == f_new:
+                events.append({"type": "glimpse", "uid": uid, "room": f_new})
 
     # 5. 스캔
     budget = int(c["scan_budget"])
@@ -613,12 +641,15 @@ def resolve_round(st: GameState, rng: Optional[random.Random] = None, timed_out:
             continue
         if used >= budget:
             events.append({"type": "scan_busy", "uid": uid})
+            result_of.setdefault(uid, "scan_busy")
         elif blackout and c["blackout_blocks_scan"]:
             events.append({"type": "scan_noise", "uid": uid})
+            result_of.setdefault(uid, "scan_noise")
             used += 1
         else:
             scan_room = f_old if int(c.get("scan_lag", 1)) >= 1 else f_new
             events.append({"type": "scan", "uid": uid, "device": gmap.rooms[scan_room].device})
+            result_of.setdefault(uid, "scan_ok")
             f.trace = min(100, f.trace + int(c.get("scan_trace", 0)))
             used += 1
 
@@ -664,6 +695,19 @@ def resolve_round(st: GameState, rng: Optional[random.Random] = None, timed_out:
         dist = min(gmap.distance(st.hunters[u].room, f.room) for u in order_ids)
         band = signal_band(dist, c)
 
+    # 플레이백 (정산 순서). 공개 부분은 헌터 이동/결과만, 도주자 경로는 관제 전용.
+    playback_hunters: List[Dict[str, Any]] = []
+    for uid in order_ids:
+        action = st.hunters[uid].order.type
+        playback_hunters.append({
+            "id": uid,
+            "from": old_rooms[uid],
+            "to": new_rooms[uid],
+            "blocked_edge": blocked_edge.get(uid),
+            "action": action,
+            "result": result_of.get(uid, "stay" if action == "stay" else None),
+        })
+
     report = {
         "round": R,
         "trace": f.trace,
@@ -684,14 +728,21 @@ def resolve_round(st: GameState, rng: Optional[random.Random] = None, timed_out:
         "captured_by": captured[0] if captured else None,
         "capture_how": captured[1] if captured else None,
         "hunters": {uid: {"name": st.hunters[uid].name, "room": st.hunters[uid].room} for uid in st.hunters},
+        "playback": {
+            "hunters": playback_hunters,          # 공개
+            "fugitive_path": list(f_path),        # 관제 전용 — public_view 가 내보내지 않는다
+        },
     }
     st.log.append({
         "round": R,
+        "seed": seed,                             # 이 라운드 정산에 쓰인 난수 시드 (리플레이용)
         "fugitive_room_before": f_old,
         "fugitive_room_after": f_new,
+        "fugitive_path": list(f_path),
         "fugitive_order": asdict(forder),
         "hunter_orders": {uid: asdict(st.hunters[uid].order) for uid in order_ids},
         "hunter_rooms": {uid: st.hunters[uid].room for uid in order_ids},
+        "playback": playback_hunters,             # 공개 플레이백 블록 (재접속 후 재생용)
         "hidden_events": hidden_events,
         "ram": f.ram,
         "trace": f.trace,
@@ -728,6 +779,8 @@ class PublicView:
     map_rows: List[Dict[str, Any]]
     map_id: str
     capture_room: Optional[str] = None      # 게임이 CAPTURED 로 끝난 뒤에만 채워진다 (그 전에는 항상 None)
+    playback: List[Dict[str, Any]] = field(default_factory=list)   # 마지막 보고의 playback["hunters"] 만 (도주자 경로 없음)
+    glimpses: List[str] = field(default_factory=list)              # 마지막 보고에서 헌터가 침입자를 목격한 방
 
 
 def public_view(st: GameState) -> PublicView:
@@ -752,4 +805,6 @@ def public_view(st: GameState) -> PublicView:
         map_rows=st.map_rows,
         map_id=st.map_id,
         capture_room=(st.fugitive.room if st.status == CAPTURED and st.fugitive else None),
+        playback=[dict(p) for p in (rep.get("playback") or {}).get("hunters", [])],
+        glimpses=list(dict.fromkeys(ev["room"] for ev in rep.get("events", []) if ev.get("type") == "glimpse")),
     )

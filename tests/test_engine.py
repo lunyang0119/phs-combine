@@ -220,11 +220,123 @@ def test_serialization_roundtrip():
 
 def test_public_view_has_no_fugitive_fields():
     st = make(start="A2")
-    E.resolve_round(st, random.Random(0))
+    place(st, "1", "C4"); place(st, "2", "C1")
+    E.submit_fugitive_order(st, "A3")
+    rep = E.resolve_round(st, random.Random(0))
+    assert rep["playback"]["fugitive_path"] == ["A2", "A3"]      # 보고 dict 에는 있지만 (관제 전용)
     pv = E.public_view(st)
     dumped = str(pv.__dict__)
     assert "fugitive" not in dumped and "ram" not in dumped
+    assert "fugitive_path" not in dumped                        # PublicView 는 도주자 경로를 절대 내보내지 않는다
+    assert pv.playback == rep["playback"]["hunters"]            # 공개 플레이백(헌터 이동/결과)만 노출
     assert pv.round_no == 1 and len(pv.hunters) == 2
+
+
+def test_playback_block_and_seed_replay():
+    st = make(hunters=(("1", "a"), ("2", "b"), ("3", "c")), start="A2", scan_budget=1, capture_mode="search")
+    place(st, "1", "A3"); place(st, "2", "C4"); place(st, "3", "C1")
+    E.submit_hunter_order(st, "1", "move", "A2")                 # 잠긴 문에 막힌다
+    E.submit_hunter_order(st, "2", "scan")
+    E.submit_fugitive_order(st, "B2", "doorlock", "A2-A3")       # 3 은 미제출 → stay
+    snapshot = st.to_dict()
+    rep = E.resolve_round(st, random.Random(7))
+    pb = rep["playback"]
+    assert [p["id"] for p in pb["hunters"]] == rep["order"]      # 정산 순서
+    by = {p["id"]: p for p in pb["hunters"]}
+    assert by["1"] == {"id": "1", "from": "A3", "to": "A3", "blocked_edge": "A2-A3", "action": "move", "result": None}
+    assert by["2"] == {"id": "2", "from": "C4", "to": "C4", "blocked_edge": None, "action": "scan", "result": "scan_ok"}
+    assert by["3"] == {"id": "3", "from": "C1", "to": "C1", "blocked_edge": None, "action": "stay", "result": "stay"}
+    assert pb["fugitive_path"] == ["A2", "B2"]
+    entry = st.log[-1]
+    assert entry["playback"] == pb["hunters"] and entry["fugitive_path"] == ["A2", "B2"]
+    assert isinstance(entry["seed"], int)
+    # 기록된 시드로 같은 상태를 다시 정산하면 같은 보고가 나온다 (리플레이)
+    st2 = E.GameState.from_dict(snapshot)
+    rep2 = E.resolve_round(st2, random.Random(999), seed=entry["seed"])
+    assert rep2 == rep and st2.log[-1]["seed"] == entry["seed"]
+
+
+def test_playback_results_search_capture_and_steam():
+    st = make(hunters=(("1", "a"), ("2", "b"), ("3", "c")), start="A2", capture_mode="search")
+    place(st, "1", "A2"); place(st, "2", "A1"); place(st, "3", "C4")
+    E.submit_hunter_order(st, "1", "search")                     # 체포
+    E.submit_hunter_order(st, "2", "search")                     # 빈 방
+    E.submit_fugitive_order(st, None)
+    rep = E.resolve_round(st, random.Random(0))
+    by = {p["id"]: p for p in rep["playback"]["hunters"]}
+    assert st.status == E.CAPTURED and by["1"]["result"] == "captured" and by["2"]["result"] == "search_empty"
+    # 증기: 수색은 search_steam, 들어온 헌터는 dazed
+    st = make(hunters=(("1", "a"), ("2", "b")), start="A2", capture_mode="search")
+    place(st, "1", "A1"); place(st, "2", "A2")
+    E.submit_hunter_order(st, "1", "move", "A2")
+    E.submit_hunter_order(st, "2", "search")
+    E.submit_fugitive_order(st, "A3", "overload")
+    rep = E.resolve_round(st, random.Random(0))
+    by = {p["id"]: p for p in rep["playback"]["hunters"]}
+    assert by["1"]["result"] == "dazed" and by["2"]["result"] == "search_steam"
+
+
+def test_glimpse_fires_in_search_mode_and_is_public():
+    from fugitive import render as RD
+    st = make(start="A2", capture_mode="search")
+    place(st, "1", "A1"); place(st, "2", "C4")
+    E.submit_hunter_order(st, "1", "move", "A2")                 # 같은 방에서 라운드를 마친다 (수색 아님)
+    E.submit_fugitive_order(st, None)
+    rep = E.resolve_round(st, random.Random(0))
+    assert st.status == E.ROUND_OPEN                             # 체포 로직은 그대로: search 모드에서 같은 방은 체포가 아니다
+    assert [e for e in rep["events"] if e["type"] == "glimpse"] == [{"type": "glimpse", "uid": "1", "room": "A2"}]
+    assert E.public_view(st).glimpses == ["A2"]
+    assert "A2 에서 침입자 신호의 주인을 목격" in RD.report_text(rep, {"1": "철수", "2": "영희"})
+    # 도주자가 헌터가 서 있는 방으로 들어와도 목격된다
+    st = make(start="A2", capture_mode="search")
+    place(st, "1", "A3"); place(st, "2", "C4")
+    E.submit_hunter_order(st, "1", "stay")
+    E.submit_fugitive_order(st, "A3")
+    rep = E.resolve_round(st, random.Random(0))
+    assert st.status == E.ROUND_OPEN and any(e["type"] == "glimpse" and e["room"] == "A3" for e in rep["events"])
+
+
+def test_glimpse_not_in_contact_mode_and_not_when_captured():
+    st = make(start="A2")                                        # contact 모드: contact_miss/colocate 가 담당
+    place(st, "1", "A1"); place(st, "2", "C4")
+    E.submit_hunter_order(st, "1", "move", "A2")
+    E.submit_fugitive_order(st, None)
+    rep = E.resolve_round(st, random.Random(0))
+    assert not any(e["type"] == "glimpse" for e in rep["events"])
+    st = make(start="A2", capture_mode="search")
+    place(st, "1", "A2"); place(st, "2", "A1")
+    E.submit_hunter_order(st, "1", "search")
+    E.submit_hunter_order(st, "2", "move", "A2")
+    E.submit_fugitive_order(st, None)
+    rep = E.resolve_round(st, random.Random(0))
+    assert st.status == E.CAPTURED and not any(e["type"] == "glimpse" for e in rep["events"])
+
+
+def test_hide_suppresses_glimpse():
+    st = make(start="B2", capture_mode="search")                 # B2 = curtain
+    place(st, "1", "A2"); place(st, "2", "C4")
+    E.submit_hunter_order(st, "1", "move", "B2")
+    E.submit_fugitive_order(st, None, "hide")
+    rep = E.resolve_round(st, random.Random(0))
+    assert rep["signature"] == "curtain" and not any(e["type"] == "glimpse" for e in rep["events"])
+    # 은신 2라운드째에도 목격 없음, 끝나면 다시 목격된다
+    E.submit_hunter_order(st, "1", "stay")
+    rep = E.resolve_round(st, random.Random(0))
+    assert not any(e["type"] == "glimpse" for e in rep["events"])
+    E.submit_hunter_order(st, "1", "stay")
+    rep = E.resolve_round(st, random.Random(0))
+    assert any(e["type"] == "glimpse" and e["room"] == "B2" for e in rep["events"])
+
+
+def test_blackout_does_not_suppress_glimpse():
+    st = make(start="A3", capture_mode="search")                 # A3 = light
+    place(st, "1", "A2"); place(st, "2", "C4")
+    E.submit_hunter_order(st, "1", "move", "A3")
+    E.submit_fugitive_order(st, None, "blackout")
+    rep = E.resolve_round(st, random.Random(0))
+    assert rep["blackout"] and rep["markers"] == [] and rep["signature"] is None
+    assert any(e["type"] == "glimpse" and e["room"] == "A3" for e in rep["events"])
+    assert E.public_view(st).glimpses == ["A3"]
 
 
 def test_config_coerce():

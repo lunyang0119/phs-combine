@@ -56,9 +56,9 @@ class HunterBrain:
             if rep["signature"] == "curtain":
                 cand = before            # 은신 = 제자리
                 self.hide_suspect = 2
-        # 접촉 실패: 그 방에 있었다 → 이번 라운드 이동 후보
+        # 접촉 실패 / 목격: 그 방에 있었다 → 이번 라운드 이동 후보
         for ev in rep["events"]:
-            if ev["type"] == "contact_miss":
+            if ev["type"] in ("contact_miss", "glimpse"):
                 cand = {ev["room"]} | set(g.rooms[ev["room"]].neighbors)
         # 스캔: scan_lag=1 이면 라운드 시작 방의 장치 → 이동 전 후보 제한 후 확장
         for ev in rep["events"]:
