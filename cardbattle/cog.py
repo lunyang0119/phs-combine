@@ -19,8 +19,8 @@ import help_option
 
 from . import config as cfgmod
 from . import data as D
+from . import embeds
 from . import engine as E
-from . import render
 from . import store
 from . import strings as S
 from .views import ChosenView, HandView, TargetView, TurnView
@@ -144,7 +144,7 @@ class CardBattleCog(commands.Cog):
             new = E.BattleState(status=E.LOBBY, host_id=str(interaction.user.id),
                                 guild_id=interaction.guild_id or 0, channel_id=interaction.channel_id or 0,
                                 config=cfgmod.build_config())
-            msg = await interaction.channel.send(render.lobby_text([]))
+            msg = await interaction.channel.send(embed=embeds.lobby([]))
             new.lobby_message_id = msg.id
             self.state = new
             self._save()
@@ -196,13 +196,13 @@ class CardBattleCog(commands.Cog):
         ch = await self._channel(st.channel_id)
         if not ch:
             return
-        text = render.lobby_text([p.name for p in st.players.values()])
+        emb = embeds.lobby([p.name for p in st.players.values()])
         try:
             msg = await ch.fetch_message(st.lobby_message_id)
-            await msg.edit(content=text)
-        except (discord.HTTPException, AttributeError):
+            await msg.edit(embed=emb)
+        except (discord.HTTPException, AttributeError, LookupError):
             try:
-                msg = await ch.send(text)
+                msg = await ch.send(embed=emb)
                 st.lobby_message_id = msg.id
                 self._save()
             except discord.HTTPException:
@@ -254,7 +254,7 @@ class CardBattleCog(commands.Cog):
             if ch is None:
                 await self._reply(interaction, "채널을 찾지 못했습니다.")
                 return
-            await ch.send(render.intro_text(new, bdef.desc))
+            await ch.send(embed=embeds.intro(new, bdef.desc))
             await self._open_turn(ch)
         await self._reply(interaction, S.OK_STARTED.format(battle=bdef.name))
         await self._resolve_turn()   # 행동 가능한 참가자가 없으면 바로 넘어간다
@@ -293,14 +293,14 @@ class CardBattleCog(commands.Cog):
             await self._reply(interaction, S.ERR_NO_SESSION)
             return
         if st.status == E.LOBBY:
-            await self._reply(interaction, render.lobby_text([p.name for p in st.players.values()]))
+            await self._reply(interaction, None, embed=embeds.lobby([p.name for p in st.players.values()]))
             return
-        await self._reply(interaction, render.status_text(st))
+        await self._reply(interaction, None, embed=embeds.status(st))
 
     # ------------------------------------------------------------------ 턴 메시지
     async def _open_turn(self, ch):
         st = self.state
-        msg = await ch.send(render.turn_open_text(st), view=TurnView())
+        msg = await ch.send(embed=embeds.turn(st), view=TurnView())
         st.turn_message_id = msg.id
         self._save()
 
@@ -313,7 +313,7 @@ class CardBattleCog(commands.Cog):
             return
         try:
             msg = await ch.fetch_message(st.turn_message_id)
-            await msg.edit(content=render.turn_open_text(st))   # view 인자를 주지 않으면 버튼 유지
+            await msg.edit(embed=embeds.turn(st))   # view 인자를 주지 않으면 버튼 유지, content 없으니 "(수정됨)" 도 안 붙음
         except (discord.HTTPException, AttributeError):
             pass
 
@@ -326,13 +326,13 @@ class CardBattleCog(commands.Cog):
             return
         try:
             msg = await ch.fetch_message(st.turn_message_id)
-            await msg.edit(content=render.turn_open_text(st), view=None)
+            await msg.edit(embed=embeds.turn(st), view=None)
         except (discord.HTTPException, AttributeError):
             pass
 
     async def _post_report(self, ch, report: Dict[str, Any]):
-        for part in render.chunks(render.report_text(report)):
-            await ch.send(part)
+        for emb in embeds.reports(self.state, report):
+            await ch.send(embed=emb)
 
     async def _resolve_turn(self, force: bool = False) -> bool:
         """아군 턴 정산 → 적 턴 → 다음 턴 열기. 전원 선택이 아니고 force 도 아니면 아무것도 안 한다."""
@@ -373,7 +373,7 @@ class CardBattleCog(commands.Cog):
             st.pending_reports = []
             self._save()
         if st.status == E.ENDED:
-            await ch.send(render.winner_text(st))
+            await ch.send(embed=embeds.winner(st))
             self._save()
         elif st.status == E.ALLY_TURN:
             await self._open_turn(ch)
@@ -431,7 +431,7 @@ class CardBattleCog(commands.Cog):
             st = self.state
             hand = E.draw_hand(st, uid, self.rng)
             self._save()
-        await interaction.response.send_message(render.hand_text(st, uid, hand), view=HandView(st, uid, hand, 0),
+        await interaction.response.send_message(embed=embeds.hand(st, uid, hand), view=HandView(st, uid, hand, 0),
                                                 ephemeral=True)
 
     async def handle_hand_page(self, interaction: discord.Interaction, uid: str, page: int):
@@ -441,7 +441,7 @@ class CardBattleCog(commands.Cog):
             return
         st = self.state
         hand = E.hand_for(st, uid)
-        await interaction.response.edit_message(content=render.hand_text(st, uid, hand),
+        await interaction.response.edit_message(content=None, embed=embeds.hand(st, uid, hand),
                                                 view=HandView(st, uid, hand, page))
 
     async def handle_card_pick(self, interaction: discord.Interaction, uid: str, card_id: str):
@@ -456,7 +456,7 @@ class CardBattleCog(commands.Cog):
             return
         targets = E.valid_targets(st, st.players[uid], card)
         if E.needs_target(card) and len(targets) > 1:
-            await interaction.response.edit_message(content=S.TARGET_TITLE.format(card=card.name),
+            await interaction.response.edit_message(content=S.TARGET_TITLE.format(card=card.name), embed=None,
                                                     view=TargetView(uid, card_id, targets))
             return
         await self._submit(interaction, uid, card_id, None)
@@ -484,7 +484,7 @@ class CardBattleCog(commands.Cog):
         if interaction.response.is_done():
             await interaction.followup.send(text, ephemeral=True, view=ChosenView(uid))
         else:
-            await interaction.response.edit_message(content=text, view=ChosenView(uid))
+            await interaction.response.edit_message(content=text, embed=None, view=ChosenView(uid))
         await self._refresh_turn_message()
         await self._resolve_turn()
 
@@ -502,7 +502,7 @@ class CardBattleCog(commands.Cog):
                 return
             self._save()
             hand = E.hand_for(st, uid)
-        await interaction.response.edit_message(content=S.OK_CANCELLED + "\n" + render.hand_text(st, uid, hand),
+        await interaction.response.edit_message(content=S.OK_CANCELLED, embed=embeds.hand(st, uid, hand),
                                                 view=HandView(st, uid, hand, 0))
         await self._refresh_turn_message()
 

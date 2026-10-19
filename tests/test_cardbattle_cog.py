@@ -14,12 +14,13 @@ from cardbattle.views import HandView, TargetView, TurnView
 class FakeMessage:
     _next_id = 1000
 
-    def __init__(self, channel, content, view=None):
+    def __init__(self, channel, content, view=None, embed=None):
         FakeMessage._next_id += 1
         self.id = FakeMessage._next_id
         self.channel = channel
         self.content = content
         self.view = view
+        self.embed = embed
         self.edits = []
 
     async def edit(self, **kw):
@@ -29,6 +30,24 @@ class FakeMessage:
             self.content = kw["content"]
         if "view" in kw:
             self.view = kw["view"]
+        if "embed" in kw:
+            self.embed = kw["embed"]
+
+
+def flat(embed):
+    """임베드의 제목·설명·필드를 한 문자열로."""
+    if embed is None:
+        return ""
+    parts = [embed.title or "", embed.description or ""]
+    for f in embed.fields:
+        parts += [f.name or "", f.value or ""]
+    if embed.footer and embed.footer.text:
+        parts.append(embed.footer.text)
+    return "\n".join(parts)
+
+
+def text(m):
+    return (m.content or "") + "\n" + flat(m.embed)
 
 
 class FakeChannel:
@@ -38,7 +57,7 @@ class FakeChannel:
 
     async def send(self, content=None, **kw):
         await asyncio.sleep(0)
-        m = FakeMessage(self, content, kw.get("view"))
+        m = FakeMessage(self, content, kw.get("view"), kw.get("embed"))
         self.sent.append(m)
         self.messages[m.id] = m
         return m
@@ -58,15 +77,15 @@ class FakeResponse:
     def is_done(self):
         return self._done
 
-    async def send_message(self, content=None, ephemeral=False, view=None, **kw):
+    async def send_message(self, content=None, ephemeral=False, view=None, embed=None, **kw):
         await asyncio.sleep(0)
         self._done = True
-        self.calls.append(("send", content, ephemeral, view))
+        self.calls.append(("send", content, ephemeral, view, embed))
 
-    async def edit_message(self, content=None, view=None, **kw):
+    async def edit_message(self, content=None, view=None, embed=None, **kw):
         await asyncio.sleep(0)
         self._done = True
-        self.calls.append(("edit", content, None, view))
+        self.calls.append(("edit", content, None, view, embed))
 
     async def defer(self, ephemeral=False):
         self._done = True
@@ -76,9 +95,9 @@ class FakeFollowup:
     def __init__(self, response):
         self.response = response
 
-    async def send(self, content=None, ephemeral=False, view=None, **kw):
+    async def send(self, content=None, ephemeral=False, view=None, embed=None, **kw):
         await asyncio.sleep(0)
-        self.response.calls.append(("followup", content, ephemeral, view))
+        self.response.calls.append(("followup", content, ephemeral, view, embed))
 
 
 def interaction(uid, channel, message=None, guild_id=1):
@@ -129,12 +148,12 @@ async def pick_any(cog, channel, uid):
     """카드 뽑기 → 첫 카드 → (필요하면) 첫 대상. 뽑은 패를 돌려준다."""
     i = interaction(uid, channel, message=turn_message(cog, channel))
     await cog.handle_draw(i)
-    kind, content, ephemeral, view = last(i)
-    assert kind == "send" and ephemeral and isinstance(view, HandView)
+    kind, content, ephemeral, view, embed = last(i)
+    assert kind == "send" and ephemeral and isinstance(view, HandView) and embed is not None
     hand = E.hand_for(cog.state, str(uid))
     i2 = interaction(uid, channel)
     await cog.handle_card_pick(i2, str(uid), hand[0])
-    kind, content, _, view = last(i2)
+    kind, content, _, view, _embed = last(i2)
     if isinstance(view, TargetView):
         tid = view.children[0].options[0].value
         i3 = interaction(uid, channel)
@@ -155,7 +174,8 @@ def test_host_is_ephemeral_posts_one_lobby_message_and_join_edits_it(tmp_path):
         await cog._cmd_join(interaction(1, ch), None)
         await cog._cmd_join(interaction(2, ch), None)
         assert len(ch.sent) == 1                                       # 새 메시지 없이 편집
-        assert "닉1" in lobby.content and "닉2" in lobby.content and "(2명)" in lobby.content
+        assert "닉1" in text(lobby) and "닉2" in text(lobby) and "(2명)" in text(lobby)
+        assert lobby.content is None and lobby.edits[-1].get("content") is None   # 임베드만 편집
         assert cog.state.players["1"].is_host and cog.state.players["1"].max_hp == 39
         i = interaction(2, ch)
         await cog._cmd_join(i, None)
@@ -207,8 +227,9 @@ def test_start_posts_turn_message_with_progress_and_button(tmp_path):
         st = cog.state
         assert st.status == E.ALLY_TURN and st.battle_id == "b01" and len(st.enemies) == 2
         tm = turn_message(cog, ch)
-        assert "선택 현황: 0/2 완료" in tm.content and isinstance(tm.view, TurnView)
-        assert any("정찰대" in (m.content or "") for m in ch.sent)
+        assert "선택 현황 0/2 완료" in text(tm) and isinstance(tm.view, TurnView)
+        assert any("정찰대" in text(m) for m in ch.sent)
+        assert "█" in text(tm) and "/39" in text(tm)                        # HP 바
     asyncio.run(body())
 
 
@@ -224,7 +245,7 @@ def test_draw_twice_same_hand_and_stale_message_rejected(tmp_path):
         i2 = interaction(2, ch, message=tm)
         await cog.handle_draw(i2)
         assert E.hand_for(cog.state, "2") == hand1 and len(hand1) == 3
-        assert last(i2)[1] == last(i1)[1]
+        assert last(i2)[4].to_dict() == last(i1)[4].to_dict()
         host_i = interaction(1, ch, message=tm)
         await cog.handle_draw(host_i)
         assert len(E.hand_for(cog.state, "1")) == len(cog.state.cards)   # 주최자 전체 카드
@@ -245,17 +266,17 @@ def test_all_chosen_resolves_posts_logs_and_opens_next_turn(tmp_path):
         await setup_battle(cog, ch)
         first_turn = turn_message(cog, ch)
         await pick_any(cog, ch, 1)
-        assert "선택 현황: 1/2 완료" in first_turn.content
+        assert "선택 현황 1/2 완료" in text(first_turn)
         n_before = len(ch.sent)
         await pick_any(cog, ch, 2)
         assert first_turn.edits[-1].get("view", "keep") is None       # 버튼 제거
-        texts = [m.content for m in ch.sent[n_before:]]
+        texts = [text(m) for m in ch.sent[n_before:]]
         assert any("아군 행동" in t and "님이" in t and "HP" in t for t in texts)
         assert any("적 행동" in t for t in texts)
         st = cog.state
         assert st.status == E.ALLY_TURN and st.turn_no == 3
         assert st.turn_message_id != first_turn.id and st.hands == {} and st.choices == {}
-        assert "선택 현황: 0/2 완료" in turn_message(cog, ch).content
+        assert "선택 현황 0/2 완료" in text(turn_message(cog, ch))
     asyncio.run(body())
 
 
@@ -276,7 +297,7 @@ def test_cancel_and_force_resolve_marks_unchosen_wait(tmp_path):
         assert last(i)[1] == S.ERR_HOST_ONLY
         n_before = len(ch.sent)
         await cog._cmd_force(interaction(1, ch), None)
-        texts = "\n".join(m.content or "" for m in ch.sent[n_before:])
+        texts = "\n".join(text(m) for m in ch.sent[n_before:])
         assert "**닉1**님은 대기했습니다" in texts and cog.state.turn_no == 3
     asyncio.run(body())
 
@@ -303,7 +324,7 @@ def test_cog_load_restores_state_and_registers_view(tmp_path):
         await cog3.cog_load()
         await asyncio.sleep(0.05)
         assert cog3.state.status == E.ALLY_TURN and cog3.state.turn_message_id
-        assert any("적 행동" in (m.content or "") for m in ch.sent[n_before:])
+        assert any("적 행동" in text(m) for m in ch.sent[n_before:])
     asyncio.run(body())
 
 
