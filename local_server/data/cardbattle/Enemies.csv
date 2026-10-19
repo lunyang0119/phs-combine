@@ -1,0 +1,4 @@
+enemy_id,name,max_hp,physics,magic,agility,charm,personality,pool
+grunt,신라 보병,30,12,8,10,8,aggressive,enemy
+guard,경비 로봇,45,10,8,6,6,defensive,enemy
+netrunner,해커,25,8,14,12,10,hacker,enemy

@@ -1,0 +1,13 @@
+card_id,name,kind,target,stat,pool,weight,effects,desc
+atk_slash,베기,attack,enemy,physics,both,10,damage:8,기본 물리 공격
+atk_bolt,볼트,attack,enemy,magic,both,8,damage:10,마법 공격
+atk_sweep,휩쓸기,attack,all_enemy,physics,both,4,damage:5,적 전체 공격
+def_guard,가드,defend,self,none,both,8,shield:0.5:1,다음 상대 턴 동안 받는 피해 절반
+def_wall,방벽,defend,ally,none,both,4,shield:0.7:1,아군 한 명이 다음 상대 턴 동안 피해 70% 감소
+hack_jam,재밍,hack,enemy,magic,both,5,atk_down:0.3:2,대상 공격력 30% 감소 (2턴)
+hack_misfire,오작동,hack,enemy,magic,both,5,misfire:0.5:2,대상의 다음 공격이 50% 확률로 불발
+hack_redirect,표적 교란,hack,enemy,magic,both,3,redirect_random:1:2,대상의 다음 공격이 무작위 대상에게 향함
+hack_stun,쇼크,hack,enemy,magic,both,2,stun:1:1,대상의 다음 행동 불가
+sp_overdrive,오버드라이브,special,enemy,physics,ally,2,damage:14;self_damage:3,강타 + 반동 피해 3
+sp_burst,버스트 샷,special,enemy,magic,ally,2,damage:12,고출력 무기 사격
+heal_kit,응급 키트,special,ally,none,both,4,heal:8,아군 HP 8 회복

@@ -2,7 +2,8 @@
 /dogwood-method-448216-f4-4023cd31106c.json
 /__pycache__
 __pycache__/
-/data/
+/data/*
+!/data/cardbattle/
 .pytest_cache/
 local_server/mogindex
 local_server/.env

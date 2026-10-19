@@ -16,6 +16,7 @@ import mogindex_commands
 import shop_commands
 import utility_commands
 from fugitive import cog as fugitive_cog
+from cardbattle import cog as cardbattle_cog
 
 COGS = [
     character_commands.CharacterCog,
@@ -25,6 +26,7 @@ COGS = [
     archive.ArchiveCommandsCog,
     mogindex_commands.MogIndexCommandsCog,
     fugitive_cog.FugitiveCog,
+    cardbattle_cog.CardBattleCog,
 ]
 # 관제/관리자 명령 (도움말 옵션 없음)
 EXCLUDED = {
@@ -63,7 +65,7 @@ def test_every_public_command_has_trailing_help_option():
         assert last.description == help_option.HELP_OPTION_DESC
         assert not any(p.required for p in params), (cog_name, c.name, [p.name for p in params if p.required])
     assert EXCLUDED <= seen
-    assert {"이동", "구매", "포인트", "전투시작", "아카이브", "검색", "고오급검색", "챗"} <= seen
+    assert {"이동", "구매", "포인트", "전투시작", "아카이브", "검색", "고오급검색", "챗", "카드"} <= seen
 
 
 def test_admin_groups_untouched():

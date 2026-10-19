@@ -1,0 +1,4 @@
+battle_id,name,enemies,desc
+b01,정찰대,grunt;grunt,신라 보병 2명
+b02,경비실,guard;netrunner,경비 로봇과 해커
+b03,대부대,grunt*3;guard;netrunner,보병 3 + 로봇 + 해커
