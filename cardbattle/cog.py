@@ -1,8 +1,9 @@
 """카드 전투 Cog — `/카드` 단일 명령 + 턴 메시지 버튼.
 
 세션은 전체에서 하나(`self.state`). 상태 변경은 전부 `self.lock` 안에서 하고 `_save()` 한다.
-흐름: 주최(LOBBY) → 참가(로비 메시지 편집) → 시작(ALLY_TURN, 턴 메시지 + 카드 뽑기 버튼)
-      → 전원 선택 또는 /카드 턴종료 → 아군 정산 게시 → 적 턴 정산 게시 → 다음 턴 메시지 … → ENDED
+흐름: 주최(LOBBY) → 참가(로비 메시지 편집) → 시작(ROUND_OPEN, 턴 메시지 + 카드 뽑기/방화벽 버튼)
+      → 전원 선택 또는 /카드 턴종료 → 라운드 정산 게시 → 다음 턴 메시지 … → ENDED
+      → (NCPD 경계도가 차면) ESCAPE: 도주 메시지의 버튼 3개 → 전원 선택 → 도주 정산 … → ENDED
 """
 from __future__ import annotations
 
@@ -21,9 +22,10 @@ from . import config as cfgmod
 from . import data as D
 from . import embeds
 from . import engine as E
+from . import image_render
 from . import store
 from . import strings as S
-from .views import ChosenView, HandView, TargetView, TurnView
+from .views import ChosenView, EscapeView, FirewallView, HandView, TargetView, TurnView
 
 logger = logging.getLogger(__name__)
 
@@ -36,6 +38,7 @@ OPTION_CHOICES = [
     app_commands.Choice(name="현황", value="status"),
 ]
 MAX_AUTO_RESOLVE = 20
+BOARD_FILENAME = "board.png"
 
 
 def _id_set(*names: str) -> set:
@@ -56,12 +59,14 @@ class CardBattleCog(commands.Cog):
         self.data: Optional[D.GameData] = None
         self.store_path = store.DEFAULT_PATH
         self.admin_ids = _id_set("CARDBATTLE_ADMIN_IDS", "FUGITIVE_ADMIN_IDS")
+        self._render_warned: Optional[str] = None
 
     # ------------------------------------------------------------------ 생명주기
     async def cog_load(self):
         self.bot.add_view(TurnView())
+        self.bot.add_view(EscapeView())
         self.state = store.load(self.store_path)
-        if self.state and self.state.status in (E.ALLY_TURN, E.ENEMY_TURN, E.RESOLVING):
+        if self.state and self.state.status in (E.ROUND_OPEN, E.RESOLVING, E.ESCAPE):
             asyncio.create_task(self._resume())
 
     def _save(self):
@@ -102,6 +107,28 @@ class CardBattleCog(commands.Cog):
         self.data = gd
         return gd
 
+    def _image_mode(self) -> bool:
+        st = self.state
+        if not st or str(st.config.get("render_mode", "image")) != "image":
+            return False
+        why = image_render.unavailable_reason()
+        if why is None:
+            return True
+        if why != self._render_warned:
+            logger.warning("카드 전투 render_mode=image 이지만 임베드만 씁니다: %s", why)
+            self._render_warned = why
+        return False
+
+    def _board_file(self, report: Optional[Dict[str, Any]] = None) -> Optional[discord.File]:
+        if not self._image_mode():
+            return None
+        try:
+            buf = image_render.render_board(self.state, report)
+        except Exception:  # noqa: BLE001
+            logger.exception("현황판 렌더 실패")
+            return None
+        return discord.File(buf, BOARD_FILENAME) if buf else None
+
     # ------------------------------------------------------------------ 명령
     async def _battle_autocomplete(self, interaction: discord.Interaction, current: str) -> List[app_commands.Choice[str]]:
         try:
@@ -112,11 +139,12 @@ class CardBattleCog(commands.Cog):
         out = []
         for b in gd.battles.values():
             if cur in b.id.lower() or cur in b.name.lower():
-                out.append(app_commands.Choice(name=f"{b.id} — {b.name}"[:100], value=b.id))
+                label = f"{b.id} — {b.name}" + (f" [{b.players}인]" if b.players else "")
+                out.append(app_commands.Choice(name=label[:100], value=b.id))
         return out[:25]
 
     @app_commands.command(name="카드", description="카드 전투 미니게임 — 주최 / 참가 / 시작 / 턴종료 / 종료 / 현황")
-    @app_commands.describe(옵션="실행할 동작", 전투id="시작할 전투 ID (옵션:시작 때 필요)", 도움말=help_option.HELP_OPTION_DESC)
+    @app_commands.describe(옵션="실행할 동작", 전투id="시작할 전투 ID (옵션:시작 때 필요. 인원수에 맞는 id)", 도움말=help_option.HELP_OPTION_DESC)
     @app_commands.choices(옵션=OPTION_CHOICES)
     @app_commands.autocomplete(전투id=_battle_autocomplete)
     async def card(self, interaction: discord.Interaction,
@@ -241,9 +269,16 @@ class CardBattleCog(commands.Cog):
             if st is None or st.status != E.LOBBY:
                 await self._reply(interaction, S.ERR_NOT_LOBBY)
                 return
+            cfg = dict(st.config)
             try:
-                new = E.new_battle(list(st.players.values()), E.enemy_combatants(bdef, gd.enemies),
-                                   gd.cards, st.config, host_id=st.host_id, battle_id=bdef.id, battle_name=bdef.name)
+                for k, v in bdef.overrides.items():
+                    cfg[k] = cfgmod.coerce(k, v)
+                enemies = E.enemy_combatants(bdef, gd.enemies, hp_mult=float(cfg.get("enemy_hp_mult", 1.0)))
+                new = E.new_battle(list(st.players.values()), enemies, gd.cards, cfg, host_id=st.host_id,
+                                   battle_id=bdef.id, battle_name=bdef.name, gimmicks=bdef.gimmicks, rng=self.rng)
+            except cfgmod.ConfigError as e:
+                await self._reply(interaction, S.ERR_DATA.format(err=e))
+                return
             except E.RuleError as e:
                 await self._reply(interaction, self._rule_msg(e))
                 return
@@ -257,7 +292,7 @@ class CardBattleCog(commands.Cog):
             await ch.send(embed=embeds.intro(new, bdef.desc))
             await self._open_turn(ch)
         await self._reply(interaction, S.OK_STARTED.format(battle=bdef.name))
-        await self._resolve_turn()   # 행동 가능한 참가자가 없으면 바로 넘어간다
+        await self._resolve_round()   # 행동 가능한 참가자가 없으면 바로 넘어간다
 
     async def _cmd_force(self, interaction: discord.Interaction, _):
         st = self.state
@@ -267,11 +302,15 @@ class CardBattleCog(commands.Cog):
         if not (self._is_host(interaction) or self._is_admin(interaction)):
             await self._reply(interaction, S.ERR_HOST_ONLY)
             return
-        if st.status != E.ALLY_TURN:
+        if st.status == E.ESCAPE:
+            await self._reply(interaction, S.OK_FORCED)
+            await self._resolve_escape(force=True)
+            return
+        if st.status != E.ROUND_OPEN:
             await self._reply(interaction, S.ERR_NOT_ALLY_TURN)
             return
         await self._reply(interaction, S.OK_FORCED)
-        await self._resolve_turn(force=True)
+        await self._resolve_round(force=True)
 
     async def _cmd_end(self, interaction: discord.Interaction, _):
         async with self.lock:
@@ -298,9 +337,26 @@ class CardBattleCog(commands.Cog):
         await self._reply(interaction, None, embed=embeds.status(st))
 
     # ------------------------------------------------------------------ 턴 메시지
-    async def _open_turn(self, ch):
+    def _turn_embed(self) -> discord.Embed:
         st = self.state
-        msg = await ch.send(embed=embeds.turn(st), view=TurnView())
+        emb = embeds.escape_turn(st) if st.status == E.ESCAPE else embeds.turn(st)
+        if st.status != E.ESCAPE and self._image_mode():
+            emb.set_image(url=f"attachment://{BOARD_FILENAME}")
+        return emb
+
+    async def _open_turn(self, ch, report: Optional[Dict[str, Any]] = None):
+        """ROUND_OPEN 이면 카드 턴 메시지(현황판 PNG 첨부), ESCAPE 면 도주 메시지."""
+        st = self.state
+        if st.status == E.ESCAPE:
+            msg = await ch.send(embed=embeds.escape_turn(st), view=EscapeView())
+        else:
+            kw: Dict[str, Any] = {"embed": self._turn_embed(), "view": TurnView()}
+            f = self._board_file(report)
+            if f is not None:
+                kw["file"] = f
+            else:
+                kw["embed"] = embeds.turn(st)
+            msg = await ch.send(**kw)
         st.turn_message_id = msg.id
         self._save()
 
@@ -313,8 +369,8 @@ class CardBattleCog(commands.Cog):
             return
         try:
             msg = await ch.fetch_message(st.turn_message_id)
-            await msg.edit(embed=embeds.turn(st))   # view 인자를 주지 않으면 버튼 유지, content 없으니 "(수정됨)" 도 안 붙음
-        except (discord.HTTPException, AttributeError):
+            await msg.edit(embed=self._turn_embed())   # view·attachments 를 주지 않으면 그대로 유지, "(수정됨)" 도 안 붙음
+        except (discord.HTTPException, AttributeError, LookupError):
             pass
 
     async def _strip_turn_view(self):
@@ -326,19 +382,22 @@ class CardBattleCog(commands.Cog):
             return
         try:
             msg = await ch.fetch_message(st.turn_message_id)
-            await msg.edit(embed=embeds.turn(st), view=None)
-        except (discord.HTTPException, AttributeError):
+            await msg.edit(embed=self._turn_embed(), view=None)
+        except (discord.HTTPException, AttributeError, LookupError):
             pass
 
     async def _post_report(self, ch, report: Dict[str, Any]):
-        for emb in embeds.reports(self.state, report):
+        if "escape" in report:
+            await ch.send(embed=embeds.escape_report(report["escape"]))
+            return
+        for emb in embeds.report(self.state, report):
             await ch.send(embed=emb)
 
-    async def _resolve_turn(self, force: bool = False) -> bool:
-        """아군 턴 정산 → 적 턴 → 다음 턴 열기. 전원 선택이 아니고 force 도 아니면 아무것도 안 한다."""
+    async def _resolve_round(self, force: bool = False) -> bool:
+        """라운드 정산 → 다음 라운드(또는 도주/종료). 전원 선택이 아니고 force 도 아니면 아무것도 안 한다."""
         async with self.lock:
             st = self.state
-            if st is None or st.status != E.ALLY_TURN:
+            if st is None or st.status != E.ROUND_OPEN:
                 return False
             if not force and not E.all_chosen(st):
                 return False
@@ -348,38 +407,57 @@ class CardBattleCog(commands.Cog):
             for _ in range(MAX_AUTO_RESOLVE):
                 await self._strip_turn_view()
                 st.turn_message_id = 0
-                rep = E.resolve_ally_turn(st, self.rng)
+                rep = E.resolve_round(st, self.rng)
                 st.pending_reports = [rep]
                 self._save()
                 await self._post_report(ch, rep)
                 st.pending_reports = []
                 self._save()
-                await self._run_enemy_and_continue(ch)
-                if st.status != E.ALLY_TURN or not E.all_chosen(st):
+                await self._after_round(ch, rep)
+                if st.status != E.ROUND_OPEN or not E.all_chosen(st):
                     break   # 선택을 기다리거나 끝났다 (all_chosen 참 = 행동 가능 인원 0 → 자동 진행)
             return True
 
-    async def _run_enemy_and_continue(self, ch):
-        """lock 보유 상태에서 호출. ENEMY_TURN 이면 적 턴을 돌리고, 끝이면 결과·아니면 다음 턴을 연다."""
+    async def _after_round(self, ch, rep: Optional[Dict[str, Any]] = None):
+        """lock 보유 상태에서 호출. 정산 결과에 따라 종료·도주·다음 라운드 메시지를 연다."""
         st = self.state
-        if st.status == E.ENEMY_TURN:
-            delay = float(st.config.get("enemy_turn_delay_sec", 1.0))
-            if delay > 0:
-                await asyncio.sleep(delay)
-            rep = E.run_enemy_turn(st, self.rng)
-            st.pending_reports = [rep]
-            self._save()
-            await self._post_report(ch, rep)
-            st.pending_reports = []
-            self._save()
         if st.status == E.ENDED:
             await ch.send(embed=embeds.winner(st))
             self._save()
-        elif st.status == E.ALLY_TURN:
+            return
+        if st.status == E.ESCAPE:
+            if not st.escape.get("history"):
+                await ch.send(embed=embeds.ncpd_trigger(st))
             await self._open_turn(ch)
+            return
+        delay = float(st.config.get("report_delay_sec", 1.0))
+        if delay > 0:
+            await asyncio.sleep(delay)
+        await self._open_turn(ch, rep)
+
+    async def _resolve_escape(self, force: bool = False) -> bool:
+        async with self.lock:
+            st = self.state
+            if st is None or st.status != E.ESCAPE:
+                return False
+            if not force and not E.all_escape_chosen(st):
+                return False
+            ch = await self._channel(st.channel_id)
+            if ch is None:
+                return False
+            await self._strip_turn_view()
+            st.turn_message_id = 0
+            rep = E.resolve_escape(st, self.rng)
+            st.pending_reports = [{"escape": rep}]
+            self._save()
+            await self._post_report(ch, {"escape": rep})
+            st.pending_reports = []
+            self._save()
+            await self._after_round(ch)
+            return True
 
     async def _resume(self):
-        """재시작 복원: 게시 못 한 보고 → 적 턴 → 턴 메시지."""
+        """재시작 복원: 게시 못 한 보고 → 턴/도주 메시지."""
         try:
             async with self.lock:
                 st = self.state
@@ -391,25 +469,25 @@ class CardBattleCog(commands.Cog):
                 for rep in list(st.pending_reports):
                     await self._post_report(ch, rep)
                 st.pending_reports = []
-                if st.status == E.RESOLVING:   # 아군 정산 도중 죽은 경우: 선택을 다시 받는다
-                    st.status = E.ALLY_TURN
+                if st.status == E.RESOLVING:   # 정산 도중 죽은 경우: 선택을 다시 받는다
+                    st.status = E.ROUND_OPEN
                     st.turn_message_id = 0
-                if st.status == E.ENEMY_TURN:
-                    await self._run_enemy_and_continue(ch)
-                elif st.status == E.ALLY_TURN and not st.turn_message_id:
+                if st.status in (E.ROUND_OPEN, E.ESCAPE) and not st.turn_message_id:
                     await self._open_turn(ch)
                 self._save()
-            await self._resolve_turn()
+            await self._resolve_round()
+            await self._resolve_escape()
         except Exception:  # noqa: BLE001
             logger.exception("카드 전투 복원 실패")
 
     # ------------------------------------------------------------------ 버튼/드롭다운
-    def _turn_guard(self, interaction: discord.Interaction, uid: str, check_message: bool = False) -> Optional[str]:
+    def _turn_guard(self, interaction: discord.Interaction, uid: str, check_message: bool = False,
+                    want: str = E.ROUND_OPEN) -> Optional[str]:
         st = self.state
         if st is None or st.status == E.ENDED or st.status == E.LOBBY:
             return S.ERR_NO_SESSION
-        if st.status != E.ALLY_TURN:
-            return S.ERR_NOT_ALLY_TURN
+        if st.status != want:
+            return S.ERR_NOT_ESCAPE if want == E.ESCAPE else S.ERR_NOT_ALLY_TURN
         if check_message and interaction.message is not None and interaction.message.id != st.turn_message_id:
             return S.ERR_STALE_MESSAGE
         p = st.players.get(uid)
@@ -417,7 +495,7 @@ class CardBattleCog(commands.Cog):
             return S.ERR_NOT_IN_GAME
         if not p.alive():
             return S.RULE_ERRORS["DEAD"]
-        if E.is_stunned(p):
+        if want == E.ROUND_OPEN and E.is_stunned(p):
             return S.RULE_ERRORS["STUNNED"]
         return None
 
@@ -486,7 +564,7 @@ class CardBattleCog(commands.Cog):
         else:
             await interaction.response.edit_message(content=text, embed=None, view=ChosenView(uid))
         await self._refresh_turn_message()
-        await self._resolve_turn()
+        await self._resolve_round()
 
     async def handle_cancel(self, interaction: discord.Interaction, uid: str):
         async with self.lock:
@@ -505,6 +583,55 @@ class CardBattleCog(commands.Cog):
         await interaction.response.edit_message(content=S.OK_CANCELLED, embed=embeds.hand(st, uid, hand),
                                                 view=HandView(st, uid, hand, 0))
         await self._refresh_turn_message()
+
+    # -- 방화벽 --------------------------------------------------------------
+    async def handle_firewall_menu(self, interaction: discord.Interaction):
+        uid = str(interaction.user.id)
+        err = self._turn_guard(interaction, uid, check_message=True)
+        if err and err != S.RULE_ERRORS["STUNNED"]:    # 기절한 사람도 게이지는 쓸 수 있다 (재부팅)
+            await self._reply(interaction, err)
+            return
+        st = self.state
+        await interaction.response.send_message(embed=embeds.firewall_menu(st), view=FirewallView(st, uid), ephemeral=True)
+
+    async def handle_firewall_pick(self, interaction: discord.Interaction, uid: str, option: str):
+        async with self.lock:
+            st = self.state
+            if st is None or st.status != E.ROUND_OPEN:
+                await self._reply(interaction, S.ERR_NOT_ALLY_TURN)
+                return
+            try:
+                ev = E.use_firewall(st, uid, option, self.rng)
+            except E.RuleError as e:
+                await self._reply(interaction, self._rule_msg(e))
+                return
+            self._save()
+            text = S.OK_FIREWALL.format(option=S.FIREWALL_OPTION_KO.get(option, option), cost=ev["cost"], value=ev["value"])
+        if interaction.response.is_done():
+            await interaction.followup.send(text, ephemeral=True)
+        else:
+            await interaction.response.edit_message(content=text, embed=None, view=None)
+        await self._refresh_turn_message()
+        await self._resolve_round()
+
+    # -- 도주 단계 -------------------------------------------------------------
+    async def handle_escape(self, interaction: discord.Interaction, action: str):
+        uid = str(interaction.user.id)
+        async with self.lock:
+            err = self._turn_guard(interaction, uid, check_message=True, want=E.ESCAPE)
+            if err:
+                await self._reply(interaction, err)
+                return
+            st = self.state
+            try:
+                E.submit_escape(st, uid, action)
+            except E.RuleError as e:
+                await self._reply(interaction, self._rule_msg(e))
+                return
+            self._save()
+        await self._reply(interaction, S.OK_ESCAPE_CHOSEN.format(action=S.ESCAPE_ACTION_KO.get(action, action)))
+        await self._refresh_turn_message()
+        await self._resolve_escape()
 
 
 async def setup(bot: commands.Bot):

@@ -1,18 +1,21 @@
 """카드 전투 UI.
 
-TurnView  — 공개 턴 메시지의 영구 버튼 (timeout=None + 고정 custom_id → 재시작 후에도 동작)
-HandView  — 본인에게만 보이는 패 드롭다운 (주최자는 전체 카드, 24장 + '다음' 옵션으로 페이징)
+TurnView   — 공개 턴 메시지의 영구 버튼 (카드 뽑기 / 방화벽). timeout=None + 고정 custom_id → 재시작 후에도 동작
+EscapeView — 도주 단계의 영구 버튼 3개 (숨기 / 이동하기 / 죽은 척하기)
+HandView   — 본인에게만 보이는 패 드롭다운 (주최자는 전체 카드, 24장 + '다음' 옵션으로 페이징)
 TargetView — 카드 선택 후 대상 드롭다운
 ChosenView — 선택 완료 후 '다시 고르기 / 선택 취소'
+FirewallView — 방화벽 지원 드롭다운
 ephemeral 메시지는 그 메시지의 컴포넌트 상호작용에서만 response.edit_message 로 고칠 수 있다.
 """
 from __future__ import annotations
 
-from typing import List, Optional
+from typing import List
 
 import discord
 
 from . import engine as E
+from . import render
 from . import strings as S
 
 COG_NAME = "CardBattleCog"
@@ -40,6 +43,27 @@ class TurnView(discord.ui.View):
     async def draw(self, interaction: discord.Interaction, button: discord.ui.Button):
         await _dispatch(interaction, "handle_draw")
 
+    @discord.ui.button(label=S.BTN_FIREWALL, style=discord.ButtonStyle.secondary, custom_id="cardbattle:firewall", emoji="🧱")
+    async def firewall(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await _dispatch(interaction, "handle_firewall_menu")
+
+
+class EscapeView(discord.ui.View):
+    def __init__(self):
+        super().__init__(timeout=None)
+
+    @discord.ui.button(label=S.ESCAPE_ACTION_KO["hide"], style=discord.ButtonStyle.secondary, custom_id="cardbattle:esc:hide", emoji="🌑")
+    async def hide(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await _dispatch(interaction, "handle_escape", "hide")
+
+    @discord.ui.button(label=S.ESCAPE_ACTION_KO["move"], style=discord.ButtonStyle.secondary, custom_id="cardbattle:esc:move", emoji="🏃")
+    async def move(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await _dispatch(interaction, "handle_escape", "move")
+
+    @discord.ui.button(label=S.ESCAPE_ACTION_KO["dead"], style=discord.ButtonStyle.secondary, custom_id="cardbattle:esc:dead", emoji="💀")
+    async def dead(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await _dispatch(interaction, "handle_escape", "dead")
+
 
 class _Owned(discord.ui.View):
     """본인만 조작 가능한 ephemeral 뷰."""
@@ -62,12 +86,13 @@ class HandSelect(discord.ui.Select):
         pages = max(1, (len(hand) + PAGE_SIZE - 1) // PAGE_SIZE)
         page = page % pages
         chunk = hand[page * PAGE_SIZE:(page + 1) * PAGE_SIZE] if len(hand) > PAGE_SIZE else hand
+        actor = st.players.get(uid)
         options = []
         for cid in chunk:
             c = st.cards.get(cid)
             if c is None:
                 continue
-            desc = f"[{S.KIND_KO.get(c.kind, c.kind)}·{S.TARGET_KO.get(c.target, c.target)}] {c.desc}"
+            desc = render.card_summary(st, c, actor)
             options.append(discord.SelectOption(label=c.name[:100], value=cid, description=desc[:100]))
         if len(hand) > PAGE_SIZE:
             options.append(discord.SelectOption(label=S.HAND_MORE.format(page=page + 1, pages=pages)[:100],
@@ -133,3 +158,24 @@ class ChosenView(_Owned):
         super().__init__(uid)
         self.add_item(BackButton(uid, S.BTN_REPICK))
         self.add_item(CancelButton(uid))
+
+
+class FirewallSelect(discord.ui.Select):
+    def __init__(self, st: E.BattleState, uid: str):
+        self.uid = uid
+        have = int(st.meters.get("firewall", 0))
+        options = []
+        for opt in E.FIREWALL_OPTIONS:
+            cost = E.firewall_cost(st, opt)
+            label = S.FIREWALL_OPTION_KO[opt] + S.FIREWALL_COST.format(cost=cost)
+            options.append(discord.SelectOption(label=label[:100], value=opt, emoji="✅" if have >= cost else "⛔"))
+        super().__init__(placeholder=S.FIREWALL_PLACEHOLDER, options=options, min_values=1, max_values=1)
+
+    async def callback(self, interaction: discord.Interaction):
+        await _dispatch(interaction, "handle_firewall_pick", self.uid, self.values[0])
+
+
+class FirewallView(_Owned):
+    def __init__(self, st: E.BattleState, uid: str):
+        super().__init__(uid, timeout=600)
+        self.add_item(FirewallSelect(st, uid))

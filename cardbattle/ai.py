@@ -10,6 +10,8 @@ from typing import Dict, List, Optional
 
 from . import engine as E
 
+DMG_SCALE = 20.0
+
 PERSONALITIES: Dict[str, Dict[str, float]] = {
     "aggressive": {"attack": 1.4, "defend": 0.6, "hack": 0.8, "special": 1.3},
     "defensive":  {"attack": 0.8, "defend": 1.5, "hack": 1.0, "special": 0.7},
@@ -75,12 +77,13 @@ def score_card(card: E.Card, ctx: AiContext, cfg) -> float:
             return (1.0 - ctx.lowest_ally.hp_ratio()) * 1.5
         if not ctx.players:
             return 0.0
+        # 피해 20 ≈ 1점. 해킹 점수(0.3~1.0)와 같은 눈금으로 맞춘다
         if card.target in ("all_enemy",):
-            s = sum(E.expected_damage(card, ctx.me, p, cfg) / p.max_hp for p in ctx.players)
+            s = sum(E.expected_damage(card, ctx.me, p, cfg) for p in ctx.players) / DMG_SCALE
         else:
             t = _best_attack_target(card, ctx, cfg)
             dmg = E.expected_damage(card, ctx.me, t, cfg)
-            s = dmg / max(1, t.max_hp) + (1.0 if dmg >= t.hp else 0.0)
+            s = dmg / DMG_SCALE + (1.0 if dmg >= t.hp else 0.0)
         mis = ctx.me.mod("misfire")
         if mis:
             s *= max(0.0, 1.0 - mis.value)
@@ -104,15 +107,19 @@ def score_card(card: E.Card, ctx: AiContext, cfg) -> float:
         if not ctx.players:
             return 0.0
         kinds = [e.kind for e in card.effects]
-        s = 0.5
+        s = 0.3
         if any(not any(k in ctx.player_debuffs.get(p.id, []) for k in kinds) for p in ctx.players):
-            s += 0.5
-        if "atk_down" in kinds and attacks_last >= 1:
             s += 0.3
+        else:
+            s -= 0.2                                   # 전원 이미 걸려 있음
+        if "atk_down" in kinds and attacks_last >= 1:
+            s += 0.2
         if "stun" in kinds:
-            s += 0.4
+            s += 0.5
         if "redirect_random" in kinds and len(ctx.players) >= 3:
             s += 0.2
+        if card.target == "all_enemy":
+            s += 0.1 * (len(ctx.players) - 1)
         return s
     return 0.0
 

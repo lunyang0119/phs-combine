@@ -27,7 +27,7 @@ SWEEP_GUILD_IDS = os.getenv("MOG_SWEEP_GUILD_IDS", "").strip()
 COGS_TO_LOAD = [
     'character_commands', 'combat_commands', 'utility_commands', 'shop_commands', 'archive',
     'mogindex_commands', 'cardbattle.cog',
-    # 'fugitive.cog',  # 침입자 추적 명령 비활성화 (로직은 fugitive/ 에 그대로; 다시 켜려면 주석 해제 후 !동기화)
+    'fugitive.cog',  # 침입자 추적 명령 비활성화 (로직은 fugitive/ 에 그대로; 다시 켜려면 주석 해제 후 !동기화)
 ]
 
 intents = discord.Intents.default()

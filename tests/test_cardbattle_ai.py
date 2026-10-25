@@ -11,8 +11,7 @@ def mk(personality="aggressive", me_hp=30, players=2):
     cfg = flat_cfg()
     ps = [E.player_combatant(str(i + 1), {"max_hp": 40, "physics": 12 + i}, f"P{i + 1}", cfg) for i in range(players)]
     me = E.Combatant("e1", "적", E.ENEMY, 45, me_hp, physics=10, magic=10, personality=personality)
-    st = E.new_battle(ps, [me], mk_cards(), cfg, host_id="99")
-    st.status = E.ENEMY_TURN
+    st = E.new_battle(ps, [me], mk_cards(), cfg, host_id="99", rng=random.Random(1))
     return st, st.enemies["e1"]
 
 
@@ -23,11 +22,14 @@ def test_defensive_low_hp_prefers_defend():
     assert ch.card_id == "guard" and ch.target_id == "e1"
 
 
-def test_aggressive_prefers_killing_blow_target():
+def test_aggressive_prefers_killing_blow_target_over_hack():
     st, me = mk("aggressive")
     st.players["2"].hp = 3
     ch = ai.choose(st, me, ["atk", "guard", "jam"], random.Random(1))
     assert ch.card_id == "atk" and ch.target_id == "2"
+    st, me = mk("aggressive")                                      # 처치 불가여도 공격형은 공격
+    ch = ai.choose(st, me, ["atk", "jam"], random.Random(1))
+    assert ch.card_id == "atk"
 
 
 def test_hacker_prefers_hack_on_undebuffed_target():
@@ -60,3 +62,13 @@ def test_choose_targets_are_valid_and_seeded_reproducible():
         assert a.target_id in {t.id for t in E.valid_targets(st, me, card)}
         assert a.target_id != "3"
     assert ai.choose(st, me, [], random.Random(1)) is None
+
+
+def test_open_round_uses_ai_and_sets_last_player_kinds():
+    st, me = mk("aggressive")
+    assert st.enemy_choices["e1"].card_id in st.cards and st.intents["e1"]["kind"] in E.KINDS
+    st.hands = {"1": ["atk"], "2": ["guard"]}
+    E.submit_choice(st, "1", "atk", "e1")
+    E.submit_choice(st, "2", "guard")
+    E.resolve_round(st, random.Random(1))
+    assert sorted(st.last_player_kinds) == ["attack", "defend"]

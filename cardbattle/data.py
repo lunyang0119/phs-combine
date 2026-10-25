@@ -14,6 +14,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Dict, List, Mapping, Optional, Protocol
 
+from . import config as cfgmod
 from . import engine as E
 
 logger = logging.getLogger(__name__)
@@ -123,13 +124,14 @@ def _f(r: Mapping[str, Any], key: str, default: float) -> float:
         raise DataError(f"{key} 는 숫자여야 합니다: {s!r}")
 
 
+def _list(text: str) -> List[str]:
+    return [p.strip() for p in str(text or "").split(";") if p.strip()]
+
+
 def parse_effects(text: str) -> List[E.Effect]:
     """`kind[:value[:turns[:chance]]]` 를 `;` 로 연결한 문자열."""
     out: List[E.Effect] = []
-    for chunk in str(text or "").split(";"):
-        chunk = chunk.strip()
-        if not chunk:
-            continue
+    for chunk in _list(text):
         parts = [p.strip() for p in chunk.split(":")]
         kind = parts[0]
         if kind not in E.EFFECT_KINDS:
@@ -142,6 +144,59 @@ def parse_effects(text: str) -> List[E.Effect]:
             raise DataError(f"효과 형식 오류: {chunk!r}")
         out.append(E.Effect(kind=kind, value=value, turns=max(1, turns), chance=min(1.0, max(0.0, chance))))
     return out
+
+
+def parse_tags(text: str) -> List[str]:
+    tags = _list(text)
+    for t in tags:
+        if t not in E.CARD_TAGS:
+            raise DataError(f"알 수 없는 태그: {t!r} (가능: {', '.join(E.CARD_TAGS)})")
+    return tags
+
+
+def parse_combo(text: str) -> Optional[E.Combo]:
+    """`target_has:stun:dmg_x:1.5` → Combo. 비어 있으면 None."""
+    s = str(text or "").strip()
+    if not s:
+        return None
+    parts = [p.strip() for p in s.split(":")]
+    if len(parts) != 4:
+        raise DataError(f"combo 형식 오류 (조건:수정자:보너스:값): {s!r}")
+    cond, mod, bonus, value = parts
+    if cond not in E.COMBO_CONDS:
+        raise DataError(f"combo 조건 {cond!r} (가능: {', '.join(E.COMBO_CONDS)})")
+    if mod not in E.MODIFIER_KINDS:
+        raise DataError(f"combo 수정자 {mod!r} (가능: {', '.join(E.MODIFIER_KINDS)})")
+    if bonus not in E.COMBO_BONUSES:
+        raise DataError(f"combo 보너스 {bonus!r} (가능: {', '.join(E.COMBO_BONUSES)})")
+    try:
+        v = float(value)
+    except ValueError:
+        raise DataError(f"combo 값은 숫자여야 합니다: {value!r}")
+    return E.Combo(cond=cond, mod=mod, bonus=bonus, value=v)
+
+
+def parse_traits(text: str) -> Dict[str, float]:
+    """`cheap_chrome;evade:0.5;doll` → {"cheap_chrome": 1.0, "evade": 0.5, "doll": 1.0}"""
+    out: Dict[str, float] = {}
+    for chunk in _list(text):
+        name, _, val = chunk.partition(":")
+        name = name.strip()
+        if name not in E.TRAITS:
+            raise DataError(f"알 수 없는 특성: {name!r} (가능: {', '.join(E.TRAITS)})")
+        try:
+            out[name] = float(val) if val.strip() else 1.0
+        except ValueError:
+            raise DataError(f"특성 값은 숫자여야 합니다: {chunk!r}")
+    return out
+
+
+def parse_gimmicks(text: str) -> List[str]:
+    gs = _list(text)
+    for g in gs:
+        if g not in E.GIMMICKS:
+            raise DataError(f"알 수 없는 기믹: {g!r} (가능: {', '.join(E.GIMMICKS)})")
+    return gs
 
 
 def card_from_row(r: Mapping[str, Any]) -> E.Card:
@@ -163,8 +218,13 @@ def card_from_row(r: Mapping[str, Any]) -> E.Card:
     effects = parse_effects(_s(r, "effects"))
     if not effects:
         raise DataError(f"[{cid}] effects 가 비어 있습니다")
+    try:
+        tags = parse_tags(_s(r, "tags"))
+        combo = parse_combo(_s(r, "combo"))
+    except DataError as e:
+        raise DataError(f"[{cid}] {e}")
     return E.Card(id=cid, name=_s(r, "name", cid), kind=kind, target=target, stat=stat, pool=pool,
-                  weight=_f(r, "weight", 1.0), effects=effects, desc=_s(r, "desc"))
+                  weight=_f(r, "weight", 1.0), effects=effects, desc=_s(r, "desc"), tags=tags, combo=combo)
 
 
 def enemy_from_row(r: Mapping[str, Any]) -> E.EnemyDef:
@@ -181,19 +241,20 @@ def enemy_from_row(r: Mapping[str, Any]) -> E.EnemyDef:
     max_hp = _i(r, "max_hp", 0)
     if max_hp <= 0:
         raise DataError(f"[{eid}] max_hp 는 1 이상이어야 합니다")
+    try:
+        traits = parse_traits(_s(r, "traits"))
+    except DataError as e:
+        raise DataError(f"[{eid}] {e}")
     return E.EnemyDef(id=eid, name=_s(r, "name", eid), max_hp=max_hp,
                       physics=_i(r, "physics", 10), magic=_i(r, "magic", 10),
                       agility=_i(r, "agility", 10), charm=_i(r, "charm", 10),
-                      personality=personality, pool=pool)
+                      personality=personality, pool=pool, traits=traits, color=_s(r, "color"))
 
 
 def parse_enemy_list(text: str, known: Mapping[str, Any]) -> List[str]:
     """`grunt*3;guard` → ['grunt','grunt','grunt','guard']"""
     out: List[str] = []
-    for chunk in str(text or "").split(";"):
-        chunk = chunk.strip()
-        if not chunk:
-            continue
+    for chunk in _list(text):
         eid, _, n = chunk.partition("*")
         eid = eid.strip()
         if eid not in known:
@@ -213,7 +274,14 @@ def battle_from_row(r: Mapping[str, Any], known: Mapping[str, Any]) -> E.BattleD
     enemies = parse_enemy_list(_s(r, "enemies"), known)
     if not enemies:
         raise DataError(f"[{bid}] 적이 없습니다")
-    return E.BattleDef(id=bid, name=_s(r, "name", bid), enemies=enemies, desc=_s(r, "desc"))
+    try:
+        gimmicks = parse_gimmicks(_s(r, "gimmicks"))
+        overrides = cfgmod.parse_overrides(_s(r, "overrides"))
+        cfgmod.build_config(overrides)          # 키·타입 검증
+    except (DataError, cfgmod.ConfigError) as e:
+        raise DataError(f"[{bid}] {e}")
+    return E.BattleDef(id=bid, name=_s(r, "name", bid), enemies=enemies, desc=_s(r, "desc"),
+                       gimmicks=gimmicks, overrides=overrides, players=_s(r, "players"))
 
 
 @dataclass
@@ -253,4 +321,17 @@ def load_game_data(source: DataSource) -> GameData:
             raise DataError(f"{side} 쪽이 뽑을 카드가 없습니다 (pool 확인)")
     if not gd.battles:
         raise DataError("전투가 하나도 없습니다")
+    for b in gd.battles.values():
+        if "terminal" in b.gimmicks and E.PASS_CARD not in gd.cards:
+            raise DataError(f"[{b.id}] terminal 기믹에는 card_id={E.PASS_CARD} 카드(pool=fixed)가 필요합니다")
+        if "doll" in b.gimmicks:
+            if E.BREAK_CARD not in gd.cards:
+                raise DataError(f"[{b.id}] doll 기믹에는 card_id={E.BREAK_CARD} 카드(pool=fixed)가 필요합니다")
+            if not any("doll" in gd.enemies[e].traits for e in b.enemies):
+                raise DataError(f"[{b.id}] doll 기믹인데 traits 에 doll 이 있는 적이 없습니다")
+            cfg = cfgmod.build_config(b.overrides)
+            for chunk in str(cfg.get("doll_modes", "")).split(";"):
+                parts = [p.strip() for p in chunk.split(":")]
+                if len(parts) >= 2 and parts[1] not in gd.cards:
+                    raise DataError(f"[{b.id}] doll_modes 의 카드 {parts[1]!r} 가 없습니다")
     return gd

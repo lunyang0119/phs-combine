@@ -1,4 +1,5 @@
-enemy_id,name,max_hp,physics,magic,agility,charm,personality,pool
-grunt,신라 보병,30,12,8,10,8,aggressive,enemy
-guard,경비 로봇,45,10,8,6,6,defensive,enemy
-netrunner,해커,25,8,14,12,10,hacker,enemy
+enemy_id,name,max_hp,physics,magic,agility,charm,personality,pool,traits,color
+scav_pipe,스캐빈저 (쇠파이프),40,14,6,9,6,aggressive,enemy,cheap_chrome,#C84B4B
+scav_gun,스캐빈저 (권총),32,10,8,13,6,aggressive,enemy,cheap_chrome,#E07A3F
+scav_boss,스캐빈저 리더,55,14,10,10,8,hacker,enemy,cheap_chrome,#B03060
+doll,고장난 돌,120,16,10,18,16,aggressive,enemy,doll;evade:0.5;regen:8,#FF4FA3
