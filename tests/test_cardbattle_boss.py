@@ -5,6 +5,7 @@ import pytest
 
 from cardbattle import engine as E
 from cardbattle import render as R
+from cardbattle import strings as S
 from cardbattle import tutorial as T
 
 from tests.test_cardbattle_engine import always, enemy_plays, flat_cfg, hp, play, wait_chooser
@@ -32,7 +33,7 @@ def test_scatter_damage_daemon_bite_and_expiry():
     rep = play(st, {pid: ("guard", None)})
     me = next(l for l in rep["lines"] if l["actor_id"] == pid)
     assert me["daemon"]["amount"] == 5 and hp(st, pid) == before - 5 and "daemon_bite" in rep["tips"]
-    assert "🦠데몬 −5" in R.log_lines(me)[0]
+    assert S.LOG_DAEMON_BITE.format(amount=5, hp=before - 5, max=40) in R.log_lines(me)[0]
     assert st.players[pid].mod("daemon") is None                                          # 다음 라운드 끝에 만료
     rep = play(st, {pid: ("guard", None)})
     assert "daemon" not in next(l for l in rep["lines"] if l["actor_id"] == pid)

@@ -319,9 +319,10 @@ def main(argv=None):
     ap.add_argument("--set", action="append", default=[], metavar="key=value")
     ap.add_argument("--policy", choices=sorted(POLICIES) + ["all"], default="all")
     ap.add_argument("--all", action="store_true", help="모든 전투")
+    ap.add_argument("--visible-only", action="store_true", help="Battles.csv 에서 # 으로 숨긴 전투는 제외")
     a = ap.parse_args(argv)
 
-    gd = D.load_game_data(D.CsvSource(a.data))
+    gd = D.load_game_data(D.CsvSource(a.data), include_commented=not a.visible_only)
     overrides = dict(kv.split("=", 1) for kv in a.set)
     policies = list(POLICIES.values()) if a.policy == "all" else [POLICIES[a.policy]]
     battles = list(gd.battles) if a.all else [a.battle]

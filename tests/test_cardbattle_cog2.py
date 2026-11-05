@@ -4,6 +4,7 @@ import random
 
 from cardbattle import engine as E
 from cardbattle import gig
+from cardbattle import render
 from cardbattle import strings as S
 from cardbattle.views import PrepView, TargetView, TurnView
 
@@ -21,6 +22,7 @@ def test_prep_buttons_then_battle_and_payout(tmp_path):
         cog = make_cog(ch, tmp_path)
         await setup_battle(cog, ch, prep_enabled=True)
         st = cog.state
+        st.config["prep_sandbox"] = False                 # b01 은 임시 금고라 보수를 안 주므로, 이 테스트에서는 실제 금고로
         assert st.status == E.PREP and st.prep_message_id and st.prep["share"] == 100
         pm = prep_message(cog, ch)
         assert isinstance(pm.view, PrepView) and "준비 단계" in text(pm) and "🔫" not in text(pm)
@@ -64,8 +66,9 @@ def test_prep_buttons_then_battle_and_payout(tmp_path):
         await pick(cog, ch, 1, "atk_sweep")
         st = cog.state
         assert st.status == E.ENDED and st.winner == E.ALLY
-        win = text(ch.sent[-1])
+        win = text(ch.sent[-2])
         assert "보수" in win and "무기" in win and isinstance(st.meters.get("payout"), dict)
+        assert S.END_TITLE in text(ch.sent[-1])                                 # 종료 배너가 맨 뒤에 따로
         pot = gig.load_pot(cog.gig_path)
         assert pot is not None and pot == st.meters["payout"]["pot_after"] and pot > 0
     asyncio.run(body())
@@ -130,7 +133,8 @@ def test_bonewa_start_posts_ambush_before_first_turn(tmp_path):
         assert st.status == E.ROUND_OPEN and st.round == 1 and st.has("first_strike") and st.has("ice")
         texts = [text(m) for m in ch.sent]
         intro = next(t for t in texts if "규칙" in t and "몸의 보느와" in t)
-        assert "데몬" in intro and "ICE" in intro and "생명 유지" in intro and "선제" in intro
+        rules = render.intro_rules(st)
+        assert len(rules) == len(st.gimmicks) + 1 and all(r and r in intro for r in rules)   # 기믹 6줄 + 방화벽
         idx_amb = next(i for i, t in enumerate(texts) if "기습" in t)
         idx_turn = next(i for i, m in enumerate(ch.sent) if m.id == st.turn_message_id)
         assert idx_amb < idx_turn and not st.pending_reports
@@ -181,4 +185,41 @@ def test_target_select_marks_overkill_risk(tmp_path):
         await cog.handle_card_pick(i3, "1", "atk_knee")
         view = last(i3)[3]
         assert isinstance(view, TargetView) and not any("⚠" in o.label for o in view.children[0].options)
+    asyncio.run(body())
+
+
+def test_host_gets_random_hand_unless_admin_option(tmp_path):
+    async def body():
+        ch = FakeChannel()
+        cog = make_cog(ch, tmp_path)
+        await setup_battle(cog, ch, admin_sees_all=False)
+        st = cog.state
+        tm = turn_message(cog, ch)
+        await cog.handle_draw(interaction(1, ch, message=tm))
+        assert len(E.hand_for(st, "1")) == 3                                     # 주최자도 보통 패
+        i = interaction(2, ch)
+        await cog._cmd_admin(i, None)
+        assert last(i)[1] == S.ERR_HOST_ONLY
+        i = interaction(1, ch)
+        await cog._cmd_admin(i, None)
+        assert last(i)[1] == S.OK_ADMIN_ON and st.all_cards == ["1"] and "1" not in st.hands
+        pool = [c for c in st.cards.values() if c.pool in ("both", "ally")]
+        assert len(E.hand_for(st, "1")) == len(pool)
+        await cog.handle_draw(interaction(1, ch, message=tm))
+        assert len(E.hand_for(st, "1")) == len(pool) and "1" not in st.hands     # 전체 목록은 저장하지 않음
+        i = interaction(1, ch)
+        await cog._cmd_admin(i, None)
+        assert last(i)[1] == S.OK_ADMIN_OFF and st.all_cards == []
+        await cog.handle_draw(interaction(1, ch, message=tm))
+        assert len(E.hand_for(st, "1")) == 3
+        # 로비에서 켜 두면 시작한 전투로 이어진다
+        ch2 = FakeChannel()
+        cog2 = make_cog(ch2, tmp_path)
+        await cog2._cmd_host(interaction(1, ch2), None)
+        cog2.state.config.update({"report_delay_sec": 0.0, "prep_enabled": False, "admin_sees_all": False})
+        await cog2._cmd_join(interaction(1, ch2), None)
+        await cog2._cmd_join(interaction(2, ch2), None)
+        await cog2._cmd_admin(interaction(1, ch2), None)
+        await cog2._cmd_start(interaction(1, ch2), "b01")
+        assert cog2.state.all_cards == ["1"] and len(E.hand_for(cog2.state, "1")) > 3
     asyncio.run(body())

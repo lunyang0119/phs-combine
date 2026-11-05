@@ -292,6 +292,7 @@ class BattleState:
     prep: Dict[str, Any] = field(default_factory=dict)        # 준비 단계 (분배금·행동 수·준비 완료·굴림 기록)
     script: List[Dict[str, Any]] = field(default_factory=list) # 튜토리얼 대본 스냅샷
     prep_message_id: int = 0
+    all_cards: List[str] = field(default_factory=list)        # `/카드 옵션:관리자` 로 이번 전투에 한해 전체 카드를 보는 참가자
 
     # -- 조회 --------------------------------------------------------------
     def unit(self, uid: str) -> Optional[Combatant]:
@@ -619,7 +620,10 @@ def draw_from_pool(pool: Sequence[Card], k: int, rng: Rng) -> List[str]:
 
 
 def admin_sees_all(st: BattleState, c: Combatant) -> bool:
-    return bool(c.is_host and st.config.get("admin_sees_all", True))
+    """전체 카드 목록에서 고르는 사람: `/카드 옵션:관리자` 를 쓴 참가자, 또는 config admin_sees_all 이 켜진 주최자."""
+    if c.id in st.all_cards:
+        return True
+    return bool(c.is_host and st.config.get("admin_sees_all", False))
 
 
 def is_grappled(c: Combatant) -> bool:

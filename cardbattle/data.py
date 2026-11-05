@@ -131,6 +131,19 @@ def _list(text: str) -> List[str]:
     return [p.strip() for p in str(text or "").split(";") if p.strip()]
 
 
+def _row_id(r: Mapping[str, Any], key: str, include_commented: bool) -> Optional[str]:
+    """행의 id. 빈 행은 None. `#` 으로 시작하는 id 는 주석 행: 기본은 건너뛰고(None),
+    include_commented 면 `#` 을 뗀 id 를 돌려준다 (테스트·시뮬레이션이 숨긴 전투도 검증하기 위해)."""
+    ident = _s(r, key)
+    if not ident:
+        return None
+    if ident.startswith("#"):
+        if not include_commented:
+            return None
+        ident = ident.lstrip("#").strip()
+    return ident or None
+
+
 def parse_effects(text: str) -> List[E.Effect]:
     """`kind[:value[:turns[:chance]]]` 를 `;` 로 연결한 문자열.
     scatter_damage / daemon (COUNT_KINDS) 은 셋째 슬롯이 지속이 아니라 **무작위 대상 수**다."""
@@ -308,25 +321,32 @@ def _mode_cards(cfg: Mapping[str, Any], key: str) -> List[str]:
     return out
 
 
-def load_game_data(source: DataSource) -> GameData:
+def load_game_data(source: DataSource, include_commented: bool = False) -> GameData:
+    """CSV/시트 전체를 읽고 검증한다. id 가 `#` 으로 시작하는 행은 주석(숨김)이며 include_commented 일 때만 읽는다."""
     gd = GameData()
     for r in source.rows("cards"):
-        if not _s(r, "card_id"):
+        ident = _row_id(r, "card_id", include_commented)
+        if ident is None:
             continue
+        r = dict(r, card_id=ident)
         c = card_from_row(r)
         if c.id in gd.cards:
             raise DataError(f"card_id 중복: {c.id}")
         gd.cards[c.id] = c
     for r in source.rows("enemies"):
-        if not _s(r, "enemy_id"):
+        ident = _row_id(r, "enemy_id", include_commented)
+        if ident is None:
             continue
+        r = dict(r, enemy_id=ident)
         e = enemy_from_row(r)
         if e.id in gd.enemies:
             raise DataError(f"enemy_id 중복: {e.id}")
         gd.enemies[e.id] = e
     for r in source.rows("battles"):
-        if not _s(r, "battle_id"):
+        ident = _row_id(r, "battle_id", include_commented)
+        if ident is None:
             continue
+        r = dict(r, battle_id=ident)
         b = battle_from_row(r, gd.enemies)
         if b.id in gd.battles:
             raise DataError(f"battle_id 중복: {b.id}")

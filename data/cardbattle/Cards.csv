@@ -9,7 +9,7 @@ hack_jam,무기 글리치,hack,enemy,magic,both,5,atk_down:0.3,,,대상의 다�
 hack_misfire,사이버웨어 고장,hack,enemy,magic,both,5,misfire:0.5,,,대상의 다음 공격이 50% 확률로 불발
 hack_redirect,적대 인식,hack,enemy,magic,both,3,redirect_random:1,,,대상의 다음 공격이 무작위 대상에게 향함
 hack_stun,시스템 리셋,hack,enemy,magic,both,2,stun:1,,,대상의 다음 행동 불가
-sp_overdrive,샌디스탄 돌격,special,enemy,physics,ally,2,damage:14;self_damage:3,lethal,target_has:grapple:dmg_x:1.5,강타 + 반동 3. 살상 위력(제압 시 과잉 제압). 붙잡고 있는 적에게 1.5배
+sp_overdrive,산데비스탄 돌격,special,enemy,physics,ally,2,damage:14;self_damage:3,lethal,target_has:grapple:dmg_x:1.5,강타 + 반동 3. 살상 위력(제압 시 과잉 제압). 붙잡고 있는 적에게 1.5배
 sp_burst,과부하 핵,special,enemy,magic,ally,2,damage:12,,target_has:misfire:dmg_x:1.5,고출력 퀵핵. 사이버웨어 고장 상태의 적에게 1.5배
 heal_kit,맥스닥 흡입기,special,ally,magic,ally,4,heal:6,,,아군 HP 6 + RAM 보정 회복. 쓰러진 아군도 일으킴
 e_pistol,권총 사격,attack,enemy,physics,enemy,6,damage:7,,,스캐빈저의 조잡한 권총

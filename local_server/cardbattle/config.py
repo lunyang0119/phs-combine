@@ -24,7 +24,7 @@ DEFAULTS: Dict[str, Any] = {
     "report_delay_sec": 1.0,      # 정산 보고 게시 후 다음 라운드 메시지까지 대기
     "use_current_hp": False,      # True 면 시트의 current_hp 로 시작
     "allow_unregistered": False,  # 캐릭터 시트에 없는 사람도 기본 스탯으로 참가 허용
-    "admin_sees_all": True,       # 주최자는 전체 카드에서 고른다
+    "admin_sees_all": False,      # True 면 주최자가 항상 전체 카드에서 고른다. 기본은 모두 무작위 패 (`/카드 옵션:관리자` 로 사람별 전환)
     "default_hp": 30,             # allow_unregistered 참가자 HP
     "default_stat": 10,
     "redirect_includes_self": False,

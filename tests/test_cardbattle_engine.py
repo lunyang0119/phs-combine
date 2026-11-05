@@ -20,7 +20,8 @@ from cardbattle import render as R
 def flat_cfg(**over):
     cfg = C.build_config()
     cfg.update({"damage_variance": 0, "stat_divisor": 1000, "ai_noise": 0.0, "hand_size": 3,
-                "prep_enabled": False, "firewall_options": "cover;reboot;aim;scan;maxdoc"})
+                "prep_enabled": False, "firewall_options": "cover;reboot;aim;scan;maxdoc",
+                "admin_sees_all": True})
     cfg.update(over)
     return cfg
 
@@ -139,7 +140,8 @@ def test_parse_effects_tags_combo_traits_grammar():
 
 
 def test_load_shipped_csvs():
-    gd = D.load_game_data(D.CsvSource())
+    gd = D.load_game_data(D.CsvSource(), include_commented=True)   # # 으로 숨긴 보스전도 검증
+    assert "scav3" not in D.load_game_data(D.CsvSource()).battles       # 봇에는 숨겨져 있음
     assert gd.battles["scav3"].enemies == ["scav_pipe", "scav_gun", "scav_boss"]
     assert gd.battles["scav3"].gimmicks == ["nonlethal", "ncpd", "drag"]
     assert gd.battles["doll4"].gimmicks == ["nonlethal", "doll", "terminal"]
@@ -181,6 +183,9 @@ def test_load_rejects_unknown_enemy_empty_battle_and_missing_fixed_cards(tmp_pat
     _write_csvs(tmp_path, "battle_id,name,enemies,desc\nb,x,g*2;g,\n")
     gd = D.load_game_data(D.CsvSource(tmp_path))
     assert gd.battles["b"].enemies == ["g", "g", "g"] and gd.battles["b"].gimmicks == []
+    _write_csvs(tmp_path, "battle_id,name,enemies,desc\nb,x,g,\n#h,hidden,g,\n")
+    assert list(D.load_game_data(D.CsvSource(tmp_path)).battles) == ["b"]                        # 주석 행 숨김
+    assert list(D.load_game_data(D.CsvSource(tmp_path), include_commented=True).battles) == ["b", "h"]
     _write_csvs(tmp_path, "battle_id,name,enemies,gimmicks,desc\nb,x,g,terminal,\n")
     with pytest.raises(D.DataError):               # pass_terminal 카드 없음
         D.load_game_data(D.CsvSource(tmp_path))

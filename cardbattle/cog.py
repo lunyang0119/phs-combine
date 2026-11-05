@@ -42,6 +42,7 @@ OPTION_CHOICES = [
     app_commands.Choice(name="현황", value="status"),
     app_commands.Choice(name="금고", value="vault"),
     app_commands.Choice(name="규칙", value="rules"),
+    app_commands.Choice(name="관리자", value="admin"),
 ]
 MAX_AUTO_RESOLVE = 20
 BOARD_FILENAME = "board.png"
@@ -151,7 +152,7 @@ class CardBattleCog(commands.Cog):
                 out.append(app_commands.Choice(name=label[:100], value=b.id))
         return out[:25]
 
-    @app_commands.command(name="카드", description="카드 전투 미니게임 — 주최 / 참가 / 시작 / 턴종료 / 종료 / 현황 / 금고 / 규칙")
+    @app_commands.command(name="카드", description="카드 전투 미니게임 — 주최 / 참가 / 시작 / 턴종료 / 종료 / 현황 / 금고 / 규칙 / 관리자")
     @app_commands.describe(옵션="실행할 동작", 전투id="시작할 전투 ID (옵션:시작 때 필요. 인원수에 맞는 id)",
                            금액="옵션:금고 에서 팀 금고를 이 값으로 맞춤 (주최자·관리자)", 도움말=help_option.HELP_OPTION_DESC)
     @app_commands.choices(옵션=OPTION_CHOICES)
@@ -296,6 +297,7 @@ class CardBattleCog(commands.Cog):
                 await self._reply(interaction, self._rule_msg(e))
                 return
             new.guild_id, new.channel_id, new.lobby_message_id = st.guild_id, st.channel_id, st.lobby_message_id
+            new.all_cards = [u for u in st.all_cards if u in new.players]
             self.state = new
             self._save()
             ch = await self._channel(new.channel_id)
@@ -381,6 +383,30 @@ class CardBattleCog(commands.Cog):
             return
         pot = await asyncio.to_thread(gig.set_pot, int(amount), self.gig_path)
         await self._reply(interaction, S.OK_VAULT_SET.format(pot=pot))
+
+    async def _cmd_admin(self, interaction: discord.Interaction, _, amount=None):
+        """이번 전투에 한해 전체 카드 목록에서 고른다 (주최자·관리자만, 다시 쓰면 해제)."""
+        uid = str(interaction.user.id)
+        async with self.lock:
+            st = self.state
+            if st is None or st.status == E.ENDED:
+                await self._reply(interaction, S.ERR_NO_SESSION)
+                return
+            if not (self._is_host(interaction) or self._is_admin(interaction)):
+                await self._reply(interaction, S.ERR_HOST_ONLY)
+                return
+            if uid not in st.players:
+                await self._reply(interaction, S.ERR_ADMIN_NOT_PLAYER)
+                return
+            if uid in st.all_cards:
+                st.all_cards.remove(uid)
+                text = S.OK_ADMIN_OFF
+            else:
+                st.all_cards.append(uid)
+                text = S.OK_ADMIN_ON
+            st.hands.pop(uid, None)          # 이번 라운드 패를 다시 뽑게 한다
+            self._save()
+        await self._reply(interaction, text)
 
     async def _cmd_rules(self, interaction: discord.Interaction, _, amount=None):
         batches = embeds.chunk_embeds(embeds.rules_sections())
@@ -582,6 +608,7 @@ class CardBattleCog(commands.Cog):
                 logger.exception("보수 지급 실패")
             self._save()
             await ch.send(embed=embeds.winner(st))
+            await ch.send(embed=embeds.resolved(st))
             return
         if st.status == E.ESCAPE:
             if not st.escape.get("history"):

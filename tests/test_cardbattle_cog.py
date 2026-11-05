@@ -5,7 +5,9 @@ from types import SimpleNamespace
 
 from discord import app_commands
 
+from cardbattle import data as D
 from cardbattle import engine as E
+from cardbattle import render
 from cardbattle import strings as S
 from cardbattle.cog import CardBattleCog
 from cardbattle.views import EscapeView, FirewallView, HandView, TargetView, TurnView
@@ -127,6 +129,11 @@ def make_cog(channel, tmp_path):
     cog.gig_path = str(tmp_path / "gig.json")
     cog.rng = random.Random(3)
     cog.registered_views = views
+
+    def load_all():                                   # # 으로 숨긴 보스전도 테스트에서는 시작할 수 있게
+        cog.data = D.load_game_data(D.CsvSource(), include_commented=True)
+        return cog.data
+    cog._load_data = load_all
     return cog
 
 
@@ -138,6 +145,7 @@ async def setup_battle(cog, channel, host=1, players=(1, 2), battle="b01", **cfg
     await cog._cmd_host(interaction(host, channel), None)
     cog.state.config["report_delay_sec"] = 0.0
     cfg.setdefault("prep_enabled", False)       # 준비 단계는 전용 테스트에서만
+    cfg.setdefault("admin_sees_all", True)      # 기존 테스트는 주최자가 전체 카드를 본다고 가정
     cog.state.config.update(cfg)
     for uid in players:
         await cog._cmd_join(interaction(uid, channel), None)
@@ -439,7 +447,9 @@ def test_status_embed_in_round_and_doll_battle_intro(tmp_path):
         st = cog.state
         assert st.has("doll") and st.meters["terminal_holder"] == "1" and st.meters["chip"] == 8
         intro = text(ch.sent[-2])
-        assert "단말기 소지자(닉1)" in intro and "인격 칩" in intro
+        rules = render.intro_rules(st)
+        assert len(rules) == len(st.gimmicks) + 1 and all(r in intro for r in rules)   # 기믹별 한 줄 + 방화벽 (prep 꺼짐)
+        assert "닉1" in S.INTRO_RULES["terminal"].format(holder="닉1") and "닉1" in intro.split("규칙", 1)[-1]
         tm = text(turn_message(cog, ch))
         assert "칩 안정도 8/8" in tm and "액정 3/3" in tm and "모드" in tm
         i = interaction(2, ch)

@@ -34,7 +34,7 @@ def parse_script(rows: Sequence[Mapping[str, Any]], cards: Mapping[str, Any]) ->
     out: Dict[str, List[Dict[str, Any]]] = {}
     for r in rows:
         sid = _s(r, "script_id")
-        if not sid:
+        if not sid or sid.startswith("#"):
             continue
         try:
             rnd = int(float(_s(r, "round")))

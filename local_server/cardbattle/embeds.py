@@ -134,14 +134,6 @@ def report(st: E.BattleState, rep: Dict[str, Any], with_board: bool = True) -> L
     if ev:
         lines.append("")
         lines.extend(ev)
-    tips = render.tip_lines(rep.get("tips") or [])
-    if tips:
-        lines.append("")
-        lines.extend(tips)
-    tl = render.tutorial_line(rep.get("tutorial"))
-    if tl:
-        lines.append("")
-        lines.append(tl)
     if not lines:
         lines = ["(행동 없음)"]
     parts = render.chunks("\n".join(lines), DESC_LIMIT)
@@ -152,6 +144,13 @@ def report(st: E.BattleState, rep: Dict[str, Any], with_board: bool = True) -> L
     if with_board:
         _meters_field(out[-1], st)
         _board_fields(out[-1], st, rep.get("hp"))
+    # 💡 팁과 튜토리얼 피드백은 현황판 아래, 별도 임베드로 (눈에 띄게)
+    extra = render.tip_lines(rep.get("tips") or [])
+    tl = render.tutorial_line(rep.get("tutorial"))
+    if tl:
+        extra.append(tl)
+    if extra:
+        out.append(discord.Embed(title=S.TIPS_TITLE, color=COLOR_COACH, description="\n".join(extra)[:DESC_LIMIT]))
     return out
 
 
@@ -211,6 +210,12 @@ def winner(st: E.BattleState) -> discord.Embed:
         e.add_field(name=S.WEAPONS_FIELD, value="\n".join(weapons)[:FIELD_LIMIT], inline=False)
     _board_fields(e, st)
     return e
+
+
+def resolved(st: E.BattleState) -> discord.Embed:
+    """결과 임베드 뒤에 따로 올리는 초록 배너: 전투가 확실히 끝났음을 알린다."""
+    desc = S.END_DESC_TUTORIAL if st.end_reason == "tutorial" else S.END_DESC
+    return discord.Embed(title=S.END_TITLE, color=COLOR_ALLY, description=desc)
 
 
 def prep(st: E.BattleState) -> discord.Embed:
