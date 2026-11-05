@@ -1,12 +1,18 @@
 battle_id,name,players,enemies,gimmicks,overrides,desc
-b01,연습: 뒷골목 소란,1-3,scav_pipe;scav_gun,,,스캐빈저 둘. 기믹 없는 연습 전투
-scav3,퍼시피카 뒷골목 (3인),3,scav_pipe;scav_gun;scav_boss,nonlethal;ncpd;drag,enemy_hp_mult=1.0;ncpd_max=3,폐차 위의 스캐빈저 셋. 비살상 제압. 과잉 제압은 NCPD 경계도를 올린다
-scav4,퍼시피카 뒷골목 (4인),4,scav_pipe*2;scav_gun;scav_boss,nonlethal;ncpd;drag,enemy_hp_mult=1.0;ncpd_max=3,폐차 위의 스캐빈저 넷. 비살상 제압. 과잉 제압은 NCPD 경계도를 올린다
-scav5,퍼시피카 뒷골목 (5인),5,scav_pipe*2;scav_gun;scav_boss,nonlethal;ncpd;drag,enemy_hp_mult=1.3;ncpd_max=3.5,폐차 위의 스캐빈저 넷. 비살상 제압. 과잉 제압은 NCPD 경계도를 올린다
-scav6,퍼시피카 뒷골목 (6인),6,scav_pipe*2;scav_gun*2;scav_boss,nonlethal;ncpd;drag,enemy_hp_mult=1.5;ncpd_max=4,폐차 위의 스캐빈저 다섯. 비살상 제압. 과잉 제압은 NCPD 경계도를 올린다
-scav7,퍼시피카 뒷골목 (7인),7,scav_pipe*3;scav_gun*2;scav_boss,nonlethal;ncpd;drag,enemy_hp_mult=1.6;ncpd_max=4.5,폐차 위의 스캐빈저 여섯. 비살상 제압. 과잉 제압은 NCPD 경계도를 올린다
-doll3,고장난 돌 (3인),3,doll,nonlethal;doll;terminal,chip_stability=8;enemy_hp_mult=1.0,단말기를 노리는 고장난 돌. 해킹으로 인격 칩을 리셋하면 멈춘다
-doll4,고장난 돌 (4인),4,doll,nonlethal;doll;terminal,chip_stability=9;enemy_hp_mult=1.15,단말기를 노리는 고장난 돌. 해킹으로 인격 칩을 리셋하면 멈춘다
-doll5,고장난 돌 (5인),5,doll,nonlethal;doll;terminal,chip_stability=10;enemy_hp_mult=1.3,단말기를 노리는 고장난 돌. 해킹으로 인격 칩을 리셋하면 멈춘다
-doll6,고장난 돌 (6인),6,doll,nonlethal;doll;terminal,chip_stability=11;enemy_hp_mult=1.45,단말기를 노리는 고장난 돌. 해킹으로 인격 칩을 리셋하면 멈춘다
-doll7,고장난 돌 (7인),7,doll,nonlethal;doll;terminal,chip_stability=12;enemy_hp_mult=1.6,단말기를 노리는 고장난 돌. 해킹으로 인격 칩을 리셋하면 멈춘다
+tut,튜토리얼: 뒷골목 연습,1-7,scav_pipe;scav_gun,tutorial;nonlethal,"enemy_hp_mult=1.5;prep_sandbox=true;admin_sees_all=false;tutorial_script=tut1;firewall_options=cover,reboot,maxdoc",여섯 라운드 연습. 코치가 라운드마다 과제를 냅니다. 금고는 임시라 보수가 없습니다
+b01,연습: 뒷골목 소란,1-3,scav_pipe;scav_gun,,"firewall_options=cover,reboot,aim,scan,maxdoc",스캐빈저 둘. 기믹 없는 연습 전투
+scav3,퍼시피카 뒷골목 (3인),3,scav_pipe;scav_gun;scav_boss,nonlethal;ncpd;drag,"enemy_hp_mult=1.15;ncpd_max=3;firewall_options=cover,reboot,scan,maxdoc",폐차 위의 스캐빈저 셋. 비살상 제압. 과잉 제압은 NCPD 경계도를 올리고 보수를 깎는다
+scav4,퍼시피카 뒷골목 (4인),4,scav_pipe*2;scav_gun;scav_boss,nonlethal;ncpd;drag,"enemy_hp_mult=1.15;ncpd_max=3;firewall_options=cover,reboot,scan,maxdoc",폐차 위의 스캐빈저 넷. 비살상 제압. 과잉 제압은 NCPD 경계도를 올리고 보수를 깎는다
+scav5,퍼시피카 뒷골목 (5인),5,scav_pipe*2;scav_gun;scav_boss,nonlethal;ncpd;drag,"enemy_hp_mult=1.45;ncpd_max=3.5;firewall_options=cover,reboot,scan,maxdoc",폐차 위의 스캐빈저 넷. 비살상 제압. 과잉 제압은 NCPD 경계도를 올리고 보수를 깎는다
+scav6,퍼시피카 뒷골목 (6인),6,scav_pipe*2;scav_gun*2;scav_boss,nonlethal;ncpd;drag,"enemy_hp_mult=1.7;ncpd_max=4;firewall_options=cover,reboot,scan,maxdoc",폐차 위의 스캐빈저 다섯. 비살상 제압. 과잉 제압은 NCPD 경계도를 올리고 보수를 깎는다
+scav7,퍼시피카 뒷골목 (7인),7,scav_pipe*3;scav_gun*2;scav_boss,nonlethal;ncpd;drag,"enemy_hp_mult=1.85;ncpd_max=4.5;firewall_options=cover,reboot,scan,maxdoc",폐차 위의 스캐빈저 여섯. 비살상 제압. 과잉 제압은 NCPD 경계도를 올리고 보수를 깎는다
+doll3,고장난 돌 (3인),3,doll,nonlethal;doll;terminal,"chip_stability=8;enemy_hp_mult=1.3;firewall_options=cover,reboot,aim,scan,maxdoc;reward_per_player=200",단말기를 노리는 고장난 돌. 해킹으로 인격 칩을 리셋하면 멈춘다
+doll4,고장난 돌 (4인),4,doll,nonlethal;doll;terminal,"chip_stability=9;enemy_hp_mult=1.5;firewall_options=cover,reboot,aim,scan,maxdoc;reward_per_player=200",단말기를 노리는 고장난 돌. 해킹으로 인격 칩을 리셋하면 멈춘다
+doll5,고장난 돌 (5인),5,doll,nonlethal;doll;terminal,"chip_stability=10;enemy_hp_mult=1.7;firewall_options=cover,reboot,aim,scan,maxdoc;reward_per_player=200",단말기를 노리는 고장난 돌. 해킹으로 인격 칩을 리셋하면 멈춘다
+doll6,고장난 돌 (6인),6,doll,nonlethal;doll;terminal,"chip_stability=11;enemy_hp_mult=1.9;firewall_options=cover,reboot,aim,scan,maxdoc;reward_per_player=200",단말기를 노리는 고장난 돌. 해킹으로 인격 칩을 리셋하면 멈춘다
+doll7,고장난 돌 (7인),7,doll,nonlethal;doll;terminal,"chip_stability=12;enemy_hp_mult=2.1;firewall_options=cover,reboot,aim,scan,maxdoc;reward_per_player=200",단말기를 노리는 고장난 돌. 해킹으로 인격 칩을 리셋하면 멈춘다
+bonewa3,몸의 보느와 (3인),3,bonewa_body,nonlethal;first_strike;daemon;firewall_duel;life_support;ice,"enemy_hp_mult=1.0;life_support_rounds=8;ice_layers=4;firewall_options=cover,reboot,aim,scan,maxdoc;reward_per_player=250;modes=seize:bw_seize:4,breach:bw_breach:4,overload:bw_overload:2;modes_norepeat=overload",다이브 캡슐 앞의 넷러너. 그는 올 줄 알고 있었다. 죽이면 안 된다
+bonewa4,몸의 보느와 (4인),4,bonewa_body,nonlethal;first_strike;daemon;firewall_duel;life_support;ice,"enemy_hp_mult=1.2;life_support_rounds=8;ice_layers=4;firewall_options=cover,reboot,aim,scan,maxdoc;reward_per_player=250;modes=seize:bw_seize:4,breach:bw_breach:4,overload:bw_overload:2;modes_norepeat=overload",다이브 캡슐 앞의 넷러너. 그는 올 줄 알고 있었다. 죽이면 안 된다
+bonewa5,몸의 보느와 (5인),5,bonewa_body,nonlethal;first_strike;daemon;firewall_duel;life_support;ice,"enemy_hp_mult=1.4;life_support_rounds=9;ice_layers=4;firewall_options=cover,reboot,aim,scan,maxdoc;reward_per_player=250;modes=seize:bw_seize:4,breach:bw_breach:4,overload:bw_overload:2;modes_norepeat=overload",다이브 캡슐 앞의 넷러너. 그는 올 줄 알고 있었다. 죽이면 안 된다
+bonewa6,몸의 보느와 (6인),6,bonewa_body,nonlethal;first_strike;daemon;firewall_duel;life_support;ice,"enemy_hp_mult=1.6;life_support_rounds=9;ice_layers=5;firewall_options=cover,reboot,aim,scan,maxdoc;reward_per_player=250;modes=seize:bw_seize:4,breach:bw_breach:4,overload:bw_overload:2;modes_norepeat=overload",다이브 캡슐 앞의 넷러너. 그는 올 줄 알고 있었다. 죽이면 안 된다
+bonewa7,몸의 보느와 (7인),7,bonewa_body,nonlethal;first_strike;daemon;firewall_duel;life_support;ice,"enemy_hp_mult=1.8;life_support_rounds=10;ice_layers=5;firewall_options=cover,reboot,aim,scan,maxdoc;reward_per_player=250;modes=seize:bw_seize:4,breach:bw_breach:4,overload:bw_overload:2;modes_norepeat=overload",다이브 캡슐 앞의 넷러너. 그는 올 줄 알고 있었다. 죽이면 안 된다

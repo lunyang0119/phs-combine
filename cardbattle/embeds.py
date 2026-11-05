@@ -23,10 +23,14 @@ COLOR_WIN = 0xF1C40F      # gold
 COLOR_LOSE = 0x2C2F33     # dark
 COLOR_HAND = 0x9B59B6     # purple
 COLOR_ALERT = 0xFF0055    # NCPD
+COLOR_PREP = 0x1ABC9C     # teal
+COLOR_COACH = 0x2ECC71    # green
+COLOR_AMBUSH = 0xFF2BD6   # magenta
 
 BAR_WIDTH = 10
 DESC_LIMIT = 4000
 FIELD_LIMIT = 1000
+MESSAGE_LIMIT = 5800      # 한 메시지의 임베드 글자 합 (Discord 6000)
 
 
 def hp_bar(hp: int, max_hp: int, width: int = BAR_WIDTH) -> str:
@@ -41,6 +45,8 @@ def unit_line(u: E.Combatant, hp: int = None, max_hp: int = None) -> str:
     max_hp = u.max_hp if max_hp is None else max_hp
     job = render.job_label(u)
     name = f"**{u.name}**" + (f" ({job})" if job else "")
+    if u.weapon_grade > 0:
+        name += f" 🔫mk.{u.weapon_grade}"
     if hp <= 0:
         return f"💀 ~~{u.name}~~" + (" 💔" if u.looted else "")
     tags = "".join(S.TAG.get(m.kind, "") for m in u.modifiers)
@@ -86,21 +92,9 @@ def lobby(names: Iterable[str]) -> discord.Embed:
 def intro(st: E.BattleState, desc: str = "") -> discord.Embed:
     e = discord.Embed(title=f"⚔️ {st.battle_name or st.battle_id}", color=COLOR_INTRO, description=desc or None)
     _board_fields(e, st)
-    rules = []
-    if st.has("nonlethal"):
-        rules.append(f"비살상: 남은 HP 를 {st.config.get('overkill_margin', 8)} 이상 초과해 쓰러뜨리면 과잉 제압")
-    if st.has("ncpd"):
-        rules.append(f"NCPD 경계도 {st.config.get('ncpd_max', 3):g} 에 닿으면 드론 출동 → 도주 단계")
-    if st.has("drag"):
-        rules.append(f"쓰러진 아군은 {st.config.get('drag_turns', 2)}라운드 안에 끌고 가는 적을 제압하지 않으면 약탈당함")
-    if st.has("doll"):
-        rules.append("돌의 인격 칩: 해킹 명중마다 안정도 −1 (리부트 중 ×2). 0 이면 비살상 승리. 물리 공격은 50% 회피")
-    if st.has("terminal"):
-        h = st.holder()
-        rules.append(f"단말기 소지자({h.name if h else '-'})가 돌의 표적. 소지자가 맞으면 액정 −1. '단말기 넘기기'로 교체")
-    rules.append("보느와의 방화벽: 맞거나 방어하면 차는 팀 게이지. 턴 메시지의 버튼으로 라운드에 한 번")
+    rules = render.intro_rules(st)
     e.add_field(name="규칙", value="\n".join(f"• {r}" for r in rules)[:FIELD_LIMIT], inline=False)
-    e.set_footer(text="라운드마다 적의 행동 종류가 먼저 공개됩니다. 해킹 → 방어 → 공격 순, 같은 단계는 민첩 순.")
+    e.set_footer(text=S.INTRO_FOOTER)
     return e
 
 
@@ -120,10 +114,17 @@ def turn(st: E.BattleState) -> discord.Embed:
     return e
 
 
+def coach(st: E.BattleState) -> discord.Embed:
+    from . import tutorial  # 순환 import 회피
+    return discord.Embed(title=S.COACH_TITLE.format(round=st.round_no()), color=COLOR_COACH,
+                         description=tutorial.coach_text(st)[:DESC_LIMIT])
+
+
 def report(st: E.BattleState, rep: Dict[str, Any], with_board: bool = True) -> List[discord.Embed]:
     """라운드 보고 → 임베드 목록 (설명이 길면 나눈다). with_board 면 마지막 임베드에 HP 표."""
     rnd = rep.get("round_no", 0)
-    title = f"⚔️ {rnd}라운드 정산"
+    ambush = bool(rep.get("ambush"))
+    title = S.AMBUSH_TITLE if ambush else f"⚔️ {rnd}라운드 정산"
     lines: List[str] = []
     for line in rep["lines"]:
         prefix = "🟢 " if line.get("side") == E.ALLY else "🔴 "
@@ -133,12 +134,21 @@ def report(st: E.BattleState, rep: Dict[str, Any], with_board: bool = True) -> L
     if ev:
         lines.append("")
         lines.extend(ev)
+    tips = render.tip_lines(rep.get("tips") or [])
+    if tips:
+        lines.append("")
+        lines.extend(tips)
+    tl = render.tutorial_line(rep.get("tutorial"))
+    if tl:
+        lines.append("")
+        lines.append(tl)
     if not lines:
         lines = ["(행동 없음)"]
     parts = render.chunks("\n".join(lines), DESC_LIMIT)
     out = []
     for i, c in enumerate(parts):
-        out.append(discord.Embed(title=title if i == 0 else f"{title} (계속)", color=COLOR_ROUND, description=c))
+        out.append(discord.Embed(title=title if i == 0 else f"{title} (계속)", color=COLOR_AMBUSH if ambush else COLOR_ROUND,
+                                 description=c))
     if with_board:
         _meters_field(out[-1], st)
         _board_fields(out[-1], st, rep.get("hp"))
@@ -183,6 +193,9 @@ def winner(st: E.BattleState) -> discord.Embed:
     title = render.winner_title(st).replace("## ", "")
     e = discord.Embed(title=title, color=COLOR_WIN if good else COLOR_LOSE,
                       description=f"{st.battle_name or st.battle_id} · {last_round(st)}라운드")
+    if st.has("life_support") and st.meters.get("boss_state"):
+        e.add_field(name=S.BOSS_STATE_FIELD, value=S.BOSS_STATE_KO.get(str(st.meters["boss_state"]), "?"), inline=True)
+        e.add_field(name="생명 유지", value=f"{st.meters.get('life', 0)}/{st.meters.get('life_max', 0)}", inline=True)
     looted = [p.name for p in st.players.values() if p.looted]
     if looted:
         e.add_field(name="약탈당함", value=", ".join(looted), inline=False)
@@ -190,11 +203,41 @@ def winner(st: E.BattleState) -> discord.Embed:
         e.add_field(name="단말기 액정", value=f"{st.meters.get('screen', 0)}/{st.meters.get('screen_max', 0)}", inline=True)
     if st.has("ncpd"):
         e.add_field(name="NCPD 경계도", value=f"{float(st.meters.get('ncpd', 0)):g}/{float(st.config.get('ncpd_max', 3)):g}", inline=True)
+    pay = render.payout_text(st)
+    if pay:
+        e.add_field(name=S.PAYOUT_FIELD, value=pay[:FIELD_LIMIT], inline=False)
+    weapons = [f"{p.name}: {E.weapon_label(p)}" for p in st.players.values() if p.weapon_grade > 0]
+    if weapons:
+        e.add_field(name=S.WEAPONS_FIELD, value="\n".join(weapons)[:FIELD_LIMIT], inline=False)
     _board_fields(e, st)
     return e
 
 
+def prep(st: E.BattleState) -> discord.Embed:
+    cfg = st.config
+    pr = st.prep
+    e = discord.Embed(title=S.PREP_TITLE, color=COLOR_PREP,
+                      description=S.PREP_DESC.format(price_normal=int(cfg.get("price_normal", 100)),
+                                                     price_black=int(cfg.get("price_black", 50)),
+                                                     normal_max=int(cfg.get("weapon_normal_max", 3)),
+                                                     wmax=int(cfg.get("weapon_max", 4)),
+                                                     actions=int(cfg.get("prep_actions", 2))))
+    e.add_field(name=S.PREP_POT_FIELD,
+                value=S.PREP_POT_VALUE.format(pot_start=int(pr.get("pot_start", 0)), share=int(pr.get("share", 0)),
+                                              pot=int(st.meters.get("pot", 0)), field_cost=int(cfg.get("field_mod_cost", 50))),
+                inline=False)
+    e.add_field(name=S.PREP_PLAYERS_FIELD, value="\n".join(render.prep_rows(st))[:FIELD_LIMIT] or "-", inline=False)
+    rolls = [render.prep_roll_line(r) for r in (pr.get("rolls") or [])[-12:]]
+    if rolls:
+        e.add_field(name=S.PREP_ROLLS_FIELD, value="\n".join(rolls)[:FIELD_LIMIT], inline=False)
+    if pr.get("done") and pr.get("returned"):
+        e.set_footer(text=S.PREP_RETURNED.format(returned=int(pr.get("returned", 0))))
+    return e
+
+
 def status(st: E.BattleState) -> discord.Embed:
+    if st.status == E.PREP:
+        return prep(st)
     done, total = render.progress(st)
     e = discord.Embed(title=f"📋 현황 — {st.round_no()}라운드", color=COLOR_TURN,
                       description=f"상태 `{st.status}` · 선택 현황 {done}/{total}")
@@ -224,7 +267,10 @@ def hand(st: E.BattleState, uid: str, hand_ids: List[str]) -> discord.Embed:
                          f"{render.card_detail(st, c, p).replace(chr(10), ' / ')}" for c in cards)
         e.description = (e.description + "\n" + text)[:DESC_LIMIT]
     if p is not None:
-        e.set_footer(text=f"{p.name} · HP {p.hp}/{p.max_hp}")
+        foot = f"{p.name} · HP {p.hp}/{p.max_hp}"
+        if p.weapon_grade > 0:
+            foot += f" · {E.weapon_label(p)}"
+        e.set_footer(text=foot)
     return e
 
 
@@ -232,10 +278,37 @@ def firewall_menu(st: E.BattleState) -> discord.Embed:
     e = discord.Embed(title=S.FIREWALL_TITLE.format(value=int(st.meters.get("firewall", 0)),
                                                     max=int(st.config.get("firewall_max", 9))), color=COLOR_TURN)
     rows = []
-    for opt in E.FIREWALL_OPTIONS:
+    for opt in E.enabled_firewall_options(st):
         pct = int(round(float(st.config.get("firewall_cover_shield", 0.5)) * 100)) if opt == "cover" else \
             int(round(float(st.config.get("firewall_maxdoc_ratio", 0.3)) * 100))
         rows.append(f"**{S.FIREWALL_OPTION_KO[opt]}**{S.FIREWALL_COST.format(cost=E.firewall_cost(st, opt))} — "
                     f"{S.FIREWALL_OPTION_DESC[opt].format(pct=pct)}")
+    if E.firewall_locked(st):
+        rows.append(S.FIREWALL_LOCKED_NOTE)
     e.description = "\n".join(rows)
     return e
+
+
+def rules_sections() -> List[discord.Embed]:
+    out = []
+    for i, (title, body) in enumerate(S.HELP_SECTIONS):
+        out.append(discord.Embed(title=f"📖 {title}", color=COLOR_TURN if i % 2 == 0 else COLOR_HAND,
+                                 description=body[:DESC_LIMIT]))
+    return out
+
+
+def chunk_embeds(embs: List[discord.Embed], limit: int = MESSAGE_LIMIT, max_per: int = 10) -> List[List[discord.Embed]]:
+    """한 메시지의 임베드 수(10)와 글자 합(6000) 제한에 맞춰 묶는다."""
+    batches: List[List[discord.Embed]] = []
+    cur: List[discord.Embed] = []
+    size = 0
+    for e in embs:
+        n = len(e.title or "") + len(e.description or "")
+        if cur and (size + n > limit or len(cur) >= max_per):
+            batches.append(cur)
+            cur, size = [], 0
+        cur.append(e)
+        size += n
+    if cur:
+        batches.append(cur)
+    return batches

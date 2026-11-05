@@ -3,3 +3,4 @@ scav_pipe,스캐빈저 (쇠파이프),40,14,6,9,6,aggressive,enemy,cheap_chrome,
 scav_gun,스캐빈저 (권총),32,10,8,13,6,aggressive,enemy,cheap_chrome,#E07A3F
 scav_boss,스캐빈저 리더,55,14,10,10,8,hacker,enemy,cheap_chrome,#B03060
 doll,고장난 돌,120,16,10,18,16,aggressive,enemy,doll;evade:0.5;regen:8,#FF4FA3
+bonewa_body,몸의 보느와,110,8,18,16,14,hacker,enemy,modes;evade:0.3,#FF2BD6

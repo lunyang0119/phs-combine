@@ -21,9 +21,10 @@ BG, FG, DIM = (18, 20, 26), (230, 232, 240), (120, 124, 138)
 ALLY_TINT, ENEMY_TINT = (28, 64, 48), (76, 32, 36)
 PANEL_BG = (28, 30, 38)
 GOOD, BAD, WARN = (80, 230, 140), (255, 90, 90), (255, 190, 90)
-TAG_KO = {"shield": "엄폐", "atk_down": "글리치", "misfire": "고장", "redirect_random": "적대인식", "stun": "기절", "grapple": "붙잡힘"}
+TAG_KO = {"shield": "엄폐", "atk_down": "글리치", "misfire": "고장", "redirect_random": "적대인식", "stun": "기절",
+          "grapple": "붙잡힘", "daemon": "데몬"}
 RESULT_KO = {"wait": "대기", "stunned": "기절", "down": "쓰러짐", "reboot": "리부트 중", "misfire": "불발",
-             "evade": "회피당함", "no_target": "대상 없음"}
+             "evade": "회피당함", "no_target": "대상 없음", "field_mod_none": "현장 개조 불가"}
 
 
 def _strip_md(s: str) -> str:
@@ -34,6 +35,9 @@ def _action_text(line: Dict[str, Any]) -> str:
     res = line.get("result", "")
     if res in RESULT_KO:
         return RESULT_KO[res]
+    if res == "field_mod" and line.get("field_mod"):
+        fm = line["field_mod"]
+        return f"현장 개조 d10={fm.get('roll')} " + ("성공 " if fm.get("success") else "실패 ") + str(fm.get("weapon", ""))
     card = line.get("card_name", "")
     bits = []
     if line.get("combo"):
@@ -48,6 +52,10 @@ def _action_text(line: Dict[str, Any]) -> str:
             tails.append(f"{t['name']} +{int(t['amount'])}")
         elif k == "shield":
             tails.append(f"{t['name']} 방어 {int(round(t['amount'] * 100))}%")
+        elif k == "daemon":
+            tails.append(f"{t['name']} 데몬 ×{int(t['amount'])}")
+        elif k == "cleanse":
+            tails.append(f"{t['name']} 감염 제거")
         elif k in TAG_KO:
             tails.append(f"{t['name']} {TAG_KO[k]}")
         elif k == "pass_terminal":
@@ -56,6 +64,10 @@ def _action_text(line: Dict[str, Any]) -> str:
             tails.append("떨쳐냄")
     if line.get("chip"):
         tails.append(f"칩 -{line['chip']['amount']}")
+    if line.get("ice") and line["ice"].get("amount"):
+        tails.append(f"ICE -{line['ice']['amount']}")
+    if line.get("daemon"):
+        tails.append(f"데몬 자해 -{line['daemon']['amount']}")
     text = " ".join(bits)
     if tails:
         text += ": " + ", ".join(tails)
@@ -92,7 +104,8 @@ def _meters(st: E.BattleState) -> List[Tuple[str, float, Tuple[int, int, int]]]:
     out = []
     m = st.meters
     fmax = max(1, int(st.config.get("firewall_max", 9)))
-    out.append((f"방화벽 {int(m.get('firewall', 0))}/{fmax}", int(m.get("firewall", 0)) / fmax, (90, 160, 255)))
+    label = f"방화벽 {int(m.get('firewall', 0))}/{fmax}" + (" (잠김)" if E.firewall_locked(st) else "")
+    out.append((label, int(m.get("firewall", 0)) / fmax, (90, 160, 255)))
     if st.has("ncpd"):
         nmax = max(0.1, float(st.config.get("ncpd_max", 3.0)))
         v = float(m.get("ncpd", 0.0))
@@ -100,10 +113,19 @@ def _meters(st: E.BattleState) -> List[Tuple[str, float, Tuple[int, int, int]]]:
     if st.has("doll"):
         cmax = max(1, int(m.get("chip_max", 1)))
         out.append((f"칩 안정도 {int(m.get('chip', 0))}/{cmax}", int(m.get("chip", 0)) / cmax, (255, 120, 220)))
+    if st.has("ice"):
+        imax = max(1, int(m.get("ice_max", 1)))
+        out.append((f"블랙 ICE {int(m.get('ice', 0))}/{imax}층", int(m.get("ice", 0)) / imax, (120, 200, 255)))
+    if st.has("life_support"):
+        lmax = max(1, int(m.get("life_max", 1)))
+        v = int(m.get("life", 0))
+        out.append((f"생명 유지 {v}/{lmax}", v / lmax, BAD if v <= 2 else WARN if v <= 4 else GOOD))
     if st.has("terminal"):
         smax = max(1, int(m.get("screen_max", 1)))
         h = st.holder()
         out.append((f"액정 {int(m.get('screen', 0))}/{smax}  소지자: {h.name if h else '-'}", int(m.get("screen", 0)) / smax, (120, 220, 255)))
+    if "pot" in m and bool(st.config.get("prep_enabled", True)):
+        out.append((f"금고 {int(m.get('pot', 0))} 에디", 0.0, (255, 215, 90)))
     return out
 
 
@@ -122,7 +144,7 @@ def render_board(st: E.BattleState, report: Optional[Dict[str, Any]] = None) -> 
     allies = list(st.players.values())
     enemies = list(st.enemies.values())
     meters = _meters(st)
-    show_mode = bool(st.has("doll") and st.meters.get("doll_mode") and st.status == E.ROUND_OPEN)
+    show_mode = bool(st.meters.get("doll_mode") and st.status == E.ROUND_OPEN)
     header_h = 44 + 22 * len(meters) + 10 + (22 if show_mode else 0)
     rows = max(len(allies), len(enemies), 1)
     W = pad * 2 + col_w * 2 + 40
@@ -132,7 +154,9 @@ def render_board(st: E.BattleState, report: Optional[Dict[str, Any]] = None) -> 
 
     # 헤더
     title = f"{st.battle_name or st.battle_id}   R{st.round_no():02d}"
-    if st.status == E.ESCAPE:
+    if report and report.get("ambush"):
+        title = f"{st.battle_name or st.battle_id}   기습!"
+    elif st.status == E.ESCAPE:
         title += "   도주 단계"
     elif st.status == E.ENDED:
         title += "   종료"
@@ -140,11 +164,14 @@ def render_board(st: E.BattleState, report: Optional[Dict[str, Any]] = None) -> 
     y = pad + 32
     for label, ratio, color in meters:
         d.text((pad, y), label, font=f_small, fill=FG)
-        _bar(d, pad + 300, y + 4, W - pad * 2 - 300, 10, ratio, color)
+        if ratio > 0 or "금고" not in label:
+            _bar(d, pad + 300, y + 4, W - pad * 2 - 300, 10, ratio, color)
         y += 22
     mode = st.meters.get("doll_mode", "")
     if show_mode:
-        d.text((pad, y), f"돌: {S.MODE_KO.get(mode, mode)} — {S.MODE_DESC.get(mode, '')}", font=f_small, fill=(255, 120, 220))
+        owner = "돌" if st.has("doll") else str(st.meters.get("mode_owner", "?"))
+        d.text((pad, y), _fit(d, f"{owner}: {S.MODE_KO.get(mode, mode)} - {S.MODE_DESC.get(mode, '')}", f_small, W - pad * 2),
+               font=f_small, fill=(255, 120, 220))
     top = header_h
 
     actions: Dict[str, Dict[str, Any]] = {}
@@ -160,15 +187,18 @@ def render_board(st: E.BattleState, report: Optional[Dict[str, Any]] = None) -> 
         d.rectangle([x, yy, x + col_w, yy + panel_h], fill=PANEL_BG, outline=col, width=3)
         d.rectangle([x, yy, x + 10, yy + panel_h], fill=col)
         name = u.name + (f"  {render.job_label(u)}" if u.side == E.ALLY and render.job_label(u) else "")
+        if u.weapon_grade > 0:
+            name += f"  [{E.weapon_label(u)}]"
         if not u.alive():
             name += "  (쓰러짐)" + ("  약탈당함" if u.looted else "")
         if st.has("terminal") and st.meters.get("terminal_holder") == u.id:
             name += "  [단말기]"
-        d.text((x + 18, yy + 6), name, font=f_mid, fill=FG if u.alive() else DIM)
+        d.text((x + 18, yy + 6), _fit(d, name, f_mid, col_w - 30), font=f_mid, fill=FG if u.alive() else DIM)
         hp_ratio = u.hp / u.max_hp if u.max_hp else 0
         _bar(d, x + 18, yy + 32, 250, 12, hp_ratio, GOOD if hp_ratio > 0.5 else WARN if hp_ratio > 0.25 else BAD)
         d.text((x + 276, yy + 28), f"{u.hp}/{u.max_hp}", font=f_small, fill=FG)
-        tags = " ".join(TAG_KO.get(m.kind, m.kind) for m in u.modifiers)
+        tags = " ".join(TAG_KO.get(m.kind, m.kind) + (f"×{int(m.value)}" if m.kind == "daemon" and m.value > 1 else "")
+                        for m in u.modifiers)
         if u.side == E.ENEMY and u.traits:
             tr = []
             if u.has_trait("cheap_chrome"):
@@ -179,7 +209,7 @@ def render_board(st: E.BattleState, report: Optional[Dict[str, Any]] = None) -> 
                 tr.append(f"자가복구 {int(u.traits['regen'])}")
             tags = (" ".join(tr) + ("  " + tags if tags else "")).strip()
         if tags:
-            d.text((x + 18, yy + 48), tags, font=f_small, fill=WARN)
+            d.text((x + 18, yy + 48), _fit(d, tags, f_small, col_w - 30), font=f_small, fill=WARN)
         # 행동 줄 (배경을 편 색으로)
         line_y = yy + 68
         d.rectangle([x + 12, line_y, x + col_w - 4, yy + panel_h - 4], fill=tint)

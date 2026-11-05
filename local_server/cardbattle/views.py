@@ -1,11 +1,12 @@
 """카드 전투 UI.
 
 TurnView   — 공개 턴 메시지의 영구 버튼 (카드 뽑기 / 방화벽). timeout=None + 고정 custom_id → 재시작 후에도 동작
+PrepView   — 준비 단계의 영구 버튼 3개 (정식 개조 / 뒷골목 개조 / 준비 완료)
 EscapeView — 도주 단계의 영구 버튼 3개 (숨기 / 이동하기 / 죽은 척하기)
 HandView   — 본인에게만 보이는 패 드롭다운 (주최자는 전체 카드, 24장 + '다음' 옵션으로 페이징)
-TargetView — 카드 선택 후 대상 드롭다운
+TargetView — 카드 선택 후 대상 드롭다운 (⚠ 과잉 위험 표시)
 ChosenView — 선택 완료 후 '다시 고르기 / 선택 취소'
-FirewallView — 방화벽 지원 드롭다운
+FirewallView — 방화벽 지원 드롭다운 (이 전투에서 열린 옵션만)
 ephemeral 메시지는 그 메시지의 컴포넌트 상호작용에서만 response.edit_message 로 고칠 수 있다.
 """
 from __future__ import annotations
@@ -46,6 +47,23 @@ class TurnView(discord.ui.View):
     @discord.ui.button(label=S.BTN_FIREWALL, style=discord.ButtonStyle.secondary, custom_id="cardbattle:firewall", emoji="🧱")
     async def firewall(self, interaction: discord.Interaction, button: discord.ui.Button):
         await _dispatch(interaction, "handle_firewall_menu")
+
+
+class PrepView(discord.ui.View):
+    def __init__(self):
+        super().__init__(timeout=None)
+
+    @discord.ui.button(label=S.BTN_PREP_NORMAL, style=discord.ButtonStyle.primary, custom_id="cardbattle:prep:normal", emoji="🔩")
+    async def normal(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await _dispatch(interaction, "handle_prep", "normal")
+
+    @discord.ui.button(label=S.BTN_PREP_BLACK, style=discord.ButtonStyle.danger, custom_id="cardbattle:prep:black", emoji="🎲")
+    async def black(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await _dispatch(interaction, "handle_prep", "black")
+
+    @discord.ui.button(label=S.BTN_PREP_READY, style=discord.ButtonStyle.success, custom_id="cardbattle:prep:ready", emoji="✅")
+    async def ready(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await _dispatch(interaction, "handle_prep", "ready")
 
 
 class EscapeView(discord.ui.View):
@@ -126,11 +144,17 @@ class CancelButton(discord.ui.Button):
 
 
 class TargetSelect(discord.ui.Select):
-    def __init__(self, uid: str, card_id: str, targets: List[E.Combatant]):
+    def __init__(self, st: E.BattleState, uid: str, card_id: str, targets: List[E.Combatant]):
         self.uid = uid
         self.card_id = card_id
-        options = [discord.SelectOption(label=S.TARGET_OPTION.format(name=t.name, hp=t.hp, max=t.max_hp)[:100],
-                                        value=t.id) for t in targets[:25]]
+        actor = st.players.get(uid)
+        card = st.cards.get(card_id)
+        options = []
+        for t in targets[:25]:
+            risky = actor is not None and card is not None and E.overkill_risk(st, actor, card, t)
+            fmt = S.TARGET_OPTION_RISK if risky else S.TARGET_OPTION
+            options.append(discord.SelectOption(label=fmt.format(name=t.name, hp=t.hp, max=t.max_hp)[:100], value=t.id,
+                                                emoji="⚠️" if risky else None))
         super().__init__(placeholder=S.TARGET_PLACEHOLDER, options=options, min_values=1, max_values=1)
 
     async def callback(self, interaction: discord.Interaction):
@@ -147,9 +171,9 @@ class BackButton(discord.ui.Button):
 
 
 class TargetView(_Owned):
-    def __init__(self, uid: str, card_id: str, targets: List[E.Combatant]):
+    def __init__(self, st: E.BattleState, uid: str, card_id: str, targets: List[E.Combatant]):
         super().__init__(uid)
-        self.add_item(TargetSelect(uid, card_id, targets))
+        self.add_item(TargetSelect(st, uid, card_id, targets))
         self.add_item(BackButton(uid))
 
 
@@ -165,11 +189,12 @@ class FirewallSelect(discord.ui.Select):
         self.uid = uid
         have = int(st.meters.get("firewall", 0))
         options = []
-        for opt in E.FIREWALL_OPTIONS:
+        for opt in E.enabled_firewall_options(st):
             cost = E.firewall_cost(st, opt)
             label = S.FIREWALL_OPTION_KO[opt] + S.FIREWALL_COST.format(cost=cost)
             options.append(discord.SelectOption(label=label[:100], value=opt, emoji="✅" if have >= cost else "⛔"))
-        super().__init__(placeholder=S.FIREWALL_PLACEHOLDER, options=options, min_values=1, max_values=1)
+        super().__init__(placeholder=S.FIREWALL_PLACEHOLDER, options=options or [discord.SelectOption(label="-", value="-")],
+                         min_values=1, max_values=1)
 
     async def callback(self, interaction: discord.Interaction):
         await _dispatch(interaction, "handle_firewall_pick", self.uid, self.values[0])

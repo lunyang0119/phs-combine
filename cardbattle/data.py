@@ -4,6 +4,7 @@
     CARDBATTLE_SOURCE=csv|sheet   (기본 csv)
     CARDBATTLE_DATA_DIR=<dir>     (기본 <repo>/data/cardbattle)
 sheet 를 골랐는데 스프레드시트가 없거나 탭이 없으면 경고 후 CSV 로 폴백한다.
+Tutorial.csv / Card_Tutorial 탭은 선택 사항이다 (없으면 튜토리얼 전투만 시작할 수 없다).
 """
 from __future__ import annotations
 
@@ -16,11 +17,13 @@ from typing import Any, Dict, List, Mapping, Optional, Protocol
 
 from . import config as cfgmod
 from . import engine as E
+from . import tutorial as T
 
 logger = logging.getLogger(__name__)
 
-TABLE_FILES = {"cards": "Cards.csv", "enemies": "Enemies.csv", "battles": "Battles.csv"}
-TABLE_TABS = {"cards": "Card_List", "enemies": "Card_Enemies", "battles": "Card_Battles"}
+TABLE_FILES = {"cards": "Cards.csv", "enemies": "Enemies.csv", "battles": "Battles.csv", "tutorial": "Tutorial.csv"}
+TABLE_TABS = {"cards": "Card_List", "enemies": "Card_Enemies", "battles": "Card_Battles", "tutorial": "Card_Tutorial"}
+OPTIONAL_TABLES = ("tutorial",)
 DEFAULT_DIR = Path(__file__).resolve().parent.parent / "data" / "cardbattle"
 PERSONALITIES = ("aggressive", "defensive", "hacker")
 
@@ -129,7 +132,8 @@ def _list(text: str) -> List[str]:
 
 
 def parse_effects(text: str) -> List[E.Effect]:
-    """`kind[:value[:turns[:chance]]]` 를 `;` 로 연결한 문자열."""
+    """`kind[:value[:turns[:chance]]]` 를 `;` 로 연결한 문자열.
+    scatter_damage / daemon (COUNT_KINDS) 은 셋째 슬롯이 지속이 아니라 **무작위 대상 수**다."""
     out: List[E.Effect] = []
     for chunk in _list(text):
         parts = [p.strip() for p in chunk.split(":")]
@@ -138,11 +142,14 @@ def parse_effects(text: str) -> List[E.Effect]:
             raise DataError(f"알 수 없는 효과: {kind!r} (가능: {', '.join(E.EFFECT_KINDS)})")
         try:
             value = float(parts[1]) if len(parts) > 1 and parts[1] else 0.0
-            turns = int(float(parts[2])) if len(parts) > 2 and parts[2] else 1
+            third = int(float(parts[2])) if len(parts) > 2 and parts[2] else 1
             chance = float(parts[3]) if len(parts) > 3 and parts[3] else 1.0
         except ValueError:
             raise DataError(f"효과 형식 오류: {chunk!r}")
-        out.append(E.Effect(kind=kind, value=value, turns=max(1, turns), chance=min(1.0, max(0.0, chance))))
+        if kind in E.COUNT_KINDS:
+            out.append(E.Effect(kind=kind, value=value, turns=1, chance=min(1.0, max(0.0, chance)), count=max(1, third)))
+        else:
+            out.append(E.Effect(kind=kind, value=value, turns=max(1, third), chance=min(1.0, max(0.0, chance))))
     return out
 
 
@@ -289,6 +296,16 @@ class GameData:
     cards: Dict[str, E.Card] = field(default_factory=dict)
     enemies: Dict[str, E.EnemyDef] = field(default_factory=dict)
     battles: Dict[str, E.BattleDef] = field(default_factory=dict)
+    tutorials: Dict[str, List[Dict[str, Any]]] = field(default_factory=dict)
+
+
+def _mode_cards(cfg: Mapping[str, Any], key: str) -> List[str]:
+    out = []
+    for chunk in E.split_list(cfg.get(key, "")):
+        parts = [p.strip() for p in chunk.split(":")]
+        if len(parts) >= 2:
+            out.append(parts[1])
+    return out
 
 
 def load_game_data(source: DataSource) -> GameData:
@@ -314,6 +331,14 @@ def load_game_data(source: DataSource) -> GameData:
         if b.id in gd.battles:
             raise DataError(f"battle_id 중복: {b.id}")
         gd.battles[b.id] = b
+    try:
+        trows = source.rows("tutorial")
+    except DataError:
+        trows = []
+    try:
+        gd.tutorials = T.parse_script(trows, gd.cards)
+    except T.ScriptError as e:
+        raise DataError(f"Tutorial: {e}")
     if not gd.cards:
         raise DataError("카드가 하나도 없습니다")
     for side in (E.ALLY, E.ENEMY):
@@ -322,6 +347,7 @@ def load_game_data(source: DataSource) -> GameData:
     if not gd.battles:
         raise DataError("전투가 하나도 없습니다")
     for b in gd.battles.values():
+        cfg = cfgmod.build_config(b.overrides)
         if "terminal" in b.gimmicks and E.PASS_CARD not in gd.cards:
             raise DataError(f"[{b.id}] terminal 기믹에는 card_id={E.PASS_CARD} 카드(pool=fixed)가 필요합니다")
         if "doll" in b.gimmicks:
@@ -329,9 +355,21 @@ def load_game_data(source: DataSource) -> GameData:
                 raise DataError(f"[{b.id}] doll 기믹에는 card_id={E.BREAK_CARD} 카드(pool=fixed)가 필요합니다")
             if not any("doll" in gd.enemies[e].traits for e in b.enemies):
                 raise DataError(f"[{b.id}] doll 기믹인데 traits 에 doll 이 있는 적이 없습니다")
-            cfg = cfgmod.build_config(b.overrides)
-            for chunk in str(cfg.get("doll_modes", "")).split(";"):
-                parts = [p.strip() for p in chunk.split(":")]
-                if len(parts) >= 2 and parts[1] not in gd.cards:
-                    raise DataError(f"[{b.id}] doll_modes 의 카드 {parts[1]!r} 가 없습니다")
+            for cid in _mode_cards(cfg, "doll_modes"):
+                if cid not in gd.cards:
+                    raise DataError(f"[{b.id}] doll_modes 의 카드 {cid!r} 가 없습니다")
+        if any("modes" in gd.enemies[e].traits for e in b.enemies):
+            key = "modes" if str(cfg.get("modes", "")).strip() else "doll_modes"
+            for cid in _mode_cards(cfg, key):
+                if cid not in gd.cards:
+                    raise DataError(f"[{b.id}] {key} 의 카드 {cid!r} 가 없습니다")
+        if "first_strike" in b.gimmicks:
+            cards = [c for c in E.split_list(cfg.get("first_strike_cards", "")) if c]
+            missing = [c for c in cards if c not in gd.cards]
+            if not cards or missing:
+                raise DataError(f"[{b.id}] first_strike_cards 의 카드가 없습니다: {missing or '(비어 있음)'}")
+        if "tutorial" in b.gimmicks and str(cfg.get("tutorial_script", "")) not in gd.tutorials:
+            raise DataError(f"[{b.id}] tutorial 기믹인데 Tutorial.csv 에 script_id={cfg.get('tutorial_script')!r} 가 없습니다")
+        if bool(cfg.get("prep_enabled", True)) and E.FIELD_MOD_CARD not in gd.cards:
+            logger.warning("[%s] prep_enabled 인데 card_id=%s 카드(pool=fixed)가 없어 현장 개조가 나오지 않습니다", b.id, E.FIELD_MOD_CARD)
     return gd

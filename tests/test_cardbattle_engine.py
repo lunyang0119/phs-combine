@@ -19,7 +19,8 @@ from cardbattle import render as R
 # ---------------------------------------------------------------------------
 def flat_cfg(**over):
     cfg = C.build_config()
-    cfg.update({"damage_variance": 0, "stat_divisor": 1000, "ai_noise": 0.0, "hand_size": 3})
+    cfg.update({"damage_variance": 0, "stat_divisor": 1000, "ai_noise": 0.0, "hand_size": 3,
+                "prep_enabled": False, "firewall_options": "cover;reboot;aim;scan;maxdoc"})
     cfg.update(over)
     return cfg
 
@@ -155,6 +156,7 @@ def test_load_shipped_csvs():
     for bid in ("scav3", "doll3"):
         b = gd.battles[bid]
         cfg = C.build_config(b.overrides)
+        cfg["prep_enabled"] = False
         st = E.new_battle([E.player_combatant("1", {"max_hp": 100}, "A", cfg)],
                           E.enemy_combatants(b, gd.enemies, cfg["enemy_hp_mult"]), gd.cards, cfg, host_id="9",
                           gimmicks=b.gimmicks, rng=random.Random(1))
@@ -313,15 +315,20 @@ def test_defend_covers_this_round_only():
     assert hp(st, "1") == 30                                        # 35 → 40(힐) → 30
 
 
-def test_atk_down_lasts_two_rounds_including_creation_round():
+def test_atk_down_consumed_by_next_attack_only():
     st = mk_state(n_players=1, host="99", chooser=always("atk"))
     play(st, {"1": ("jam", "e1")}, chooser=always("atk"))
-    assert hp(st, "1") == 35                                        # 해킹이 공격보다 먼저 → 같은 라운드에 적용
+    assert hp(st, "1") == 35                                        # 해킹이 공격보다 먼저 → 같은 라운드의 공격에 적용
+    assert st.enemies["e1"].mod("atk_down") is None                 # 그 공격에 소모됨
     play(st, {"1": ("heal", "1")}, chooser=always("atk"))
-    assert hp(st, "1") == 35                                        # 40 → 35
-    assert st.enemies["e1"].mod("atk_down") is None
+    assert hp(st, "1") == 30                                        # 40 → 30: 다음 라운드는 원래 피해
+    # 글리치를 걸어 두고 적이 공격하지 않으면 다음 공격 때까지 남는다
+    st = mk_state(n_players=1, host="99", chooser=always("guard"))
+    play(st, {"1": ("jam", "e1")}, chooser=always("guard"))
+    play(st, {"1": ("guard", None)}, chooser=always("atk"))
+    assert st.enemies["e1"].mod("atk_down") is not None
     play(st, {"1": ("heal", "1")}, chooser=always("atk"))
-    assert hp(st, "1") == 30                                        # 원래 피해
+    assert hp(st, "1") == 35 and st.enemies["e1"].mod("atk_down") is None
 
 
 def test_misfire_consumed_on_use_and_redirect_random():

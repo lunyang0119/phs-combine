@@ -36,10 +36,12 @@ def _detail(t: Dict[str, Any]) -> str:
     pct = int(round(float(amount) * 100)) if kind in ("shield", "atk_down", "misfire") else 0
     turns = t.get("turns", "")
     try:
-        out = fmt.format(amount=int(amount) if kind in ("damage", "self_damage", "heal") else amount,
+        out = fmt.format(amount=int(amount) if kind in ("damage", "self_damage", "heal", "daemon", "cleanse") else amount,
                          pct=pct, turns=turns or "")
     except (KeyError, ValueError):
         return ""
+    if t.get("iced"):
+        out += S.LOG_ICED
     if t.get("weak"):
         out += S.LOG_WEAK
     if t.get("overkill"):
@@ -51,12 +53,34 @@ def _detail(t: Dict[str, Any]) -> str:
     return out
 
 
+def _line_tail(line: Dict[str, Any]) -> str:
+    """칩·ICE·풀려남·데몬 자해처럼 줄 끝에 붙는 꼬리."""
+    tail = ""
+    if line.get("chip"):
+        c = line["chip"]
+        tail += S.LOG_CHIP.format(amount=c["amount"], value=c["value"], max=c["max"])
+        if c.get("capped"):
+            tail += S.LOG_CHIP_CAPPED
+    if line.get("ice"):
+        i = line["ice"]
+        tail += S.LOG_ICE.format(amount=i["amount"], value=i["value"], max=i["max"]) if i.get("amount") else S.LOG_ICE_CAPPED
+    if line.get("released"):
+        tail += S.LOG_RELEASED.format(names=", ".join(line["released"]))
+    if line.get("daemon"):
+        d = line["daemon"]
+        tail += S.LOG_DAEMON_BITE.format(amount=d["amount"], hp=d["hp"], max=d["max_hp"])
+        if d.get("killed"):
+            tail += S.LOG_KILLED
+    return tail
+
+
 def log_lines(line: Dict[str, Any]) -> List[str]:
     """정산 로그 한 항목 → 출력 줄들 (전체 공격은 대상별 줄)."""
     a = _actor(line)
     card = line.get("card_name", "")
     eul = _josa(card, "을", "를")
     res = line.get("result")
+    tail_extra = _line_tail(line)
     if res == "wait":
         return [S.LOG_WAIT.format(**a)]
     if res == "stunned":
@@ -66,25 +90,24 @@ def log_lines(line: Dict[str, Any]) -> List[str]:
     if res == "reboot":
         return [S.LOG_REBOOT.format(**a)]
     if res == "misfire":
-        return [S.LOG_MISFIRE.format(card=card, eul=eul, **a)]
+        return [S.LOG_MISFIRE.format(card=card, eul=eul, **a) + tail_extra]
     if res == "no_target":
-        return [S.LOG_NO_TARGET.format(card=card, eul=eul, **a)]
+        return [S.LOG_NO_TARGET.format(card=card, eul=eul, **a) + tail_extra]
+    if res == "field_mod_none":
+        return [S.LOG_FIELD_MOD_NONE.format(**a) + tail_extra]
+    if res == "field_mod" and line.get("field_mod"):
+        fm = line["field_mod"]
+        fmt = S.LOG_FIELD_MOD_WIN if fm.get("success") else S.LOG_FIELD_MOD_FAIL
+        return [fmt.format(roll=fm.get("roll"), weapon=fm.get("weapon", ""), cost=fm.get("cost", 0), pot=fm.get("pot", 0),
+                           refund=S.OK_PREP_REFUND if fm.get("refund") else "", **a) + tail_extra]
     if res == "evade":
         tname = (line.get("targets") or [{}])[0].get("name", "?")
-        return [S.LOG_EVADE.format(card=card, eul=eul, target=tname, eun2=_josa(tname, "은", "는"), **a)]
+        return [S.LOG_EVADE.format(card=card, eul=eul, target=tname, eun2=_josa(tname, "은", "는"), **a) + tail_extra]
     head = S.LOG_USE.format(card=card, eul=eul, **a)
     if res == "redirect":
         head = S.LOG_REDIRECT_PREFIX + head
     if line.get("combo"):
         head = S.LOG_COMBO_PREFIX + head
-    tail_extra = ""
-    if line.get("chip"):
-        c = line["chip"]
-        tail_extra += S.LOG_CHIP.format(amount=c["amount"], value=c["value"], max=c["max"])
-        if c.get("capped"):
-            tail_extra += S.LOG_CHIP_CAPPED
-    if line.get("released"):
-        tail_extra += S.LOG_RELEASED.format(names=", ".join(line["released"]))
     targets = line.get("targets") or []
     if not targets:
         return [head + tail_extra]
@@ -122,7 +145,20 @@ def event_line(ev: Dict[str, Any]) -> Optional[str]:
         return S.EVENT_LOOTED.format(player=ev["player"])
     if k == "regen":
         return S.EVENT_REGEN.format(name=ev["name"], amount=ev["amount"], hp=ev["hp"], max_hp=ev["max_hp"])
-    return None    # firewall_gain 은 게이지 표시로 충분
+    if k == "firewall_drain":
+        return S.EVENT_FIREWALL_DRAIN.format(by=ev["by"], josa=_josa(ev["by"], "이", "가"), amount=ev["amount"],
+                                             value=ev["value"], max=ev["max"])
+    if k == "firewall_lock":
+        return S.EVENT_FIREWALL_LOCK.format(by=ev["by"], josa=_josa(ev["by"], "이", "가"))
+    if k == "ice":
+        return S.EVENT_ICE.format(by=ev["by"], josa=_josa(ev["by"], "이", "가"), amount=ev["amount"], value=ev["value"], max=ev["max"])
+    if k == "expose":
+        life = S.EVENT_EXPOSE_LIFE.format(life=ev["life"], life_max=ev.get("life_max", 0)) if "life" in ev else ""
+        return S.EVENT_EXPOSE.format(life=life)
+    if k == "life":
+        fmt = S.EVENT_LIFE_LOW if int(ev.get("value", 0)) <= 2 else S.EVENT_LIFE
+        return fmt.format(value=ev["value"], max=ev["max"])
+    return None    # firewall_gain / field_mod 는 게이지·로그 줄로 충분
 
 
 def event_lines(events: Iterable[Dict[str, Any]]) -> List[str]:
@@ -132,6 +168,17 @@ def event_lines(events: Iterable[Dict[str, Any]]) -> List[str]:
         if t:
             out.append(t)
     return out
+
+
+def tip_lines(keys: Iterable[str]) -> List[str]:
+    return [S.TIPS[k] for k in keys if k in S.TIPS]
+
+
+def tutorial_line(result: Optional[Dict[str, Any]]) -> str:
+    if not result or result.get("ok") is None:
+        return ""
+    fmt = S.TUTORIAL_OK if result.get("ok") else S.TUTORIAL_FAIL
+    return fmt.format(text=result.get("text", ""))
 
 
 # ---------------------------------------------------------------------------
@@ -150,6 +197,10 @@ def hp_board(st: E.BattleState) -> str:
 
 def job_label(u: E.Combatant) -> str:
     return S.JOB_KO.get(u.job, u.job) if u.job else ""
+
+
+def weapon_label(u: E.Combatant) -> str:
+    return E.weapon_label(u)
 
 
 def intent_text(it: Dict[str, Any]) -> str:
@@ -171,18 +222,30 @@ def intents_text(st: E.BattleState) -> str:
 
 def meters_text(st: E.BattleState) -> List[str]:
     m = st.meters
-    out = [S.METER_FIREWALL.format(value=int(m.get("firewall", 0)), max=int(st.config.get("firewall_max", 9)))]
+    fw = S.METER_FIREWALL.format(value=int(m.get("firewall", 0)), max=int(st.config.get("firewall_max", 9)))
+    if E.firewall_locked(st):
+        fw += S.METER_FIREWALL_LOCKED
+    out = [fw]
     if st.has("ncpd"):
         out.append(S.METER_NCPD.format(value=float(m.get("ncpd", 0.0)), max=float(st.config.get("ncpd_max", 3.0))))
     if st.has("doll"):
         out.append(S.METER_CHIP.format(value=int(m.get("chip", 0)), max=int(m.get("chip_max", 0))))
-        mode = m.get("doll_mode", "")
-        if mode and st.status == E.ROUND_OPEN:
+    if st.has("ice"):
+        out.append(S.METER_ICE.format(value=int(m.get("ice", 0)), max=int(m.get("ice_max", 0))))
+    if st.has("life_support"):
+        out.append(S.METER_LIFE.format(value=int(m.get("life", 0)), max=int(m.get("life_max", 0))))
+    mode = m.get("doll_mode", "")
+    if mode and st.status == E.ROUND_OPEN:
+        if st.has("doll"):
             out.append(S.METER_MODE.format(mode=S.MODE_KO.get(mode, mode)))
+        else:
+            out.append(S.METER_MODE_GENERIC.format(owner=m.get("mode_owner", "?"), mode=S.MODE_KO.get(mode, mode)))
     if st.has("terminal"):
         h = st.holder()
         out.append(S.METER_SCREEN.format(value=int(m.get("screen", 0)), max=int(m.get("screen_max", 0)),
                                          holder=h.name if h else "-"))
+    if "pot" in m and bool(st.config.get("prep_enabled", True)):
+        out.append(S.METER_POT.format(value=int(m.get("pot", 0))))
     return out
 
 
@@ -199,6 +262,12 @@ def combo_text(card: E.Card) -> str:
     return S.COMBO_LINE.format(cond=cond + " 적", bonus=bonus)
 
 
+def risk_names(st: E.BattleState, card: E.Card, actor: Optional[E.Combatant]) -> List[str]:
+    if actor is None:
+        return []
+    return [e.name for e in st.alive_units(E.ENEMY) if E.overkill_risk(st, actor, card, e)]
+
+
 def card_summary(st: E.BattleState, card: E.Card, actor: Optional[E.Combatant]) -> str:
     """드롭다운 설명용 한 줄: [종류·대상] 예상 피해 · 설명"""
     parts = [f"[{S.KIND_KO.get(card.kind, card.kind)}·{S.TARGET_KO.get(card.target, card.target)}]"]
@@ -206,6 +275,8 @@ def card_summary(st: E.BattleState, card: E.Card, actor: Optional[E.Combatant]) 
         lo, hi = E.damage_range(card, actor, st.config)
         if hi > 0:
             parts.append(S.HAND_DMG.format(lo=lo, hi=hi))
+        if risk_names(st, card, actor):
+            parts.append("⚠")
     if card.tags:
         parts.append("·".join(S.TAG_KO.get(t, t) for t in card.tags))
     parts.append(card.desc)
@@ -213,12 +284,17 @@ def card_summary(st: E.BattleState, card: E.Card, actor: Optional[E.Combatant]) 
 
 
 def card_detail(st: E.BattleState, card: E.Card, actor: Optional[E.Combatant]) -> str:
-    """패 임베드 필드 본문: 설명 + 예상 피해 + 콤보 줄."""
+    """패 임베드 필드 본문: 설명 + 예상 피해(무기 보너스) + ⚠ 과잉 위험 대상 + 콤보 줄."""
     lines = [card.desc or "-"]
     if actor is not None:
         lo, hi = E.damage_range(card, actor, st.config)
         if hi > 0:
-            lines.append(f"예상 피해 {S.HAND_DMG.format(lo=lo, hi=hi)}" + (" (대상당)" if card.target == "all_enemy" else ""))
+            wb = E.weapon_bonus(actor, st.config)
+            lines.append(f"예상 피해 {S.HAND_DMG.format(lo=lo, hi=hi)}" + (" (대상당)" if card.target == "all_enemy" else "")
+                         + (S.HAND_WEAPON.format(bonus=wb) if wb else ""))
+        names = risk_names(st, card, actor)
+        if names:
+            lines.append(S.HAND_RISK.format(names=", ".join(names)))
     cb = combo_text(card)
     if cb:
         lines.append(cb)
@@ -228,6 +304,33 @@ def card_detail(st: E.BattleState, card: E.Card, actor: Optional[E.Combatant]) -
 def lobby_text(names: Iterable[str]) -> str:
     names = list(names)
     return S.LOBBY.format(n=len(names), names=", ".join(names) if names else S.LOBBY_EMPTY)
+
+
+def intro_rules(st: E.BattleState) -> List[str]:
+    """전투 소개의 규칙 줄들 (strings.INTRO_RULES 를 상태 숫자로 채운다)."""
+    cfg = st.config
+    h = st.holder()
+    ctx = {
+        "margin": int(cfg.get("overkill_margin", 15)), "ncpd_max": float(cfg.get("ncpd_max", 3.0)),
+        "drag_turns": int(cfg.get("drag_turns", 2)), "holder": h.name if h else "-",
+        "daemon_damage": int(cfg.get("daemon_damage", 5)), "daemon_max": int(cfg.get("daemon_max_infected", 4)),
+        "life": int(st.meters.get("life_max", cfg.get("life_support_rounds", 8))),
+        "ice_layers": int(st.meters.get("ice_max", cfg.get("ice_layers", 3))),
+        "ice_pct": int(round(float(cfg.get("ice_reduction", 0.3)) * 100)), "ice_cap": int(cfg.get("ice_round_cap", 2)),
+        "wmin": 1, "wmax_start": int(cfg.get("weapon_start_max", 2)),
+        "price_normal": int(cfg.get("price_normal", 100)), "price_black": int(cfg.get("price_black", 50)),
+        "actions": int(cfg.get("prep_actions", 2)), "field_cost": int(cfg.get("field_mod_cost", 50)),
+        "options": " / ".join(S.FIREWALL_OPTION_KO.get(o, o) for o in E.enabled_firewall_options(st)),
+    }
+    out = []
+    for g in st.gimmicks:
+        fmt = S.INTRO_RULES.get(g)
+        if fmt:
+            out.append(fmt.format(**ctx))
+    if bool(cfg.get("prep_enabled", True)):
+        out.append(S.INTRO_RULES["prep"].format(**ctx))
+    out.append(S.INTRO_RULES["firewall"].format(**ctx))
+    return out
 
 
 def intro_text(st: E.BattleState, desc: str = "") -> str:
@@ -243,6 +346,10 @@ def progress(st: E.BattleState):
         acting = E.escape_players(st)
         done = sum(1 for p in acting if p.id in st.escape.get("choices", {}))
         return done, len(acting)
+    if st.status == E.PREP:
+        ready = set(st.prep.get("ready", []))
+        acting = [p for p in st.players.values() if p.alive()]
+        return sum(1 for p in acting if p.id in ready), len(acting)
     acting = E.acting_players(st)
     done = sum(1 for p in acting if p.id in st.choices)
     return done, len(acting)
@@ -253,6 +360,8 @@ def mark_for(st: E.BattleState, p: E.Combatant) -> str:
         return S.MARK_OUT
     if st.status == E.ESCAPE:
         return S.MARK_DONE if p.id in st.escape.get("choices", {}) else S.MARK_TODO
+    if st.status == E.PREP:
+        return S.MARK_DONE if p.id in st.prep.get("ready", []) else S.MARK_TODO
     if E.is_stunned(p):
         return S.MARK_STUN
     if p.id in st.choices:
@@ -273,13 +382,73 @@ def turn_open_text(st: E.BattleState) -> str:
 
 
 def report_text(report: Dict[str, Any]) -> str:
-    lines = [S.REPORT_HEADER.format(round=report.get("round_no", 0))]
+    lines = [S.AMBUSH_TITLE if report.get("ambush") else S.REPORT_HEADER.format(round=report.get("round_no", 0))]
     for line in report["lines"]:
         prefix = "🟢 " if line.get("side") == E.ALLY else "🔴 "
         for i, text in enumerate(log_lines(line)):
             lines.append((prefix + text) if i == 0 else text)
     lines.extend(event_lines(report.get("events") or []))
+    lines.extend(tip_lines(report.get("tips") or []))
+    t = tutorial_line(report.get("tutorial"))
+    if t:
+        lines.append(t)
     return "\n".join(lines)
+
+
+def prep_rows(st: E.BattleState) -> List[str]:
+    cfg = st.config
+    prep = st.prep
+    out = []
+    for p in st.players.values():
+        out.append(S.PREP_ROW.format(
+            mark=mark_for(st, p), name=p.name, weapon=E.weapon_label(p) or "-",
+            allowance=int(prep.get("allowance", {}).get(p.id, 0)),
+            actions_left=int(cfg.get("prep_actions", 2)) - int(prep.get("actions", {}).get(p.id, 0))))
+    return out
+
+
+def _entry_kwargs(entry: Dict[str, Any]) -> Dict[str, Any]:
+    kw = dict(entry)
+    kw["refund"] = S.OK_PREP_REFUND if entry.get("refund") else ""
+    return kw
+
+
+def prep_roll_line(entry: Dict[str, Any]) -> str:
+    kw = _entry_kwargs(entry)
+    if entry.get("kind") == "normal":
+        return S.PREP_ROLL_NORMAL.format(**kw)
+    if entry.get("roll") in (None, 0):
+        return S.PREP_ROLL_AUTO.format(**kw)
+    return S.PREP_ROLL_BLACK.format(**kw)
+
+
+def prep_result_text(entry: Dict[str, Any]) -> str:
+    """개조 버튼의 ephemeral 응답."""
+    kw = _entry_kwargs(entry)
+    if entry.get("kind") == "normal":
+        return S.OK_PREP_NORMAL.format(**kw)
+    if entry.get("roll") in (None, 0):
+        return S.OK_PREP_BLACK_AUTO.format(**kw)
+    if entry.get("success"):
+        return S.OK_PREP_BLACK_WIN.format(**kw)
+    return S.OK_PREP_BLACK_FAIL.format(**kw)
+
+
+def prep_public_line(entry: Dict[str, Any]) -> str:
+    return S.PREP_PUBLIC_ROLL.format(name=entry["name"], roll=entry.get("roll"),
+                                     result=S.PREP_PUBLIC_WIN if entry.get("success") else S.PREP_PUBLIC_FAIL,
+                                     weapon=entry.get("weapon", ""))
+
+
+def payout_text(st: E.BattleState) -> str:
+    p = st.meters.get("payout")
+    if not isinstance(p, dict):
+        return ""
+    if p.get("sandbox") or not p.get("enabled", True):
+        return S.PAYOUT_SANDBOX
+    return S.PAYOUT_VALUE.format(base=p["base"], ratio=p["ratio"], penalty=p["penalty"], overkills=p["overkills"],
+                                 loud=p["loud"], reward=p["reward"], leftover=p["leftover"],
+                                 pot_after=p.get("pot_after") if p.get("pot_after") is not None else "-")
 
 
 def winner_title(st: E.BattleState) -> str:
@@ -288,10 +457,16 @@ def winner_title(st: E.BattleState) -> str:
     if st.winner == E.CAUGHT:
         return S.WIN_CAUGHT
     if st.winner == E.ALLY:
+        if st.end_reason == "tutorial":
+            return S.WIN_TUTORIAL
+        if st.end_reason == "collapse":
+            return S.WIN_ALLY_COLLAPSE
         if st.end_reason == "chip":
             return S.WIN_ALLY_CHIP
         if st.has("doll"):
             return S.WIN_ALLY_DOLL_HP
+        if st.has("life_support"):
+            return S.WIN_ALLY_BOSS.get(str(st.meters.get("boss_state", "hurt")), S.WIN_ALLY)
         return S.WIN_ALLY
     return S.WIN_ENEMY
 

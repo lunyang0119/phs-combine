@@ -4,18 +4,24 @@ atk_knee,관절 치기,attack,enemy,physics,ally,6,damage:5,nonlethal,,무릎·�
 atk_bolt,쇼트 서킷,attack,enemy,magic,both,8,damage:8,,target_has:atk_down:dmg_add:5,RAM 공격. 무기 글리치 상태의 적에게 +5
 atk_sweep,제압 사격,attack,all_enemy,physics,both,4,damage:4,loud,,적 전체 사격 (소음: 경계도 +0.5)
 def_guard,엄폐,defend,self,none,both,8,shield:0.5:1,,,이번 라운드 받는 피해 절반
-def_ice,보느와의 ICE,defend,ally,none,ally,4,shield:0.7:1,,,아군 한 명이 이번 라운드 피해 70% 감소
-hack_jam,무기 글리치,hack,enemy,magic,both,5,atk_down:0.3:2,,,대상 공격력 30% 감소 (2라운드)
-hack_misfire,사이버웨어 고장,hack,enemy,magic,both,5,misfire:0.5:2,,,대상의 다음 공격이 50% 확률로 불발
-hack_redirect,적대 인식,hack,enemy,magic,both,3,redirect_random:1:2,,,대상의 다음 공격이 무작위 대상에게 향함
-hack_stun,시스템 리셋,hack,enemy,magic,both,2,stun:1:1,,,대상의 다음 행동 불가
+def_ice,보느와의 ICE,defend,ally,none,ally,4,shield:0.7:1;cleanse:1,,,아군 한 명이 이번 라운드 피해 70% 감소. 데몬 감염도 지운다
+hack_jam,무기 글리치,hack,enemy,magic,both,5,atk_down:0.3,,,대상의 다음 공격 30% 감소
+hack_misfire,사이버웨어 고장,hack,enemy,magic,both,5,misfire:0.5,,,대상의 다음 공격이 50% 확률로 불발
+hack_redirect,적대 인식,hack,enemy,magic,both,3,redirect_random:1,,,대상의 다음 공격이 무작위 대상에게 향함
+hack_stun,시스템 리셋,hack,enemy,magic,both,2,stun:1,,,대상의 다음 행동 불가
 sp_overdrive,샌디스탄 돌격,special,enemy,physics,ally,2,damage:14;self_damage:3,lethal,target_has:grapple:dmg_x:1.5,강타 + 반동 3. 살상 위력(제압 시 과잉 제압). 붙잡고 있는 적에게 1.5배
 sp_burst,과부하 핵,special,enemy,magic,ally,2,damage:12,,target_has:misfire:dmg_x:1.5,고출력 퀵핵. 사이버웨어 고장 상태의 적에게 1.5배
 heal_kit,맥스닥 흡입기,special,ally,magic,ally,4,heal:6,,,아군 HP 6 + RAM 보정 회복. 쓰러진 아군도 일으킴
 e_pistol,권총 사격,attack,enemy,physics,enemy,6,damage:7,,,스캐빈저의 조잡한 권총
-e_flash,섬광 마스크,hack,all_enemy,magic,enemy,3,misfire:0.5:2,,,발광 마스크 섬광: 아군 전체 다음 공격 50% 불발
+e_training,훈련용 사격,attack,enemy,none,enemy,0,damage:3,,,튜토리얼 전용 약한 사격 (AI 는 뽑지 않는다)
+e_flash,섬광 마스크,hack,all_enemy,magic,enemy,3,misfire:0.5,,,발광 마스크 섬광: 아군 전체 다음 공격 50% 불발
 pass_terminal,단말기 넘기기,special,ally,none,fixed,0,pass_terminal:1,,,보느와의 단말기를 다른 아군에게 넘긴다 (돌의 표적이 바뀜)
 break_free,떨쳐내기,special,self,none,fixed,0,break_free:1,,,매달린 돌을 떨쳐낸다
+field_mod,현장 개조,special,self,none,fixed,0,field_mod:1,,,금고의 에디로 무기를 즉석 개조한다 (d10). 실패해도 등급은 그대로. 다음 공격만 불발
 doll_cling,매달리기,special,enemy,none,fixed,0,damage:3;grapple:1,,,단말기 소지자에게 매달려 붙잡는다 (긁힘 3)
 doll_claws,손톱 연타,attack,enemy,physics,fixed,0,damage:6;damage:6,,,긴 손톱으로 두 번 긋는다
 doll_reboot,리부트,special,self,none,fixed,0,noop:0,,,인격 칩 재부팅 중 (행동 불가. 해킹 피해 2배)
+bw_ambush,기습 퀵핵,hack,all_enemy,magic,fixed,0,scatter_damage:4:3;daemon:1:1,,,들어서자마자 날아온 퀵핵. 셋이 다치고 하나가 감염된다
+bw_seize,장악,hack,all_enemy,magic,fixed,0,ice:1;daemon:1:2,,,ICE 한 층을 다시 세우고 아군 둘에게 데몬을 심는다
+bw_breach,침입,hack,enemy,magic,fixed,0,firewall_drain:2;redirect_random:1,,,단말기 보느와의 방화벽을 깎고 대상의 다음 공격을 적대 인식으로 돌린다
+bw_overload,과부하,attack,all_enemy,magic,fixed,0,damage:7;expose:1,,,전원에게 RAM 과부하. 대신 ICE 가 전부 내려가고 생명 유지 시계가 하나 더 준다

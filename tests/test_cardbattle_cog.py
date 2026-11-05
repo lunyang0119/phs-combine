@@ -81,7 +81,7 @@ class FakeResponse:
     async def send_message(self, content=None, ephemeral=False, view=None, embed=None, **kw):
         await asyncio.sleep(0)
         self._done = True
-        self.calls.append(("send", content, ephemeral, view, embed))
+        self.calls.append(("send", content, ephemeral, view, embed if embed is not None else kw.get("embeds")))
 
     async def edit_message(self, content=None, view=None, embed=None, **kw):
         await asyncio.sleep(0)
@@ -124,6 +124,7 @@ def make_cog(channel, tmp_path):
     bot = SimpleNamespace(get_channel=lambda cid: channel, add_view=views.append, sheet_handler=FakeSheets())
     cog = CardBattleCog(bot)
     cog.store_path = str(tmp_path / "state.json")
+    cog.gig_path = str(tmp_path / "gig.json")
     cog.rng = random.Random(3)
     cog.registered_views = views
     return cog
@@ -136,6 +137,7 @@ def last(i):
 async def setup_battle(cog, channel, host=1, players=(1, 2), battle="b01", **cfg):
     await cog._cmd_host(interaction(host, channel), None)
     cog.state.config["report_delay_sec"] = 0.0
+    cfg.setdefault("prep_enabled", False)       # 준비 단계는 전용 테스트에서만
     cog.state.config.update(cfg)
     for uid in players:
         await cog._cmd_join(interaction(uid, channel), None)

@@ -1,8 +1,10 @@
 """카드 전투 Cog — `/카드` 단일 명령 + 턴 메시지 버튼.
 
 세션은 전체에서 하나(`self.state`). 상태 변경은 전부 `self.lock` 안에서 하고 `_save()` 한다.
-흐름: 주최(LOBBY) → 참가(로비 메시지 편집) → 시작(ROUND_OPEN, 턴 메시지 + 카드 뽑기/방화벽 버튼)
-      → 전원 선택 또는 /카드 턴종료 → 라운드 정산 게시 → 다음 턴 메시지 … → ENDED
+흐름: 주최(LOBBY) → 참가(로비 메시지 편집) → 시작
+      → (prep_enabled) PREP: 준비 메시지의 버튼 3개(정식 개조/뒷골목 개조/준비 완료) → 전원 준비 또는 /카드 턴종료
+      → (first_strike) 기습 보고 → ROUND_OPEN: 턴 메시지 + 카드 뽑기/방화벽 버튼
+      → 전원 선택 또는 /카드 턴종료 → 라운드 정산 게시 → 다음 턴 메시지 … → ENDED (보수를 금고에 더함)
       → (NCPD 경계도가 차면) ESCAPE: 도주 메시지의 버튼 3개 → 전원 선택 → 도주 정산 … → ENDED
 """
 from __future__ import annotations
@@ -22,10 +24,12 @@ from . import config as cfgmod
 from . import data as D
 from . import embeds
 from . import engine as E
+from . import gig
 from . import image_render
+from . import render
 from . import store
 from . import strings as S
-from .views import ChosenView, EscapeView, FirewallView, HandView, TargetView, TurnView
+from .views import ChosenView, EscapeView, FirewallView, HandView, PrepView, TargetView, TurnView
 
 logger = logging.getLogger(__name__)
 
@@ -36,6 +40,8 @@ OPTION_CHOICES = [
     app_commands.Choice(name="턴종료", value="force"),
     app_commands.Choice(name="종료", value="end"),
     app_commands.Choice(name="현황", value="status"),
+    app_commands.Choice(name="금고", value="vault"),
+    app_commands.Choice(name="규칙", value="rules"),
 ]
 MAX_AUTO_RESOLVE = 20
 BOARD_FILENAME = "board.png"
@@ -58,6 +64,7 @@ class CardBattleCog(commands.Cog):
         self.rng: E.Rng = E.DEFAULT_RNG
         self.data: Optional[D.GameData] = None
         self.store_path = store.DEFAULT_PATH
+        self.gig_path = gig.DEFAULT_PATH
         self.admin_ids = _id_set("CARDBATTLE_ADMIN_IDS", "FUGITIVE_ADMIN_IDS")
         self._render_warned: Optional[str] = None
 
@@ -65,8 +72,9 @@ class CardBattleCog(commands.Cog):
     async def cog_load(self):
         self.bot.add_view(TurnView())
         self.bot.add_view(EscapeView())
+        self.bot.add_view(PrepView())
         self.state = store.load(self.store_path)
-        if self.state and self.state.status in (E.ROUND_OPEN, E.RESOLVING, E.ESCAPE):
+        if self.state and self.state.status in (E.PREP, E.ROUND_OPEN, E.RESOLVING, E.ESCAPE, E.ENDED):
             asyncio.create_task(self._resume())
 
     def _save(self):
@@ -81,7 +89,7 @@ class CardBattleCog(commands.Cog):
                 return None
         return ch
 
-    async def _reply(self, interaction: discord.Interaction, content: str, ephemeral: bool = True, **kw):
+    async def _reply(self, interaction: discord.Interaction, content: Optional[str], ephemeral: bool = True, **kw):
         if interaction.response.is_done():
             await interaction.followup.send(content, ephemeral=ephemeral, **kw)
         else:
@@ -143,13 +151,15 @@ class CardBattleCog(commands.Cog):
                 out.append(app_commands.Choice(name=label[:100], value=b.id))
         return out[:25]
 
-    @app_commands.command(name="카드", description="카드 전투 미니게임 — 주최 / 참가 / 시작 / 턴종료 / 종료 / 현황")
-    @app_commands.describe(옵션="실행할 동작", 전투id="시작할 전투 ID (옵션:시작 때 필요. 인원수에 맞는 id)", 도움말=help_option.HELP_OPTION_DESC)
+    @app_commands.command(name="카드", description="카드 전투 미니게임 — 주최 / 참가 / 시작 / 턴종료 / 종료 / 현황 / 금고 / 규칙")
+    @app_commands.describe(옵션="실행할 동작", 전투id="시작할 전투 ID (옵션:시작 때 필요. 인원수에 맞는 id)",
+                           금액="옵션:금고 에서 팀 금고를 이 값으로 맞춤 (주최자·관리자)", 도움말=help_option.HELP_OPTION_DESC)
     @app_commands.choices(옵션=OPTION_CHOICES)
     @app_commands.autocomplete(전투id=_battle_autocomplete)
     async def card(self, interaction: discord.Interaction,
                    옵션: Optional[app_commands.Choice[str]] = None,
                    전투id: Optional[str] = None,
+                   금액: Optional[int] = None,
                    도움말: bool = False):
         if await help_option.maybe_help(interaction, 도움말, S.HELP):
             return
@@ -160,9 +170,9 @@ class CardBattleCog(commands.Cog):
         if handler is None:
             await self._reply(interaction, f"알 수 없는 옵션: {value}")
             return
-        await handler(interaction, 전투id)
+        await handler(interaction, 전투id, 금액)
 
-    async def _cmd_host(self, interaction: discord.Interaction, _):
+    async def _cmd_host(self, interaction: discord.Interaction, _, amount=None):
         async with self.lock:
             st = self.state
             if st is not None and st.status != E.ENDED:
@@ -187,7 +197,7 @@ class CardBattleCog(commands.Cog):
         except Exception:  # noqa: BLE001
             return None
 
-    async def _cmd_join(self, interaction: discord.Interaction, _):
+    async def _cmd_join(self, interaction: discord.Interaction, _, amount=None):
         async with self.lock:
             st = self.state
             if st is None or st.status == E.ENDED:
@@ -236,7 +246,7 @@ class CardBattleCog(commands.Cog):
             except discord.HTTPException:
                 pass
 
-    async def _cmd_start(self, interaction: discord.Interaction, battle_id: Optional[str]):
+    async def _cmd_start(self, interaction: discord.Interaction, battle_id: Optional[str], amount=None):
         st = self.state
         if st is None or st.status == E.ENDED:
             await self._reply(interaction, S.ERR_NO_SESSION)
@@ -274,8 +284,11 @@ class CardBattleCog(commands.Cog):
                 for k, v in bdef.overrides.items():
                     cfg[k] = cfgmod.coerce(k, v)
                 enemies = E.enemy_combatants(bdef, gd.enemies, hp_mult=float(cfg.get("enemy_hp_mult", 1.0)))
+                pot = None if bool(cfg.get("prep_sandbox")) else gig.load_pot(self.gig_path)
+                script = gd.tutorials.get(str(cfg.get("tutorial_script", ""))) if "tutorial" in bdef.gimmicks else None
                 new = E.new_battle(list(st.players.values()), enemies, gd.cards, cfg, host_id=st.host_id,
-                                   battle_id=bdef.id, battle_name=bdef.name, gimmicks=bdef.gimmicks, rng=self.rng)
+                                   battle_id=bdef.id, battle_name=bdef.name, gimmicks=bdef.gimmicks, rng=self.rng,
+                                   pot=pot, script=script, weapon_names=S.WEAPON_NAMES)
             except cfgmod.ConfigError as e:
                 await self._reply(interaction, S.ERR_DATA.format(err=e))
                 return
@@ -290,17 +303,31 @@ class CardBattleCog(commands.Cog):
                 await self._reply(interaction, "채널을 찾지 못했습니다.")
                 return
             await ch.send(embed=embeds.intro(new, bdef.desc))
-            await self._open_turn(ch)
+            if new.status == E.PREP:
+                await self._open_prep(ch)
+            else:
+                await self._begin_messages(ch)
+        if self.state is not None and self.state.status == E.PREP:
+            await self._reply(interaction, S.OK_STARTED_PREP.format(battle=bdef.name))
+            return
         await self._reply(interaction, S.OK_STARTED.format(battle=bdef.name))
         await self._resolve_round()   # 행동 가능한 참가자가 없으면 바로 넘어간다
 
-    async def _cmd_force(self, interaction: discord.Interaction, _):
+    async def _cmd_force(self, interaction: discord.Interaction, _, amount=None):
         st = self.state
         if st is None or st.status == E.ENDED:
             await self._reply(interaction, S.ERR_NO_SESSION)
             return
         if not (self._is_host(interaction) or self._is_admin(interaction)):
             await self._reply(interaction, S.ERR_HOST_ONLY)
+            return
+        if st.status == E.PREP:
+            await self._reply(interaction, S.OK_FORCED_PREP)
+            async with self.lock:
+                ch = await self._channel(st.channel_id)
+                if ch is not None:
+                    await self._finish_prep(ch)
+            await self._resolve_round()
             return
         if st.status == E.ESCAPE:
             await self._reply(interaction, S.OK_FORCED)
@@ -312,7 +339,7 @@ class CardBattleCog(commands.Cog):
         await self._reply(interaction, S.OK_FORCED)
         await self._resolve_round(force=True)
 
-    async def _cmd_end(self, interaction: discord.Interaction, _):
+    async def _cmd_end(self, interaction: discord.Interaction, _, amount=None):
         async with self.lock:
             st = self.state
             if st is None:
@@ -322,11 +349,12 @@ class CardBattleCog(commands.Cog):
                 await self._reply(interaction, S.ERR_HOST_ONLY)
                 return
             await self._strip_turn_view()
+            await self._strip_prep_view()
             self.state = None
             self._save()
         await self._reply(interaction, S.OK_ENDED)
 
-    async def _cmd_status(self, interaction: discord.Interaction, _):
+    async def _cmd_status(self, interaction: discord.Interaction, _, amount=None):
         st = self.state
         if st is None:
             await self._reply(interaction, S.ERR_NO_SESSION)
@@ -335,6 +363,128 @@ class CardBattleCog(commands.Cog):
             await self._reply(interaction, None, embed=embeds.lobby([p.name for p in st.players.values()]))
             return
         await self._reply(interaction, None, embed=embeds.status(st))
+
+    async def _cmd_vault(self, interaction: discord.Interaction, _, amount: Optional[int] = None):
+        st = self.state
+        if amount is None:
+            pot = gig.load_pot(self.gig_path)
+            battle = ""
+            if st is not None and st.status not in (E.LOBBY, E.ENDED) and "pot" in st.meters:
+                battle = S.OK_VAULT_BATTLE.format(left=int(st.meters.get("pot", 0)))
+            await self._reply(interaction, S.OK_VAULT.format(pot=pot if pot is not None else 0, battle=battle))
+            return
+        if not (self._is_host(interaction) or self._is_admin(interaction)):
+            await self._reply(interaction, S.ERR_HOST_ONLY)
+            return
+        if int(amount) < 0:
+            await self._reply(interaction, S.ERR_VAULT_AMOUNT)
+            return
+        pot = await asyncio.to_thread(gig.set_pot, int(amount), self.gig_path)
+        await self._reply(interaction, S.OK_VAULT_SET.format(pot=pot))
+
+    async def _cmd_rules(self, interaction: discord.Interaction, _, amount=None):
+        batches = embeds.chunk_embeds(embeds.rules_sections())
+        for i, batch in enumerate(batches):
+            if i == 0 and not interaction.response.is_done():
+                await interaction.response.send_message(embeds=batch, ephemeral=True)
+            else:
+                await interaction.followup.send(embeds=batch, ephemeral=True)
+
+    # ------------------------------------------------------------------ 준비 단계
+    async def _open_prep(self, ch):
+        st = self.state
+        msg = await ch.send(embed=embeds.prep(st), view=PrepView())
+        st.prep_message_id = msg.id
+        self._save()
+
+    async def _refresh_prep_message(self, strip: bool = False):
+        st = self.state
+        if not st or not st.prep_message_id:
+            return
+        ch = await self._channel(st.channel_id)
+        if not ch:
+            return
+        try:
+            msg = await ch.fetch_message(st.prep_message_id)
+            if strip:
+                await msg.edit(embed=embeds.prep(st), view=None)
+            else:
+                await msg.edit(embed=embeds.prep(st))
+        except (discord.HTTPException, AttributeError, LookupError):
+            pass
+
+    async def _strip_prep_view(self):
+        st = self.state
+        if st and st.prep_message_id:
+            await self._refresh_prep_message(strip=True)
+
+    async def _finish_prep(self, ch):
+        """lock 보유 상태에서 호출. 준비 단계를 닫고 (기습 보고 →) 1라운드 메시지를 연다."""
+        st = self.state
+        if st is None or st.status != E.PREP:
+            return
+        gig.finish_prep(st, self.rng)
+        self._save()
+        await self._strip_prep_view()
+        await self._begin_messages(ch)
+
+    async def _begin_messages(self, ch):
+        """전투가 열린 직후: 밀린 보고(기습) 게시 → 첫 턴 메시지."""
+        await self._flush_reports(ch)
+        await self._open_turn(ch)
+
+    async def _flush_reports(self, ch):
+        st = self.state
+        for rep in list(st.pending_reports):
+            await self._post_report(ch, rep)
+        st.pending_reports = []
+        self._save()
+
+    async def handle_prep(self, interaction: discord.Interaction, action: str):
+        uid = str(interaction.user.id)
+        public: Optional[str] = None
+        all_ready = False
+        async with self.lock:
+            st = self.state
+            if st is None or st.status != E.PREP:
+                await self._reply(interaction, S.ERR_NOT_PREP)
+                return
+            if interaction.message is not None and interaction.message.id != st.prep_message_id:
+                await self._reply(interaction, S.ERR_STALE_MESSAGE)
+                return
+            if uid not in st.players:
+                await self._reply(interaction, S.ERR_NOT_IN_GAME)
+                return
+            try:
+                if action == "ready":
+                    text = S.OK_PREP_READY if gig.prep_ready(st, uid) else S.OK_PREP_ALREADY
+                else:
+                    entry = gig.prep_upgrade(st, uid, action, self.rng)
+                    text = render.prep_result_text(entry)
+                    if action == "black" and entry.get("roll"):
+                        public = render.prep_public_line(entry)
+            except E.RuleError as e:
+                await self._reply(interaction, self._rule_msg(e))
+                return
+            self._save()
+            all_ready = gig.prep_all_ready(st)
+        await self._reply(interaction, text)
+        await self._refresh_prep_message()
+        if public:
+            ch = await self._channel(self.state.channel_id) if self.state else None
+            if ch is not None:
+                try:
+                    await ch.send(public)
+                except discord.HTTPException:
+                    pass
+        if all_ready:
+            async with self.lock:
+                st = self.state
+                if st is not None and st.status == E.PREP:
+                    ch = await self._channel(st.channel_id)
+                    if ch is not None:
+                        await self._finish_prep(ch)
+            await self._resolve_round()
 
     # ------------------------------------------------------------------ 턴 메시지
     def _turn_embed(self) -> discord.Embed:
@@ -345,11 +495,15 @@ class CardBattleCog(commands.Cog):
         return emb
 
     async def _open_turn(self, ch, report: Optional[Dict[str, Any]] = None):
-        """ROUND_OPEN 이면 카드 턴 메시지(현황판 PNG 첨부), ESCAPE 면 도주 메시지."""
+        """ROUND_OPEN 이면 (코치 →) 카드 턴 메시지(현황판 PNG 첨부), ESCAPE 면 도주 메시지."""
         st = self.state
         if st.status == E.ESCAPE:
             msg = await ch.send(embed=embeds.escape_turn(st), view=EscapeView())
         else:
+            if st.has("tutorial") and st.script:
+                coach = embeds.coach(st)
+                if coach.description:
+                    await ch.send(embed=coach)
             kw: Dict[str, Any] = {"embed": self._turn_embed(), "view": TurnView()}
             f = self._board_file(report)
             if f is not None:
@@ -375,7 +529,7 @@ class CardBattleCog(commands.Cog):
 
     async def _strip_turn_view(self):
         st = self.state
-        if not st or not st.turn_message_id:
+        if not st or not st.turn_message_id or st.status in (E.LOBBY, E.PREP):
             return
         ch = await self._channel(st.channel_id)
         if not ch:
@@ -422,8 +576,12 @@ class CardBattleCog(commands.Cog):
         """lock 보유 상태에서 호출. 정산 결과에 따라 종료·도주·다음 라운드 메시지를 연다."""
         st = self.state
         if st.status == E.ENDED:
-            await ch.send(embed=embeds.winner(st))
+            try:
+                await asyncio.to_thread(gig.apply_payout, st, self.gig_path)
+            except Exception:  # noqa: BLE001
+                logger.exception("보수 지급 실패")
             self._save()
+            await ch.send(embed=embeds.winner(st))
             return
         if st.status == E.ESCAPE:
             if not st.escape.get("history"):
@@ -457,7 +615,7 @@ class CardBattleCog(commands.Cog):
             return True
 
     async def _resume(self):
-        """재시작 복원: 게시 못 한 보고 → 턴/도주 메시지."""
+        """재시작 복원: 게시 못 한 보고 → 턴/도주/준비 메시지. 끝났는데 보수를 못 줬으면 지급."""
         try:
             async with self.lock:
                 st = self.state
@@ -466,9 +624,16 @@ class CardBattleCog(commands.Cog):
                 ch = await self._channel(st.channel_id)
                 if ch is None:
                     return
+                if st.status == E.ENDED:
+                    if not isinstance(st.meters.get("payout"), dict):
+                        gig.apply_payout(st, self.gig_path)
+                        self._save()
+                    return
                 for rep in list(st.pending_reports):
                     await self._post_report(ch, rep)
                 st.pending_reports = []
+                if st.status == E.PREP and not st.prep_message_id:
+                    await self._open_prep(ch)
                 if st.status == E.RESOLVING:   # 정산 도중 죽은 경우: 선택을 다시 받는다
                     st.status = E.ROUND_OPEN
                     st.turn_message_id = 0
@@ -535,7 +700,7 @@ class CardBattleCog(commands.Cog):
         targets = E.valid_targets(st, st.players[uid], card)
         if E.needs_target(card) and len(targets) > 1:
             await interaction.response.edit_message(content=S.TARGET_TITLE.format(card=card.name), embed=None,
-                                                    view=TargetView(uid, card_id, targets))
+                                                    view=TargetView(st, uid, card_id, targets))
             return
         await self._submit(interaction, uid, card_id, None)
 
