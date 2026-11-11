@@ -97,6 +97,43 @@ class _Owned(discord.ui.View):
         return True
 
 
+MENU_STYLES = {"host": discord.ButtonStyle.success, "join": discord.ButtonStyle.success,
+               "start": discord.ButtonStyle.primary, "force": discord.ButtonStyle.primary,
+               "end": discord.ButtonStyle.danger}
+
+
+class MenuButton(discord.ui.Button):
+    def __init__(self, label: str, value: str):
+        super().__init__(label=label, style=MENU_STYLES.get(value, discord.ButtonStyle.secondary))
+        self.value = value
+
+    async def callback(self, interaction: discord.Interaction):
+        await _dispatch(interaction, "handle_menu", self.value)
+
+
+class MenuView(_Owned):
+    """`/카드` 를 옵션 없이 실행했을 때의 ephemeral 버튼 메뉴. items = [(라벨, 값)]."""
+
+    def __init__(self, uid: str, items):
+        super().__init__(uid, timeout=900)
+        for label, value in items:
+            self.add_item(MenuButton(label, value))
+
+
+class BattleSelect(discord.ui.Select):
+    def __init__(self, options: List[discord.SelectOption]):
+        super().__init__(placeholder=S.MENU_BATTLE_PLACEHOLDER, options=options[:25], min_values=1, max_values=1)
+
+    async def callback(self, interaction: discord.Interaction):
+        await _dispatch(interaction, "handle_battle_pick", self.values[0])
+
+
+class BattleSelectView(_Owned):
+    def __init__(self, uid: str, options: List[discord.SelectOption]):
+        super().__init__(uid, timeout=600)
+        self.add_item(BattleSelect(options))
+
+
 class HandSelect(discord.ui.Select):
     def __init__(self, st: E.BattleState, uid: str, hand: List[str], page: int):
         self.uid = uid

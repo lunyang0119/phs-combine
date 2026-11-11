@@ -435,7 +435,22 @@ def test_end_clears_state_and_command_dispatch(tmp_path):
         assert not (tmp_path / "state.json").exists()
         i = interaction(1, ch)
         await cog.card.callback(cog, i, 옵션=None)
-        assert "옵션" in last(i)[1]
+        menu = last(i)[3]                                              # 옵션 없이 → 본인만 보는 버튼 메뉴
+        assert last(i)[1] == S.MENU_TITLE and last(i)[2] is True
+        assert [b.value for b in menu.children] == ["host", "join", "start", "force", "end", "status", "vault", "rules", "admin"]
+        i = interaction(1, ch)
+        await cog.handle_menu(i, "start")                              # 세션 없음 → 기존 오류 그대로
+        assert last(i)[1] == S.ERR_NO_SESSION
+        await cog.handle_menu(interaction(1, ch), "host")
+        await cog.handle_menu(interaction(1, ch), "join")
+        i = interaction(1, ch)
+        await cog.handle_menu(i, "start")                              # 주최자 + 로비 → 전투 선택 메뉴
+        sel = last(i)[3].children[0]
+        assert "b01" in [o.value for o in sel.options]
+        cog.state.config.update(prep_enabled=False, report_delay_sec=0.0)
+        i = interaction(1, ch)
+        await cog.handle_battle_pick(i, "b01")
+        assert cog.state.status == E.ROUND_OPEN and cog.state.battle_id == "b01"
     asyncio.run(body())
 
 

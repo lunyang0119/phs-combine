@@ -29,6 +29,7 @@ from . import image_render
 from . import render
 from . import store
 from . import strings as S
+from .views import BattleSelectView, MenuView
 from .views import ChosenView, EscapeView, FirewallView, HandView, PrepView, TargetView, TurnView
 
 logger = logging.getLogger(__name__)
@@ -164,7 +165,9 @@ class CardBattleCog(commands.Cog):
                    도움말: bool = False):
         if await help_option.maybe_help(interaction, 도움말, S.HELP):
             return
-        if not await help_option.require(interaction, 옵션=옵션):
+        if 옵션 is None:                       # 옵션 없이 실행 → 본인에게만 보이는 버튼 메뉴
+            items = [(c.name, c.value) for c in OPTION_CHOICES]
+            await self._reply(interaction, S.MENU_TITLE, view=MenuView(str(interaction.user.id), items))
             return
         value = 옵션.value if isinstance(옵션, app_commands.Choice) else str(옵션)
         handler = getattr(self, f"_cmd_{value}", None)
@@ -172,6 +175,33 @@ class CardBattleCog(commands.Cog):
             await self._reply(interaction, f"알 수 없는 옵션: {value}")
             return
         await handler(interaction, 전투id, 금액)
+
+    async def handle_menu(self, interaction: discord.Interaction, value: str):
+        """메뉴 버튼. 결과는 새 ephemeral 메시지로 가므로 메뉴는 계속 쓸 수 있다."""
+        st = self.state
+        if value == "start" and st is not None and st.status == E.LOBBY and self._is_host(interaction) and st.players:
+            try:
+                gd = self.data or await asyncio.to_thread(self._load_data)
+            except Exception as e:  # noqa: BLE001
+                logger.exception("카드 전투 데이터 로드 실패")
+                await self._reply(interaction, S.ERR_DATA.format(err=e))
+                return
+            n = len(st.players)
+            battles = sorted(gd.battles.values(), key=lambda b: 0 if b.players == n else (1 if not b.players else 2))
+            opts = [discord.SelectOption(label=(f"{b.name}" + (f" [{b.players}인]" if b.players else ""))[:100],
+                                         value=b.id, description=b.id[:100]) for b in battles[:25]]
+            if opts:
+                await self._reply(interaction, S.MENU_BATTLE_PROMPT.format(n=n),
+                                  view=BattleSelectView(str(interaction.user.id), opts))
+                return
+        handler = getattr(self, f"_cmd_{value}", None)
+        if handler is None:
+            await self._reply(interaction, f"알 수 없는 옵션: {value}")
+            return
+        await handler(interaction, None, None)
+
+    async def handle_battle_pick(self, interaction: discord.Interaction, battle_id: str):
+        await self._cmd_start(interaction, battle_id)
 
     async def _cmd_host(self, interaction: discord.Interaction, _, amount=None):
         async with self.lock:

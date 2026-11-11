@@ -1,0 +1,9 @@
+# Entry point and slash-command sync (`main.py`)
+
+> Split out of [CLAUDE.md](../../CLAUDE.md). Keep this file up to date when the code changes.
+
+[main.py](../../main.py) defines `BattleManager(commands.Bot)`. `setup_hook` creates one `SheetsHandler`, loads the Cogs in `COGS_TO_LOAD` (`character_commands`, `combat_commands`, `utility_commands`, `shop_commands`, `archive`, `mogindex_commands`, `cardbattle.cog`; all but the last live in the repo root, not a `cogs/` folder). `fugitive.cog` is **commented out** of that list in both `main.py` and `local_server/main.py`: the 침입자 추적 commands are disabled while the package, its tests and `python -m fugitive.sim` stay intact. Re-enable by uncommenting and running `!동기화` (the control guild is still synced on boot, so the stale `/추적기`·`/도주` copies are removed while it is off), then runs `sync_commands()`: a global `tree.sync()` plus `tree.sync(guild=...)` for `FUGITIVE_CONTROL_GUILD_ID` and `MOG_GUILD_ID`. `on_ready` additionally syncs the guilds named by `MOG_SWEEP_GUILD_IDS` once (see Environment), so a guild that only has stale copies gets an empty list pushed and the copies disappear. A command that Discord still lists but the tree does not know raises `CommandNotFound`; the custom `CommandTree.on_error` answers the user ephemerally instead of only logging. The owner-only prefix command `!동기화` re-runs the sync without a restart and reports Cogs that failed to load (`bot.failed_cogs`). Never call `copy_global_to` again: it is what left the orphaned guild copies behind.
+
+`summary.py` (Gemini-backed chat summariser, `SummaryCommandsCog`) is a complete Cog that is **not** in the load list; add it to `cogs_to_load` to enable it.
+
+Note the name collision: `main.BattleManager` is the bot, while `combat/battle_manager.BattleManager` is a class of static helpers for battle flow.
