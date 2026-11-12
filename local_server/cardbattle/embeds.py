@@ -5,7 +5,7 @@
 """
 from __future__ import annotations
 
-from typing import Any, Dict, Iterable, List
+from typing import Any, Dict, Iterable, List, Optional
 
 import discord
 
@@ -26,6 +26,7 @@ COLOR_ALERT = 0xFF0055    # NCPD
 COLOR_PREP = 0x1ABC9C     # teal
 COLOR_COACH = 0x2ECC71    # green
 COLOR_AMBUSH = 0xFF2BD6   # magenta
+COLOR_BRIEF = 0x00B8D4    # cyan
 
 BAR_WIDTH = 10
 DESC_LIMIT = 4000
@@ -94,8 +95,35 @@ def intro(st: E.BattleState, desc: str = "") -> discord.Embed:
     _board_fields(e, st)
     rules = render.intro_rules(st)
     e.add_field(name="규칙", value="\n".join(f"• {r}" for r in rules)[:FIELD_LIMIT], inline=False)
+    special = [t for t, _ in render.briefing_sections(st)]
+    if special and bool(st.config.get("briefing", True)):
+        e.add_field(name=S.INTRO_SPECIAL_FIELD, value=S.INTRO_SPECIAL.format(names=" · ".join(special))[:FIELD_LIMIT],
+                    inline=False)
     e.set_footer(text=S.INTRO_FOOTER)
     return e
+
+
+def briefing(st: E.BattleState) -> Optional[discord.Embed]:
+    """1라운드 직전에 한 번: 이 전투에 붙은 특수 규칙을 기믹마다 한 칸씩 자세히."""
+    sections = render.briefing_sections(st)
+    if not sections:
+        return None
+    e = discord.Embed(title=S.BRIEFING_TITLE, color=COLOR_BRIEF, description=S.BRIEFING_DESC)
+    for title, body in sections:
+        e.add_field(name=title, value=body[:FIELD_LIMIT + 24], inline=False)
+    return e
+
+
+def flash(st: E.BattleState) -> List[discord.Embed]:
+    """이번 라운드에 터진 플래시백: 사람마다 임베드 하나 (인물 · 대사 · 굴림 · 효과)."""
+    out = []
+    for f in render.flash_entries(st):
+        e = discord.Embed(title=f["title"], color=f["color"], description="\n".join(f["lines"])[:DESC_LIMIT] or None)
+        e.set_author(name=f["player"])
+        e.add_field(name="굴림", value=f["roll"], inline=False)
+        e.add_field(name="효과", value=f"**{f['player']}** — {f['effect']}"[:FIELD_LIMIT], inline=False)
+        out.append(e)
+    return out
 
 
 def _marks(st: E.BattleState) -> str:

@@ -485,8 +485,14 @@ class CardBattleCog(commands.Cog):
         await self._begin_messages(ch)
 
     async def _begin_messages(self, ch):
-        """전투가 열린 직후: 밀린 보고(기습) 게시 → 첫 턴 메시지."""
+        """전투가 열린 직후: 밀린 보고(기습) 게시 → 특수 규칙 브리핑(1회) → 첫 턴 메시지."""
         await self._flush_reports(ch)
+        st = self.state
+        if st is not None and bool(st.config.get("briefing", True)) and not st.meters.get("briefed"):
+            brief = embeds.briefing(st)
+            if brief is not None:
+                await ch.send(embed=brief)
+            st.meters["briefed"] = True
         await self._open_turn(ch)
 
     async def _flush_reports(self, ch):
@@ -560,6 +566,8 @@ class CardBattleCog(commands.Cog):
                 coach = embeds.coach(st)
                 if coach.description:
                     await ch.send(embed=coach)
+            for emb in embeds.flash(st):           # 플래시백이 터졌으면 턴 메시지 바로 위에
+                await ch.send(embed=emb)
             kw: Dict[str, Any] = {"embed": self._turn_embed(), "view": TurnView()}
             f = self._board_file(report)
             if f is not None:

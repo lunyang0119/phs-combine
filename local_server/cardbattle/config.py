@@ -97,6 +97,39 @@ DEFAULTS: Dict[str, Any] = {
     "penalty_loud": 20,           # 소음 카드 1회당 벌금
     "reward_fail_ratio": 0.0,     # 전멸·잡힘의 보수 비율
     "reward_collapse_ratio": 0.5, # 보느와가 발작으로 쓰러진(collapse) 결말의 보수 비율
+    # -- 전투 브리핑 (1라운드 전에 그 전투의 특수 규칙을 자세히 설명하는 임베드) -------------
+    "briefing": True,
+    # -- 리미트 (limit 기믹: 직업별 전투당 1회 카드) ----------------------------------
+    "limit_cards": "스트라이커:limit_edge;마테리아 위버:limit_net;솔져:limit_soldier;턱스:limit_turks;*:limit_any",
+    # -- 플래시백 (flash 기믹: 라운드마다 4d10 + 매력 보정, DMW 의 카드판) ----------------
+    "flash_threshold": 29,        # 이 값 이상이면 발동 (매력 10 이하 ≈ 13%, 매력 16 ≈ 27%)
+    "flash_per_round": 1,         # 한 라운드에 터질 수 있는 인원 (굴림이 높은 순)
+    "flash_effects": "",          # 나올 수 있는 효과 (비어 있으면 engine.FLASH_EFFECTS 전부)
+    "flash_extra_cards": 1,       # extra_card: 이번 라운드 패 +N
+    "flash_boost": 6,             # boost: 다음 피해 카드 +N
+    "flash_guard": 0.5,           # guard: 이번 라운드 받는 피해 감소
+    "flash_firewall": 2,          # firewall: 방화벽 게이지 +N
+    "flash_heal_ratio": 0.2,      # heal: 최대 HP 비율 회복
+    # -- 팀 연계 (chain 기믹: 같은 라운드에 같은 적을 여럿이 때리면) -----------------------
+    "chain_bonus": 0.1,           # 앞서 맞힌 아군 1명당 피해 +10% (과잉 제압 판정에는 넣지 않는다)
+    "chain_max": 4,               # 보너스 단계 상한
+    "chain_firewall_at": 3,       # 한 적에게 이만큼 이어지면 방화벽 충전
+    "chain_firewall": 1,
+    # -- 국면 전환 (phases 기믹) -----------------------------------------------------
+    "phases": "",                 # `enemy_id:hp%:card_id` 목록. 문턱 아래로 내려가면 다음 라운드에 그 카드를 낸다 (1회)
+    # -- 말 걸기 (talk 기믹: 2d10 + 매력 보정) ---------------------------------------
+    "talk_dc": 16,                # 목표값
+    "talk_dc_step": 2,            # 같은 상대에게 걸 때마다 목표값 +N
+    "talk_crit_margin": 8,        # 목표값을 이만큼 넘기면 대성공 (기절)
+    "talk_atk_down": 0.5,         # 성공: 상대의 다음 공격 감소
+    "talk_life": 1,               # 성공: 생명 유지 시계 +N (life_support)
+    "talk_ncpd": 0.5,             # 성공: 경계도 −N (ncpd)
+    "talk_chip": 1,               # 성공: 돌의 칩 안정도 −N (doll)
+    # -- 환경 (env 기믹: 전투 시작 때 하나를 뽑는다) -----------------------------------
+    "env_pool": "blackout;emp;acid;glitch",
+    "env_chance": 1.0,
+    "env_emp_firewall": 1,        # 전자기 폭풍: 라운드마다 방화벽 +N
+    "env_acid_ratio": 0.03,       # 산성비: 라운드 끝 최대 HP 비율 피해 (HP 1 아래로는 안 내려감)
     # -- 튜토리얼 ----------------------------------------------------------
     "tutorial_script": "tut1",    # Tutorial.csv 의 script_id
 }

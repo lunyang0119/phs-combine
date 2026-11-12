@@ -118,7 +118,7 @@ def test_vault_and_rules_commands(tmp_path):
         assert "500" in last(i)[1] and gig.load_pot(cog.gig_path) == 500
         i = interaction(1, ch)
         await cog._cmd_rules(i, None, None)
-        kind, content, ephemeral, view, embed = last(i)
+        kind, content, ephemeral, view, embed = i.response.calls[0]      # 섹션이 10개를 넘으면 뒤는 followup
         assert kind == "send" and ephemeral and isinstance(embed, list) and len(embed) >= 7
         assert any("30초" in (e.title or "") for e in embed)
     asyncio.run(body())
@@ -134,7 +134,8 @@ def test_bonewa_start_posts_ambush_before_first_turn(tmp_path):
         texts = [text(m) for m in ch.sent]
         intro = next(t for t in texts if "규칙" in t and "몸의 보느와" in t)
         rules = render.intro_rules(st)
-        assert len(rules) == len(st.gimmicks) + 1 and all(r and r in intro for r in rules)   # 기믹 6줄 + 방화벽
+        classic = [g for g in st.gimmicks if g in S.INTRO_RULES]
+        assert len(rules) == len(classic) + 1 and all(r and r in intro for r in rules)   # 기믹 6줄 + 방화벽
         idx_amb = next(i for i, t in enumerate(texts) if "기습" in t)
         idx_turn = next(i for i, m in enumerate(ch.sent) if m.id == st.turn_message_id)
         assert idx_amb < idx_turn and not st.pending_reports

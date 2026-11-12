@@ -79,7 +79,7 @@ def greedy_choice(st: E.BattleState, me: E.Combatant, hand: List[str], rng: rand
         b = [c for c in cards if c.has(E.BREAK_CARD)]
         return E.Choice(me.id, b[0].id, me.id) if b else None
     intents = {it["id"]: it for it in E.public_intents(st)}
-    attackers = [e for e in enemies if intents.get(e.id, {}).get("kind") in ("attack", "special", "mode")]
+    attackers = [e for e in enemies if intents.get(e.id, {}).get("kind") in ("attack", "special", "mode", "phase", "hidden")]
     nonlethal = st.has("nonlethal")
     hacks = [c for c in cards if c.kind == "hack"]
     # 돌·ICE: 해킹이 답 (ICE 가 남아 있는 동안)
@@ -162,7 +162,7 @@ def greedy_firewall(st: E.BattleState, rng: random.Random) -> Optional[str]:
     stuck = [p for p in st.alive_units(E.ALLY) if E.is_stunned(p) or E.is_grappled(p) or (p.mod("daemon") and p.mod("daemon").value >= 2)]
     if "reboot" in opts and stuck and fw >= E.firewall_cost(st, "reboot"):
         return "reboot"
-    attackers = [it for it in E.public_intents(st) if it["kind"] in ("attack", "special", "mode")]
+    attackers = [it for it in E.public_intents(st) if it["kind"] in ("attack", "special", "mode", "phase", "hidden")]
     if "cover" in opts and len(attackers) >= 2 and fw >= E.firewall_cost(st, "cover"):
         return "cover"
     if "aim" in opts and st.has("nonlethal") and fw >= E.firewall_cost(st, "aim") and any(e.hp <= 20 for e in st.alive_units(E.ENEMY)):

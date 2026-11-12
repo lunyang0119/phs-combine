@@ -39,21 +39,25 @@ ALLY, ENEMY = "ally", "enemy"
 ESCAPED, CAUGHT = "escaped", "caught"          # winner 값 (도주 단계 결과)
 KINDS = ("attack", "defend", "hack", "special")
 TARGETS = ("enemy", "ally", "self", "all_enemy", "all_ally")
-STATS = ("physics", "magic", "none")
+STATS = ("physics", "magic", "charm", "none")
 POOLS = ("ally", "enemy", "both", "fixed")     # fixed: 규칙이 손에 쥐어주는 카드 (드로우 안 됨)
 EFFECT_KINDS = ("damage", "heal", "shield", "self_damage", "atk_down", "misfire", "redirect_random", "stun",
                 "grapple", "break_free", "pass_terminal", "chip", "noop",
-                "scatter_damage", "daemon", "cleanse", "firewall_drain", "firewall_lock", "ice", "expose", "field_mod")
-COUNT_KINDS = ("scatter_damage", "daemon")     # 셋째 슬롯이 '지속'이 아니라 '대상 수'
-MODIFIER_KINDS = ("shield", "atk_down", "misfire", "redirect_random", "stun", "grapple", "daemon")
-ONE_SHOT = ("atk_down", "misfire", "redirect_random", "stun")
+                "scatter_damage", "daemon", "cleanse", "firewall_drain", "firewall_lock", "ice", "expose", "field_mod",
+                "flurry", "rage", "talk")
+COUNT_KINDS = ("scatter_damage", "daemon", "flurry")   # 셋째 슬롯이 '지속'이 아니라 '대상 수' (flurry 는 최대 타수)
+MODIFIER_KINDS = ("shield", "atk_down", "misfire", "redirect_random", "stun", "grapple", "daemon", "rage", "boost")
+ONE_SHOT = ("atk_down", "misfire", "redirect_random", "stun", "boost")
 TICKING = ("shield", "daemon")
 PHASE = {"hack": 0, "defend": 1, "attack": 2, "special": 2}
-CARD_TAGS = ("loud", "lethal", "nonlethal")
+CARD_TAGS = ("loud", "lethal", "nonlethal", "limit", "pierce")
 COMBO_CONDS = ("target_has", "self_has")
 COMBO_BONUSES = ("dmg_x", "dmg_add", "chip_add")
 GIMMICKS = ("nonlethal", "ncpd", "drag", "doll", "terminal",
-            "first_strike", "daemon", "firewall_duel", "life_support", "ice", "tutorial")
+            "first_strike", "daemon", "firewall_duel", "life_support", "ice", "tutorial",
+            "limit", "flash", "chain", "phases", "talk", "env")
+ENVS = ("blackout", "emp", "acid", "glitch")        # 정전 / 전자기 폭풍 / 산성비 / 신호 교란
+FLASH_EFFECTS = ("extra_card", "recharge", "boost", "guard", "firewall", "heal", "scan")
 TRAITS = ("cheap_chrome", "evade", "doll", "fast", "regen", "modes")
 DOLL_MODES = ("cling", "rampage", "reboot")
 MODES = DOLL_MODES + ("seize", "breach", "overload")
@@ -65,6 +69,7 @@ ESCAPE_BEATS = {"hide": "light", "move": "thermal", "dead": "callout"}
 ESCAPE_LOSES = {"hide": "thermal", "move": "callout", "dead": "light"}
 PASS_CARD, BREAK_CARD = "pass_terminal", "break_free"
 FIELD_MOD_CARD = "field_mod"
+TALK_CARD = "talk"
 BOSS_STATES = ("fine", "hurt", "critical")
 TIP_KEYS = ("hack_cancel", "shield", "combo", "misfire", "redirect", "evade", "firewall_ready", "overkill",
             "drag", "grapple", "chip", "daemon", "daemon_bite", "ice_strip", "exposed", "life_low", "field_mod")
@@ -172,7 +177,7 @@ class Card:
         return tag in self.tags
 
     def deals_damage(self) -> bool:
-        return self.has("damage") or self.has("scatter_damage")
+        return self.has("damage") or self.has("scatter_damage") or self.has("flurry")
 
 
 @dataclass
@@ -580,6 +585,17 @@ def new_battle(
     if st.has("life_support"):
         st.meters["life"] = int(config.get("life_support_rounds", 8))
         st.meters["life_max"] = st.meters["life"]
+    if st.has("limit"):
+        st.meters["limit_used"] = []
+    if st.has("phases"):
+        st.meters["phases_done"] = []
+        st.meters["phase_queue"] = {}
+    if st.has("talk"):
+        st.meters["talk_count"] = {}
+    if st.has("env"):
+        pool = [e for e in split_list(config.get("env_pool", "")) if e in ENVS]
+        if pool and rng.random() < float(config.get("env_chance", 1.0)):
+            st.meters["env"] = rng.choice(pool)
     if bool(config.get("prep_enabled", True)):
         _start_prep(st, rng, weapon_names, pot)
         return st
@@ -638,11 +654,33 @@ def can_field_mod(st: BattleState, c: Combatant) -> bool:
     return int(st.meters.get("pot", 0)) >= int(st.config.get("field_mod_cost", 50))
 
 
+def limit_card_for(st: BattleState, c: Combatant) -> Optional[str]:
+    """limit 기믹: 직업별 리미트 카드 id (config limit_cards = `직업:card;…`, `*` 는 그 밖의 직업)."""
+    if not st.has("limit") or c.side != ALLY:
+        return None
+    table: Dict[str, str] = {}
+    for chunk in split_list(st.config.get("limit_cards", "")):
+        job, sep, cid = chunk.rpartition(":")
+        if sep:
+            table[job.strip()] = cid.strip()
+    cid = table.get(c.job) or table.get("*")
+    return cid if cid and cid in st.cards else None
+
+
+def limit_ready(st: BattleState, c: Combatant) -> bool:
+    return limit_card_for(st, c) is not None and c.id not in (st.meters.get("limit_used") or [])
+
+
 def fixed_cards(st: BattleState, c: Combatant) -> List[str]:
-    """규칙이 쥐어주는 카드. 붙잡혔으면 떨쳐내기만, 단말기 소지자는 넘기기, 금고가 남았으면 현장 개조."""
+    """규칙이 쥐어주는 카드. 붙잡혔으면 떨쳐내기만, 단말기 소지자는 넘기기, 금고가 남았으면 현장 개조,
+    limit 기믹이면 아직 안 쓴 리미트 카드, talk 기믹이면 말 걸기."""
     if is_grappled(c):
         return [BREAK_CARD] if BREAK_CARD in st.cards else []
     out: List[str] = []
+    if limit_ready(st, c):
+        out.append(limit_card_for(st, c))
+    if st.has("talk") and c.side == ALLY and TALK_CARD in st.cards:
+        out.append(TALK_CARD)
     if st.has("terminal") and st.meters.get("terminal_holder") == c.id and PASS_CARD in st.cards:
         if len(st.alive_units(ALLY)) > 1:
             out.append(PASS_CARD)
@@ -661,7 +699,8 @@ def draw_hand(st: BattleState, uid: str, rng: Rng = DEFAULT_RNG) -> List[str]:
     if admin_sees_all(st, c):
         return [card.id for card in pool_for(st, c)] + fixed_cards(st, c)
     if uid not in st.hands:
-        hand = draw_from_pool(pool_for(st, c), int(st.config.get("hand_size", 3)), rng)
+        extra = int((st.round_flags.get("flash_extra") or {}).get(uid, 0))
+        hand = draw_from_pool(pool_for(st, c), int(st.config.get("hand_size", 3)) + extra, rng)
         if st.has("tutorial"):
             from . import tutorial  # 순환 import 회피
             hand = tutorial.guaranteed(st, uid, hand)
@@ -833,6 +872,15 @@ def open_round(st: BattleState, rng: Rng = DEFAULT_RNG, chooser: Optional[Choose
         if is_stunned(e):
             st.intents[e.id] = {"kind": "stunned", "label": "stunned", "target": None, "card_id": ""}
             continue
+        queued = (st.meters.get("phase_queue") or {}).pop(e.id, None) if st.has("phases") else None
+        if queued and queued in st.cards:           # 국면 전환: 예고된 카드를 이번 라운드에 낸다
+            card = st.cards[queued]
+            if st.mode_owner() is e:
+                st.meters["doll_mode"] = ""
+            st.enemy_choices[e.id] = Choice(e.id, queued, _mode_target(st, e, card, rng))
+            st.intents[e.id] = {"kind": "phase", "label": card.name, "target": st.enemy_choices[e.id].target_id,
+                                "card_id": queued}
+            continue
         if (e.has_trait("doll") and st.has("doll")) or e.has_trait("modes"):
             mode, cid = _pick_mode(st, e, rng)
             if cid:
@@ -852,6 +900,83 @@ def open_round(st: BattleState, rng: Rng = DEFAULT_RNG, chooser: Optional[Choose
         st.intents[e.id] = {"kind": st.cards[ch.card_id].kind, "label": st.cards[ch.card_id].kind,
                             "target": ch.target_id, "card_id": ch.card_id}
     st.status = ROUND_OPEN
+    if st.meters.get("env") == "emp" and st.round >= 1:
+        _firewall_add(st, float(st.config.get("env_emp_firewall", 1)))
+    st.meters.pop("flash_now", None)
+    if st.has("flash") and st.round >= 1:
+        _roll_flash(st, rng)
+
+
+def flash_bonus(c: Combatant) -> int:
+    return max(0, (c.charm - 10) // 2)
+
+
+def _flash_options(st: BattleState, p: Combatant) -> List[str]:
+    want = [e for e in split_list(st.config.get("flash_effects", "")) if e in FLASH_EFFECTS] or list(FLASH_EFFECTS)
+    out = []
+    for e in want:
+        if e == "recharge" and not (limit_card_for(st, p) and p.id in (st.meters.get("limit_used") or [])):
+            continue
+        if e == "heal" and p.hp >= p.max_hp:
+            continue
+        if e == "scan" and (st.round_flags.get("scan") or st.config.get("show_intent_target")):
+            continue
+        out.append(e)
+    return out
+
+
+def _roll_flash(st: BattleState, rng: Rng) -> None:
+    """플래시백(DMW 의 카드판): 행동 가능한 아군마다 4d10 + 매력 보정. 문턱을 넘은 사람 중 높은 순으로
+    flash_per_round 명이 무작위 효과 하나를 받는다. 결과는 meters["flash_now"] (대사는 strings.FLASH_FIGURES)."""
+    cfg = st.config
+    need = int(cfg.get("flash_threshold", 29))
+    hits = []
+    for p in acting_players(st):
+        dice = [int(rng.randint(1, 10)) for _ in range(4)]
+        total = sum(dice) + flash_bonus(p)
+        if total >= need:
+            hits.append((total, rng.random(), p, dice))
+    hits.sort(key=lambda h: (-h[0], h[1]))
+    out: List[Dict[str, Any]] = []
+    for total, _, p, dice in hits[:max(0, int(cfg.get("flash_per_round", 1)))]:
+        opts = _flash_options(st, p)
+        if not opts:
+            continue
+        eff = rng.choice(opts)
+        rec: Dict[str, Any] = {"pid": p.id, "name": p.name, "dice": dice, "bonus": flash_bonus(p), "roll": total,
+                               "need": need, "effect": eff, "line": int(rng.randint(0, 9999)), "value": 0}
+        if eff == "extra_card":
+            n = int(cfg.get("flash_extra_cards", 1))
+            st.round_flags.setdefault("flash_extra", {})[p.id] = n
+            st.hands.pop(p.id, None)
+            rec["value"] = n
+        elif eff == "recharge":
+            st.meters["limit_used"] = [u for u in (st.meters.get("limit_used") or []) if u != p.id]
+            card = st.cards.get(limit_card_for(st, p) or "")
+            rec["card"] = card.name if card else ""
+        elif eff == "boost":
+            v = int(cfg.get("flash_boost", 6))
+            add_modifier(p, Modifier("boost", float(v), 1, st.round, source="flash"))
+            rec["value"] = v
+        elif eff == "guard":
+            v = float(cfg.get("flash_guard", 0.5))
+            add_modifier(p, Modifier("shield", v, 1, st.round, source="flash"))
+            rec["value"] = int(round(v * 100))
+        elif eff == "firewall":
+            v = int(cfg.get("flash_firewall", 2))
+            _firewall_add(st, float(v))
+            rec["value"] = v
+        elif eff == "heal":
+            amt = max(1, int(round(p.max_hp * float(cfg.get("flash_heal_ratio", 0.2)))))
+            healed = min(p.max_hp, p.hp + amt) - p.hp
+            p.hp += healed
+            rec["value"] = healed
+        elif eff == "scan":
+            st.round_flags["scan"] = True
+        out.append(rec)
+    if out:
+        st.meters["flash_now"] = out
+        st.meters["flash_count"] = int(st.meters.get("flash_count", 0)) + len(out)
 
 
 def public_intents(st: BattleState) -> List[Dict[str, Any]]:
@@ -863,6 +988,9 @@ def public_intents(st: BattleState) -> List[Dict[str, Any]]:
         if e is None or not e.alive():
             continue
         t = st.unit(it.get("target")) if it.get("target") else None
+        if st.meters.get("env") == "blackout" and not st.round_flags.get("scan") and it["kind"] != "stunned":
+            out.append({"id": eid, "name": e.name, "kind": "hidden", "label": "hidden", "target": None})
+            continue
         out.append({"id": eid, "name": e.name, "kind": it["kind"], "label": it["label"],
                     "target": (t.name if (t is not None and show_t) else None)})
     return out
@@ -963,33 +1091,56 @@ def stat_bonus(actor: Combatant, stat: str, config: Dict[str, Any]) -> int:
         return actor.physics // div
     if stat == "magic":
         return actor.magic // div
+    if stat == "charm":
+        return actor.charm // div
     return 0
 
 
-def damage_range(card: Card, actor: Combatant, config: Dict[str, Any]) -> Tuple[int, int]:
-    """UI 용 예상 피해 (수정자 미반영, 무기 보너스 반영). damage 효과가 없으면 (0, 0)."""
+def _card_base(card: Card) -> Optional[Tuple[float, float]]:
+    """카드의 기본 피해 (최소, 최대). flurry 는 2 타 ~ count 타."""
+    f = card.effect("flurry")
+    if f is not None:
+        return float(f.value) * 2, float(f.value) * max(2, int(f.count))
     e = card.effect("damage") or card.effect("scatter_damage")
     if e is None:
+        return None
+    return float(e.value), float(e.value)
+
+
+def boost_bonus(actor: Combatant) -> int:
+    b = actor.mod("boost")
+    return int(b.value) if b is not None else 0
+
+
+def damage_range(card: Card, actor: Combatant, config: Dict[str, Any]) -> Tuple[int, int]:
+    """UI 용 예상 피해 (무기 보너스·플래시백 강화 반영, 그 밖의 수정자 미반영). 피해 효과가 없으면 (0, 0)."""
+    b = _card_base(card)
+    if b is None:
         return 0, 0
-    base = int(e.value) + stat_bonus(actor, card.stat, config) + weapon_bonus(actor, config)
-    return base, base + int(config.get("damage_variance", 4))
+    add = stat_bonus(actor, card.stat, config) + weapon_bonus(actor, config) + boost_bonus(actor)
+    return int(b[0]) + add, int(b[1]) + add + int(config.get("damage_variance", 4))
 
 
 def expected_damage(card: Card, actor: Combatant, target: Optional[Combatant], config: Dict[str, Any]) -> float:
     """AI 용 기대 피해 (난수 평균, 수정자 반영)."""
-    e = card.effect("damage") or card.effect("scatter_damage")
-    if e is None:
+    b = _card_base(card)
+    if b is None:
         return 0.0
-    dmg = e.value + stat_bonus(actor, card.stat, config) + weapon_bonus(actor, config) + int(config.get("damage_variance", 4)) / 2.0
+    dmg = (b[0] + b[1]) / 2.0 + stat_bonus(actor, card.stat, config) + weapon_bonus(actor, config) \
+        + boost_bonus(actor) + int(config.get("damage_variance", 4)) / 2.0
+    rg = actor.mod("rage")
+    if rg:
+        dmg *= 1.0 + rg.value
     ad = actor.mod("atk_down")
     if ad:
         dmg *= max(0.0, 1.0 - ad.value)
+    pierce = card.tagged("pierce")
     if target is not None:
         sh = target.mod("shield")
-        if sh:
+        if sh and not pierce:
             dmg *= max(0.0, 1.0 - sh.value)
         ev = target.traits.get("evade") if target.traits else None
-        if ev and card.stat == "physics":
+        if ev and card.stat == "physics" and not pierce:
             dmg *= max(0.0, 1.0 - float(ev))
     return max(0.0, dmg)
 
@@ -1020,7 +1171,8 @@ def overkill_risk(st: BattleState, actor: Combatant, card: Card, target: Combata
             hi = int(hi * float(card.combo.value))
         elif card.combo.bonus == "dmg_add":
             hi = hi + int(card.combo.value)
-    hi = int(hi * ice_multiplier(st))
+    if not card.tagged("pierce"):
+        hi = int(hi * ice_multiplier(st))
     if card.tagged("lethal"):
         return hi >= target.hp
     return hi - target.hp >= int(st.config.get("overkill_margin", 15))
@@ -1110,7 +1262,15 @@ def _apply_card(st: BattleState, actor: Combatant, card: Card, chosen_target: Op
         line["result"] = "pass"
     elif card.has(FIELD_MOD_CARD):
         line["result"] = "field_mod"
+    elif card.has("talk"):
+        line["result"] = "talk"
 
+    if actor.side == ALLY and card.tagged("limit") and st.has("limit"):
+        used = list(st.meters.get("limit_used") or [])
+        if actor.id not in used:
+            used.append(actor.id)
+        st.meters["limit_used"] = used
+        line["limit"] = True
     if actor.side == ALLY and card.kind == "defend":
         _firewall_add(st, float(cfg.get("firewall_per_defend", 1)), events, "defend")
     if card.tagged("loud") and st.has("ncpd") and actor.side == ALLY:
@@ -1151,7 +1311,8 @@ def _apply_card(st: BattleState, actor: Combatant, card: Card, chosen_target: Op
                     line["result"] = "redirect"
                     line["redirected"] = True
         # 회피 (물리 공격 한정, 스마트 탄 유도 중엔 무시)
-        if len(targets) == 1 and card.stat == "physics" and not (actor.side == ALLY and st.round_flags.get("steady_aim")):
+        if len(targets) == 1 and card.stat == "physics" and not card.tagged("pierce") \
+                and not (actor.side == ALLY and st.round_flags.get("steady_aim")):
             ev = targets[0].traits.get("evade") if targets[0].traits else None
             if ev and rng.random() < float(ev):
                 line["result"] = "evade"
@@ -1162,6 +1323,10 @@ def _apply_card(st: BattleState, actor: Combatant, card: Card, chosen_target: Op
         if ad is not None:
             actor.remove_mod("atk_down")
             line["atk_down"] = ad.value
+        bo = actor.mod("boost")
+        if bo is not None:                  # 플래시백 강화: 다음 피해 카드 1회
+            actor.remove_mod("boost")
+            line["boost"] = bo.value
 
     single = targets[0] if len(targets) == 1 else None
     if combo_applies(st, actor, card, single):
@@ -1194,7 +1359,7 @@ def _h_damage(st, actor, card, eff, targets, line, rng, events):
     steady = actor.side == ALLY and bool(st.round_flags.get("steady_aim"))
     for t in targets:
         var = 0 if steady else rng.randint(0, int(cfg.get("damage_variance", 4)))
-        dmg = eff.value + stat_bonus(actor, card.stat, cfg) + weapon_bonus(actor, cfg) + var
+        dmg = eff.value + stat_bonus(actor, card.stat, cfg) + weapon_bonus(actor, cfg) + var + float(line.get("boost") or 0)
         if line.get("combo") and card.combo is not None:
             if card.combo.bonus == "dmg_x":
                 dmg *= float(card.combo.value)
@@ -1203,15 +1368,32 @@ def _h_damage(st, actor, card, eff, targets, line, rng, events):
         ad = line.get("atk_down")
         if ad:
             dmg *= max(0.0, 1.0 - float(ad))
+        rg = actor.mod("rage")
+        if rg:
+            dmg *= 1.0 + rg.value
         info_flags: Dict[str, Any] = {}
+        pierce = card.tagged("pierce")
         sh = t.mod("shield")
-        if sh:
+        if sh and not pierce:
             dmg *= max(0.0, 1.0 - sh.value)
             info_flags["shielded"] = True
-        if t.side == ENEMY and st.has("ice") and int(st.meters.get("ice", 0)) > 0:
+        if t.side == ENEMY and st.has("ice") and int(st.meters.get("ice", 0)) > 0 and not pierce:
             dmg *= ice_multiplier(st)
             info_flags["iced"] = int(st.meters.get("ice", 0))
         dmg = max(0, int(dmg))
+        base_dmg = dmg                      # 과잉 제압은 연계 보너스를 뺀 피해로 판정한다
+        if st.has("chain") and actor.side == ALLY and t.side == ENEMY and dmg > 0:
+            chain = st.round_flags.setdefault("chain", {})
+            chain_n = int(chain.get(t.id, 0))
+            if chain_n > 0:
+                steps = min(chain_n, int(cfg.get("chain_max", 4)))
+                dmg += int(dmg * float(cfg.get("chain_bonus", 0.1)) * steps)
+                info_flags["chain"] = chain_n + 1
+            chain[t.id] = chain_n + 1
+            if chain_n + 1 == int(cfg.get("chain_firewall_at", 3)):
+                _firewall_add(st, float(cfg.get("chain_firewall", 1)), events, "chain")
+                events.append({"kind": "chain", "target": t.name, "count": chain_n + 1,
+                               "firewall": int(cfg.get("chain_firewall", 1))})
         before = t.hp
         floor = 1 if (t.side == ENEMY and tutorial_invulnerable(st)) else 0   # 튜토리얼: 마지막 수업 전엔 쓰러지지 않는다
         t.hp = max(floor, t.hp - dmg)
@@ -1221,7 +1403,7 @@ def _h_damage(st, actor, card, eff, targets, line, rng, events):
         if st.has("nonlethal") and t.side == ENEMY and actor.side == ALLY and before > 0 and t.hp == 0:
             lethal_card = card.tagged("lethal")
             doll_ok = t.has_trait("doll") and bool(cfg.get("doll_hp_overkill_ok"))
-            if (lethal_card or dmg - before >= int(cfg.get("overkill_margin", 15))) and not doll_ok \
+            if (lethal_card or base_dmg - before >= int(cfg.get("overkill_margin", 15))) and not doll_ok \
                     and not card.tagged("nonlethal"):
                 info["overkill"] = True
                 _ncpd_add(st, float(cfg.get("ncpd_overkill", 1.0)), events, "overkill", actor.name)
@@ -1252,6 +1434,57 @@ def _h_scatter(st, actor, card, eff, targets, line, rng, events):
         picked.append(u)
     if picked:
         _h_damage(st, actor, card, Effect("damage", eff.value), picked, line, rng, events)
+
+
+def _h_flurry(st, actor, card, eff, targets, line, rng, events):
+    """다단 히트: 2 ~ count 타를 굴려 한 번의 피해로 합친다 (타당 value)."""
+    hits = int(rng.randint(2, max(2, int(eff.count))))
+    line["flurry"] = hits
+    _h_damage(st, actor, card, Effect("damage", eff.value * hits), targets, line, rng, events)
+
+
+def _h_rage(st, actor, card, eff, targets, line, rng, events):
+    """분노: 자신의 피해가 전투 끝까지 value 만큼 늘어난다 (겹치면 큰 값)."""
+    add_modifier(actor, Modifier("rage", float(eff.value), 99, st.round, source=actor.id))
+    events.append({"kind": "rage", "name": actor.name, "pct": int(round(float(eff.value) * 100))})
+
+
+def _h_talk(st, actor, card, eff, targets, line, rng, events):
+    """말 걸기: 2d10 + 매력 보정 ≥ 목표값(같은 상대에게 걸 때마다 오른다). 성공하면 상대의 다음 공격 약화,
+    전투에 따라 생명 유지 +1 / 경계도 감소 / 돌의 칩 −1. 크게 성공하면 기절."""
+    cfg = st.config
+    counts = st.meters.setdefault("talk_count", {})
+    for t in targets:
+        if t.side == actor.side:
+            continue
+        d1, d2 = int(rng.randint(1, 10)), int(rng.randint(1, 10))
+        bonus = stat_bonus(actor, "charm", cfg)
+        dc = int(cfg.get("talk_dc", 16)) + int(cfg.get("talk_dc_step", 2)) * int(counts.get(t.id, 0))
+        total = d1 + d2 + bonus
+        success = total >= dc
+        crit = success and (d1 + d2 == 20 or total >= dc + int(cfg.get("talk_crit_margin", 8)))
+        counts[t.id] = int(counts.get(t.id, 0)) + 1
+        info = _tinfo(t, "talk", 0)
+        info.update({"dice": [d1, d2], "bonus": bonus, "total": total, "dc": dc, "success": success, "crit": crit,
+                     "who": t.id.split("#")[0], "quote": int(rng.randint(0, 9999)),
+                     "pct": int(round(float(cfg.get("talk_atk_down", 0.5)) * 100))})
+        if success:
+            add_modifier(t, Modifier("atk_down", float(cfg.get("talk_atk_down", 0.5)), 1, st.round, source=actor.id))
+            if crit and not (t.has_trait("doll") and st.has("doll")):
+                add_modifier(t, Modifier("stun", 1.0, 1, st.round, source=actor.id))
+            if st.has("life_support"):
+                mx = int(st.meters.get("life_max", 0))
+                st.meters["life"] = min(mx, int(st.meters.get("life", 0)) + int(cfg.get("talk_life", 1)))
+                info["life"] = [st.meters["life"], mx]
+            if st.has("ncpd"):
+                st.meters["ncpd"] = max(0.0, float(st.meters.get("ncpd", 0.0)) - float(cfg.get("talk_ncpd", 0.5)))
+                info["ncpd"] = st.meters["ncpd"]
+            if st.has("doll") and t.has_trait("doll"):
+                dealt = _chip_damage(st, int(cfg.get("talk_chip", 1)))
+                line["chip"] = {"amount": dealt, "value": st.meters["chip"], "max": st.meters.get("chip_max", 0),
+                                "capped": dealt < int(cfg.get("talk_chip", 1))}
+            st.meters["talk_ok"] = int(st.meters.get("talk_ok", 0)) + 1
+        line["targets"].append(info)
 
 
 def _h_self_damage(st, actor, card, eff, targets, line, rng, events):
@@ -1498,6 +1731,9 @@ HANDLERS: Dict[str, Callable[..., None]] = {
     "ice": _h_ice,
     "expose": _h_expose,
     "field_mod": _h_field_mod,
+    "flurry": _h_flurry,
+    "rage": _h_rage,
+    "talk": _h_talk,
     "noop": _h_noop,
 }
 
@@ -1596,7 +1832,7 @@ def _collect_tips(st: BattleState, lines: List[Dict[str, Any]], events: List[Dic
     for ln in lines:
         res = ln.get("result")
         hit("hack_cancel", res == "stunned" and ln.get("side") == ENEMY
-            and st.intents.get(ln["actor_id"], {}).get("kind") in ("attack", "special", "mode"))
+            and st.intents.get(ln["actor_id"], {}).get("kind") in ("attack", "special", "mode", "phase"))
         hit("combo", bool(ln.get("combo")))
         hit("misfire", res == "misfire")
         hit("redirect", bool(ln.get("redirected")))
@@ -1650,17 +1886,18 @@ def resolve_round(st: BattleState, rng: Rng = DEFAULT_RNG, chooser: Optional[Cho
     for e in st.enemies.values():
         actions[e.id] = st.enemy_choices.get(e.id)
 
+    glitch = st.meters.get("env") == "glitch"      # 신호 교란: 같은 단계 안에서는 민첩 대신 무작위
     ordered: List[Tuple[int, int, float, Combatant]] = []
     waits: List[Combatant] = []
     for u in st.alive_units():
         ch = actions.get(u.id)
         if is_stunned(u):
-            ordered.append((-1, -u.agility, rng.random(), u))     # 기절은 맨 앞에 알린다
+            ordered.append((-1, 0 if glitch else -u.agility, rng.random(), u))     # 기절은 맨 앞에 알린다
             continue
         if ch is None or ch.card_id not in st.cards:
             waits.append(u)
             continue
-        ordered.append((PHASE.get(st.cards[ch.card_id].kind, 2), -u.agility, rng.random(), u))
+        ordered.append((card_phase(st.cards[ch.card_id]), 0 if glitch else -u.agility, rng.random(), u))
     ordered.sort(key=lambda x: (x[0], x[1], x[2]))
 
     announced: List[Combatant] = []        # 기절은 라운드 끝에 풀린다 → 같은 라운드의 '기절한 적에게' 콤보가 성립
@@ -1688,8 +1925,10 @@ def resolve_round(st: BattleState, rng: Rng = DEFAULT_RNG, chooser: Optional[Cho
 
     tick_modifiers(st)
     _regen(st, events)
+    _env_acid(st, events)
     _advance_drag(st, rng, events)
     _tick_life(st, events)
+    _check_phases(st, events)
 
     # 종료 판정
     w: Optional[str] = None
@@ -1748,6 +1987,55 @@ def resolve_ambush(st: BattleState, rng: Rng = DEFAULT_RNG, chooser: Optional[Ch
     st.round = 1
     open_round(st, rng, chooser)
     return report
+
+
+def card_phase(card: Card) -> int:
+    """정산 단계. 말 걸기는 준비 동작(0)으로 친다: 예고된 공격보다 먼저 닿는다."""
+    if card.has("talk"):
+        return 0
+    return PHASE.get(card.kind, 2)
+
+
+def phase_table(st: BattleState) -> List[Tuple[str, int, str]]:
+    """config phases = `enemy_id:hp%:card_id` 목록 → [(enemy_id, pct, card_id)]"""
+    out: List[Tuple[str, int, str]] = []
+    for chunk in split_list(st.config.get("phases", "")):
+        parts = [p.strip() for p in chunk.split(":")]
+        if len(parts) == 3:
+            try:
+                out.append((parts[0], int(float(parts[1])), parts[2]))
+            except ValueError:
+                continue
+    return out
+
+
+def _check_phases(st: BattleState, events: List[Dict[str, Any]]) -> None:
+    """국면 전환: 적 HP 가 문턱 아래로 내려가면 한 번, 다음 라운드에 낼 카드를 예약하고 예고한다."""
+    if not st.has("phases"):
+        return
+    done = list(st.meters.get("phases_done") or [])
+    queue: Dict[str, str] = st.meters.setdefault("phase_queue", {})
+    for eid, pct, cid in sorted(phase_table(st), key=lambda x: -x[1]):
+        if cid not in st.cards:
+            continue
+        for e in st.alive_units(ENEMY):
+            key = f"{e.id}:{pct}"
+            if e.id.split("#")[0] != eid or key in done or e.hp_ratio() * 100 > pct:
+                continue
+            done.append(key)
+            queue[e.id] = cid
+            events.append({"kind": "phase_warn", "name": e.name, "card": st.cards[cid].name, "pct": pct})
+    st.meters["phases_done"] = done
+
+
+def _env_acid(st: BattleState, events: List[Dict[str, Any]]) -> None:
+    """산성비: 라운드 끝에 생존자 전원이 최대 HP 의 일부를 잃는다 (이걸로는 쓰러지지 않는다)."""
+    if st.meters.get("env") != "acid" or st.round < 1:
+        return
+    ratio = float(st.config.get("env_acid_ratio", 0.03))
+    for u in st.alive_units():
+        u.hp = max(1, u.hp - max(1, int(u.max_hp * ratio)))
+    events.append({"kind": "env_acid", "pct": int(round(ratio * 100))})
 
 
 def _regen(st: BattleState, events: List[Dict[str, Any]]) -> None:

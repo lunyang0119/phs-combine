@@ -143,8 +143,9 @@ def test_load_shipped_csvs():
     gd = D.load_game_data(D.CsvSource(), include_commented=True)   # # 으로 숨긴 보스전도 검증
     assert "scav3" not in D.load_game_data(D.CsvSource()).battles       # 봇에는 숨겨져 있음
     assert gd.battles["scav3"].enemies == ["scav_pipe", "scav_gun", "scav_boss"]
-    assert gd.battles["scav3"].gimmicks == ["nonlethal", "ncpd", "drag"]
-    assert gd.battles["doll4"].gimmicks == ["nonlethal", "doll", "terminal"]
+    assert gd.battles["scav3"].gimmicks[:3] == ["nonlethal", "ncpd", "drag"]
+    assert gd.battles["doll4"].gimmicks[:3] == ["nonlethal", "doll", "terminal"]
+    assert not set(gd.battles["tut"].gimmicks) & {"limit", "flash", "chain", "phases", "talk", "env"}   # 튜토리얼에는 안 넣는다
     assert gd.battles["doll4"].overrides["chip_stability"] == "9"
     assert all(c.effects for c in gd.cards.values())
     assert gd.cards["atk_knee"].tagged("nonlethal") and gd.cards["sp_overdrive"].tagged("lethal")

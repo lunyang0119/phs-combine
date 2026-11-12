@@ -215,3 +215,20 @@ Found while reading; none of these were changed.
 
 - **Combat** is swingy and character-driven: wide dice ranges, crits, job multipliers and the DMW slot make individual turns dramatic, and the character sheet (job, materia, stats above 10) matters a lot. Encounters are quick to author (pick monsters and a difficulty) but special behaviour needs new code in the cog.
 - **Card battle** is low-variance and coordination-driven: narrow damage spread, visible enemy intent and phase ordering reward planning the round as a team, and the constraints (non-lethal, noise, clocks) make *how* the team wins part of the score. New content is mostly CSV rows, and balance can be checked offline with `python -m cardbattle.sim`.
+
+---
+
+## 14. Mechanics since ported from Combat
+
+After this comparison was written, six Combat ideas were added to Card battle as opt-in gimmicks (not used in the tutorial; each battle that has them posts a briefing embed before round 1). Sections 5, 6 and 9 above describe Card battle without them.
+
+| Combat mechanic | Card battle gimmick | What changed in the port |
+|---|---|---|
+| Job limit breaks | `limit` | A per-job fixed card, once per battle, always in hand |
+| DMW slot with dialogue | `flash` | 4d10 + charm bonus at round open; grants an option (extra card, limit recharge, +damage, …) with a figure and lines, never changes a resolved result |
+| Same-target combo counter | `chain` | Counted within one round across allies; the bonus is excluded from the overkill check |
+| HP-threshold boss skills, rage | `phases` | Telegraphed one round ahead through the public intent |
+| Boss dialogue keywords | `talk` | A charm-roll card with an enemy reply line instead of chat keyword detection |
+| Environment effects | `env` | Blackout, EMP storm, acid rain, signal glitch; practice battles only |
+
+Dice variance, critical hits, MP, mid-battle joins and timed auto-revival were deliberately not ported. Details: [docs/dev/cardbattle.md](docs/dev/cardbattle.md).

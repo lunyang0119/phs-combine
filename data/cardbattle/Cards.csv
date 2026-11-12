@@ -25,3 +25,12 @@ bw_ambush,기습 퀵핵,hack,all_enemy,magic,fixed,0,scatter_damage:4:3;daemon:1
 bw_seize,장악,hack,all_enemy,magic,fixed,0,ice:1;daemon:1:2,,,ICE 한 층을 다시 세우고 아군 둘에게 데몬을 심는다
 bw_breach,침입,hack,enemy,magic,fixed,0,firewall_drain:2;redirect_random:1,,,단말기 보느와의 방화벽을 깎고 대상의 다음 공격을 적대 인식으로 돌린다
 bw_overload,과부하,attack,all_enemy,magic,fixed,0,damage:7;expose:1,,,전원에게 RAM 과부하. 대신 ICE 가 전부 내려가고 생명 유지 시계가 하나 더 준다
+limit_edge,산데비스탄 과부하,special,enemy,physics,fixed,0,damage:18;self_damage:8,limit;pierce,,[리미트] 엄폐·ICE·회피를 무시하는 일격. 반동 8. 전투당 한 번
+limit_net,블랙월 균열,hack,all_enemy,magic,fixed,0,stun:1,limit,,[리미트] 적 전체의 다음 행동 불가. 전투당 한 번
+limit_soldier,팔도일섬,special,enemy,physics,fixed,0,flurry:4:8,limit,,[리미트] 2~8연타 (타당 4). 몇 번 벨지는 굴려 봐야 안다. 전투당 한 번
+limit_turks,전격 제압,hack,enemy,magic,fixed,0,damage:6;stun:1,limit;nonlethal,,[리미트] 비살상 전격 + 기절. 과잉 제압이 되지 않는다. 전투당 한 번
+limit_any,이 악물기,special,self,none,fixed,0,heal:20;shield:0.5:1,limit,,[리미트] HP 20 회복 + 이번 라운드 피해 절반. 전투당 한 번
+talk,말 걸기,special,enemy,charm,fixed,0,talk:1,nonlethal,,매력 판정 (2d10 + 매력 보정). 통하면 상대의 다음 공격이 반감되고 상황이 누그러진다. 무슨 말을 했는지는 채팅에 직접
+scav_rage,약 빨기,special,self,none,fixed,0,heal:12;rage:0.3,,,[국면 전환] 흡입기를 들이켠다. HP 12 회복. 이후 피해 +30%
+doll_frenzy,폭주 프로토콜,special,self,none,fixed,0,rage:0.3,,,[국면 전환] 안전 제한이 풀린다. 이후 피해 +30%
+bw_lastwall,최후의 방벽,hack,all_enemy,magic,fixed,0,ice:2;firewall_lock:1,,,[국면 전환] ICE 두 층을 다시 세우고 단말기 보느와의 방화벽을 한 라운드 잠근다

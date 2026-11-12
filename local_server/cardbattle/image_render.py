@@ -22,7 +22,7 @@ ALLY_TINT, ENEMY_TINT = (28, 64, 48), (76, 32, 36)
 PANEL_BG = (28, 30, 38)
 GOOD, BAD, WARN = (80, 230, 140), (255, 90, 90), (255, 190, 90)
 TAG_KO = {"shield": "엄폐", "atk_down": "글리치", "misfire": "고장", "redirect_random": "적대인식", "stun": "기절",
-          "grapple": "붙잡힘", "daemon": "데몬"}
+          "grapple": "붙잡힘", "daemon": "데몬", "rage": "분노", "boost": "플래시백"}
 RESULT_KO = {"wait": "대기", "stunned": "기절", "down": "쓰러짐", "reboot": "리부트 중", "misfire": "불발",
              "evade": "회피당함", "no_target": "대상 없음", "field_mod_none": "현장 개조 불가"}
 
@@ -62,6 +62,8 @@ def _action_text(line: Dict[str, Any]) -> str:
             tails.append(f"단말기 → {t['name']}")
         elif k == "break_free":
             tails.append("떨쳐냄")
+        elif k == "talk":
+            tails.append(f"{t['name']} 설득 {t.get('total', 0)}/{t.get('dc', 0)} " + ("성공" if t.get("success") else "실패"))
     if line.get("chip"):
         tails.append(f"칩 -{line['chip']['amount']}")
     if line.get("ice") and line["ice"].get("amount"):

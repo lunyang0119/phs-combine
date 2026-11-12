@@ -388,6 +388,29 @@ def load_game_data(source: DataSource, include_commented: bool = False) -> GameD
             missing = [c for c in cards if c not in gd.cards]
             if not cards or missing:
                 raise DataError(f"[{b.id}] first_strike_cards 의 카드가 없습니다: {missing or '(비어 있음)'}")
+        if "limit" in b.gimmicks:
+            for chunk in E.split_list(cfg.get("limit_cards", "")):
+                cid = chunk.rpartition(":")[2].strip()
+                if cid not in gd.cards:
+                    raise DataError(f"[{b.id}] limit_cards 의 카드 {cid!r} 가 없습니다")
+        if "talk" in b.gimmicks and E.TALK_CARD not in gd.cards:
+            raise DataError(f"[{b.id}] talk 기믹에는 card_id={E.TALK_CARD} 카드(pool=fixed)가 필요합니다")
+        if "phases" in b.gimmicks:
+            chunks = E.split_list(cfg.get("phases", ""))
+            if not chunks:
+                raise DataError(f"[{b.id}] phases 기믹인데 overrides 에 phases=enemy_id:hp%:card_id 가 없습니다")
+            for chunk in chunks:
+                parts = [p.strip() for p in chunk.split(":")]
+                if len(parts) != 3 or parts[0] not in b.enemies or parts[2] not in gd.cards:
+                    raise DataError(f"[{b.id}] phases 항목 오류 (enemy_id:hp%:card_id, 이 전투의 적·있는 카드): {chunk!r}")
+                try:
+                    float(parts[1])
+                except ValueError:
+                    raise DataError(f"[{b.id}] phases 의 hp% 는 숫자여야 합니다: {chunk!r}")
+        if "env" in b.gimmicks:
+            bad = [e for e in E.split_list(cfg.get("env_pool", "")) if e not in E.ENVS]
+            if bad:
+                raise DataError(f"[{b.id}] env_pool 에 알 수 없는 환경: {bad} (가능: {', '.join(E.ENVS)})")
         if "tutorial" in b.gimmicks and str(cfg.get("tutorial_script", "")) not in gd.tutorials:
             raise DataError(f"[{b.id}] tutorial 기믹인데 Tutorial.csv 에 script_id={cfg.get('tutorial_script')!r} 가 없습니다")
         if bool(cfg.get("prep_enabled", True)) and E.FIELD_MOD_CARD not in gd.cards:

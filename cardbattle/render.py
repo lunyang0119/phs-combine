@@ -1,6 +1,7 @@
 """상태 → 텍스트. Discord 객체는 모른다."""
 from __future__ import annotations
 
+import re
 from typing import Any, Dict, Iterable, List, Optional
 
 from utils import get_korean_particle
@@ -40,6 +41,8 @@ def _detail(t: Dict[str, Any]) -> str:
                          pct=pct, turns=turns or "")
     except (KeyError, ValueError):
         return ""
+    if t.get("chain"):
+        out += S.LOG_CHAIN.format(n=t["chain"])
     if t.get("iced"):
         out += S.LOG_ICED
     if t.get("weak"):
@@ -103,7 +106,15 @@ def log_lines(line: Dict[str, Any]) -> List[str]:
     if res == "evade":
         tname = (line.get("targets") or [{}])[0].get("name", "?")
         return [S.LOG_EVADE.format(card=card, eul=eul, target=tname, eun2=_josa(tname, "은", "는"), **a) + tail_extra]
+    if res == "talk":
+        return _talk_lines(line, a) or [S.LOG_NO_TARGET.format(card=card, eul=eul, **a)]
     head = S.LOG_USE.format(card=card, eul=eul, **a)
+    if line.get("flurry"):
+        head += S.LOG_FLURRY.format(hits=line["flurry"])
+    if line.get("boost"):
+        head += S.LOG_BOOST.format(v=int(line["boost"]))
+    if line.get("limit"):
+        head = S.LOG_LIMIT_PREFIX + head
     if res == "redirect":
         head = S.LOG_REDIRECT_PREFIX + head
     if line.get("combo"):
@@ -122,8 +133,45 @@ def log_lines(line: Dict[str, Any]) -> List[str]:
     return out
 
 
+def talk_quote(who: str, key: str, idx: int) -> str:
+    table = S.TALK_LINES.get(who) or S.TALK_LINES.get("default") or {}
+    quotes = table.get(key) or (S.TALK_LINES.get("default") or {}).get(key) or []
+    return quotes[idx % len(quotes)] if quotes else ""
+
+
+def _talk_lines(line: Dict[str, Any], a: Dict[str, str]) -> List[str]:
+    out: List[str] = []
+    tail_extra = _line_tail(line)
+    for t in line.get("targets") or []:
+        if t.get("kind") != "talk":
+            continue
+        key = "crit" if t.get("crit") else ("ok" if t.get("success") else "fail")
+        dice = t.get("dice") or [0, 0]
+        result = S.LOG_TALK_RESULT[key].format(pct=t.get("pct", 50))
+        text = S.LOG_TALK.format(target=t["name"], d1=dice[0], d2=dice[1], bonus=t.get("bonus", 0), total=t.get("total", 0),
+                                 dc=t.get("dc", 0), result=result, **a)
+        if "life" in t:
+            text += S.LOG_TALK_LIFE.format(value=t["life"][0], max=t["life"][1])
+        if "ncpd" in t:
+            text += S.LOG_TALK_NCPD.format(value=float(t["ncpd"]))
+        out.append(text + tail_extra)
+        q = talk_quote(str(t.get("who", "")), key, int(t.get("quote", 0)))
+        if q:
+            out.append(S.LOG_TALK_QUOTE.format(target=t["name"], quote=q))
+    return out
+
+
 def event_line(ev: Dict[str, Any]) -> Optional[str]:
     k = ev.get("kind")
+    if k == "rage":
+        return S.EVENT_RAGE.format(name=ev["name"], josa=_josa(ev["name"], "이", "가"), pct=ev["pct"])
+    if k == "phase_warn":
+        return S.EVENT_PHASE_WARN.format(name=ev["name"], josa=_josa(ev["name"], "이", "가"), card=ev["card"],
+                                         eul=_josa(ev["card"], "을", "를"))
+    if k == "chain":
+        return S.EVENT_CHAIN.format(target=ev["target"], count=ev["count"], firewall=ev["firewall"])
+    if k == "env_acid":
+        return S.EVENT_ENV_ACID.format(pct=ev["pct"])
     if k == "firewall_use":
         opt = ev["option"]
         detail_fmt = S.EVENT_FIREWALL_DETAIL.get(opt, "")
@@ -246,6 +294,8 @@ def meters_text(st: E.BattleState) -> List[str]:
                                          holder=h.name if h else "-"))
     if "pot" in m and bool(st.config.get("prep_enabled", True)):
         out.append(S.METER_POT.format(value=int(m.get("pot", 0))))
+    if m.get("env"):
+        out.append(S.METER_ENV.format(env=S.ENV_KO.get(str(m["env"]), str(m["env"]))))
     return out
 
 
@@ -298,6 +348,8 @@ def card_detail(st: E.BattleState, card: E.Card, actor: Optional[E.Combatant]) -
     cb = combo_text(card)
     if cb:
         lines.append(cb)
+    if card.tagged("limit"):
+        lines.append("💥 리미트: 이 전투에서 한 번만")
     return "\n".join(lines)
 
 
@@ -330,6 +382,75 @@ def intro_rules(st: E.BattleState) -> List[str]:
     if bool(cfg.get("prep_enabled", True)):
         out.append(S.INTRO_RULES["prep"].format(**ctx))
     out.append(S.INTRO_RULES["firewall"].format(**ctx))
+    return out
+
+
+def briefing_sections(st: E.BattleState) -> List[tuple]:
+    """1라운드 직전에 한 번 올리는 특수 규칙 설명: [(제목, 본문)]. strings.BRIEFING 에 키가 있는 기믹만."""
+    cfg = st.config
+    limit_cards = [st.cards[c.rpartition(":")[2].strip()] for c in E.split_list(cfg.get("limit_cards", ""))
+                   if c.rpartition(":")[2].strip() in st.cards]
+    flurry = [c.effect("flurry").count for c in limit_cards if c.effect("flurry")]
+    names = {e.id.split("#")[0]: re.sub(r" [A-Z]$", "", e.name) for e in st.enemies.values()}
+    phase_rows = []
+    for eid, pct, cid in E.phase_table(st):
+        if cid in st.cards and eid in names:
+            phase_rows.append(S.BRIEFING_PHASE_LINE.format(name=names[eid], pct=pct, card=st.cards[cid].name,
+                                                           desc=st.cards[cid].desc))
+    extra = ""
+    for g, fmt in S.BRIEFING_TALK_EXTRA.items():
+        if st.has(g):
+            extra += fmt.format(talk_life=int(cfg.get("talk_life", 1)), talk_ncpd=float(cfg.get("talk_ncpd", 0.5)),
+                                talk_chip=int(cfg.get("talk_chip", 1)))
+    env = str(st.meters.get("env", ""))
+    env_text = S.ENV_BRIEF.get(env, "").format(emp=int(cfg.get("env_emp_firewall", 1)),
+                                               acid=int(round(float(cfg.get("env_acid_ratio", 0.03)) * 100)))
+    ctx = {
+        "flurry_max": max(flurry) if flurry else 8,
+        "flash_need": int(cfg.get("flash_threshold", 29)), "flash_per": int(cfg.get("flash_per_round", 1)),
+        "flash_extra": int(cfg.get("flash_extra_cards", 1)), "flash_boost": int(cfg.get("flash_boost", 6)),
+        "flash_guard": int(round(float(cfg.get("flash_guard", 0.5)) * 100)), "flash_firewall": int(cfg.get("flash_firewall", 2)),
+        "flash_heal": int(round(float(cfg.get("flash_heal_ratio", 0.2)) * 100)),
+        "chain_pct": int(round(float(cfg.get("chain_bonus", 0.1)) * 100)),
+        "chain_cap": int(round(float(cfg.get("chain_bonus", 0.1)) * 100)) * int(cfg.get("chain_max", 4)),
+        "chain_fw_at": int(cfg.get("chain_firewall_at", 3)), "chain_fw": int(cfg.get("chain_firewall", 1)),
+        "phase_list": "\n".join(phase_rows) or "-",
+        "talk_dc": int(cfg.get("talk_dc", 16)), "talk_down": int(round(float(cfg.get("talk_atk_down", 0.5)) * 100)),
+        "talk_crit": int(cfg.get("talk_crit_margin", 8)), "talk_step": int(cfg.get("talk_dc_step", 2)), "talk_extra": extra,
+        "env_text": env_text,
+    }
+    out = []
+    for g in st.gimmicks:
+        entry = S.BRIEFING.get(g)
+        if not entry:
+            continue
+        if g == "env" and not env_text:
+            continue
+        if g == "phases" and not phase_rows:
+            continue
+        try:
+            out.append((entry[0], entry[1].format(**ctx)))
+        except (KeyError, ValueError, IndexError):
+            out.append((entry[0], entry[1]))
+    return out
+
+
+def flash_entries(st: E.BattleState) -> List[Dict[str, Any]]:
+    """이번 라운드에 터진 플래시백 → [{title, color, lines, roll, effect}] (대사는 strings.FLASH_FIGURES)."""
+    out = []
+    for rec in st.meters.get("flash_now") or []:
+        fig = S.FLASH_FIGURES.get(rec.get("effect", ""))
+        if not fig:
+            continue
+        mems = fig.get("memories") or [[]]
+        lines = list(mems[int(rec.get("line", 0)) % len(mems)])
+        out.append({
+            "pid": rec.get("pid"), "player": rec.get("name", ""), "title": S.FLASH_TITLE.format(name=fig["name"]),
+            "color": fig.get("color", 0xF1C40F), "lines": lines,
+            "roll": S.FLASH_ROLL.format(dice=" + ".join(str(d) for d in rec.get("dice") or []), bonus=rec.get("bonus", 0),
+                                        roll=rec.get("roll", 0), need=rec.get("need", 0)),
+            "effect": fig["text"].format(value=rec.get("value", 0), card=rec.get("card", "")),
+        })
     return out
 
 

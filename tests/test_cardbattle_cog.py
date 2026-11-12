@@ -461,9 +461,10 @@ def test_status_embed_in_round_and_doll_battle_intro(tmp_path):
         await setup_battle(cog, ch, battle="doll3")
         st = cog.state
         assert st.has("doll") and st.meters["terminal_holder"] == "1" and st.meters["chip"] == 8
-        intro = text(ch.sent[-2])
+        intro = next(text(m) for m in ch.sent if "고장난 돌" in text(m) and "규칙" in text(m))
         rules = render.intro_rules(st)
-        assert len(rules) == len(st.gimmicks) + 1 and all(r in intro for r in rules)   # 기믹별 한 줄 + 방화벽 (prep 꺼짐)
+        classic = [g for g in st.gimmicks if g in S.INTRO_RULES]     # 특수 규칙(limit·flash…)은 브리핑에서 설명한다
+        assert len(rules) == len(classic) + 1 and all(r in intro for r in rules)   # 기믹별 한 줄 + 방화벽 (prep 꺼짐)
         assert "닉1" in S.INTRO_RULES["terminal"].format(holder="닉1") and "닉1" in intro.split("규칙", 1)[-1]
         tm = text(turn_message(cog, ch))
         assert "칩 안정도 8/8" in tm and "액정 3/3" in tm and "모드" in tm
