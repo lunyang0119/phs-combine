@@ -70,6 +70,11 @@ def _board_fields(e: discord.Embed, st: E.BattleState, hp: Dict[str, Any] = None
 
 def _meters_field(e: discord.Embed, st: E.BattleState) -> None:
     rows = render.meters_text(st)
+    if rows:                                   # 첫 줄(방화벽)은 HP 처럼 막대로
+        fmax = int(st.config.get("firewall_max", 9))
+        fval = int(st.meters.get("firewall", 0))
+        rows[0] = S.METER_FIREWALL_BAR.format(bar=hp_bar(fval, fmax), value=fval, max=fmax) \
+            + (S.METER_FIREWALL_LOCKED if E.firewall_locked(st) else "")
     if rows:
         e.add_field(name="게이지", value="\n".join(rows)[:FIELD_LIMIT], inline=False)
 
@@ -130,15 +135,15 @@ def _marks(st: E.BattleState) -> str:
     return "\n".join(f"{render.mark_for(st, p)} {p.name}" for p in st.players.values()) or "-"
 
 
-def turn(st: E.BattleState) -> discord.Embed:
+def turn(st: E.BattleState, with_board: bool = True) -> discord.Embed:
+    """턴 메시지. 현황판 PNG 를 붙일 때는 with_board=False 로 글자 HP 표를 뺀다 (그림과 겹쳐 보기 어렵다)."""
     done, total = render.progress(st)
-    e = discord.Embed(title=f"🃏 {st.round_no()}라운드", color=COLOR_TURN,
-                      description="아래 **카드 뽑기** 버튼으로 패를 확인하고 카드를 고르세요.\n"
-                                  "전원이 고르면 양편이 함께 정산됩니다.")
+    e = discord.Embed(title=f"🃏 {st.round_no()}라운드", color=COLOR_TURN, description=S.TURN_DESC)
     _intents_field(e, st)
     e.add_field(name=f"선택 현황 {done}/{total} 완료", value=_marks(st)[:FIELD_LIMIT], inline=False)
     _meters_field(e, st)
-    _board_fields(e, st)
+    if with_board:
+        _board_fields(e, st)
     return e
 
 

@@ -288,7 +288,7 @@ def test_open_round_publishes_enemy_kind_but_not_target():
     st.config["show_intent_target"] = True
     assert E.public_intents(st)[0]["target"] == "P1"
     text = R.intents_text(st)
-    assert "적1: 공격 준비 → P1" in text
+    assert "적1: **공격 준비** → P1" in text
 
 
 # ---------------------------------------------------------------------------

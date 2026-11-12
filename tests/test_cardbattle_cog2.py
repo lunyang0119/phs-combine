@@ -58,7 +58,7 @@ def test_prep_buttons_then_battle_and_payout(tmp_path):
         assert st.status == E.ROUND_OPEN and st.round == 1
         assert pm.edits[-1].get("view", "keep") is None                          # 준비 버튼 제거
         tm = turn_message(cog, ch)
-        assert isinstance(tm.view, TurnView) and "금고" in text(tm) and "🔫mk." in text(tm)
+        assert isinstance(tm.view, TurnView) and "금고" in text(tm) and (cog._image_mode() or "🔫mk." in text(tm))
         # 끝까지: 적 HP 1 → 주최자가 제압 사격 → 종료 + 보수가 금고 파일에
         for e in st.enemies.values():
             e.hp = 1
@@ -155,7 +155,8 @@ def test_tutorial_battle_posts_coach_and_feedback(tmp_path):
         assert st.has("tutorial") and st.script and not st.config["admin_sees_all"]
         texts = [text(m) for m in ch.sent]
         assert any("코치" in t and "첫 라운드" in t for t in texts)
-        assert texts.index(next(t for t in texts if "코치" in t)) < [m.id for m in ch.sent].index(st.turn_message_id)
+        idx_coach = next(i for i, t in enumerate(texts) if "코치 — 1라운드" in t)
+        assert idx_coach == [m.id for m in ch.sent].index(st.turn_message_id) + 1      # 코치는 턴 현황 바로 아래
         hand = await pick(cog, ch, 1, "atk_slash")
         assert "atk_slash" in hand and len(hand) == 3
         n = len(ch.sent)

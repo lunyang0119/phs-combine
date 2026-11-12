@@ -291,10 +291,12 @@ WIN_CAUGHT = "## 🚨 드론의 서치라이트가 당신들을 비춥니다. (R
 NCPD_TRIGGER = "## 🚨 NCPD 드론 출동!\n경계도가 가득 찼습니다. 스캐빈저들이 흩어지고, 여러분도 흩어져야 합니다.\n**도주 단계**: {turns}턴 동안 경계도를 {alert}에서 0 으로 내리세요. 매 턴 **과반수**가 경찰 행동을 이기면 경계도 −1."
 STATUS = "**상태**: {status} / {round}라운드\n**선택 현황**: {done}/{total}\n{board}"
 
+TURN_DESC = "아래 **카드 뽑기** 버튼으로 패를 확인하고 카드를 고르세요.\n전원이 선택을 끝내면 정산됩니다."
 INTENT_HEADER = "**적 의도**"
-INTENT_LINE = "• {name}: {intent}{target}"
+INTENT_LINE = "• {name}: **{intent}**{target}"
 INTENT_TARGET = " → {target}"
 METER_FIREWALL = "🧱 방화벽 {value}/{max}"
+METER_FIREWALL_BAR = "🧱 방화벽\n`{bar}` {value}/{max}"       # 임베드용: HP 처럼 막대
 METER_FIREWALL_LOCKED = " 🔒잠김"
 METER_NCPD = "🚨 NCPD 경계도 {value:g}/{max:g}"
 METER_CHIP = "💾 칩 안정도 {value}/{max}"

@@ -244,9 +244,13 @@ def test_start_posts_turn_message_with_intents_progress_button_and_board(tmp_pat
         t = text(tm)
         assert "선택 현황 0/2 완료" in t and isinstance(tm.view, TurnView)
         assert "적 의도" in t and "준비" in t and "→" not in t.split("적 의도")[1].split("선택 현황")[0]   # 대상 비공개
-        assert "방화벽" in t and "엣지러너" in t and "넷러너" in t
+        assert "방화벽" in t and "░" in t and "0/9" in t and "전원이 선택을 끝내면 정산됩니다" in t   # 방화벽 막대
+        assert "**공격 준비**" in t or "**해킹 준비**" in t or "**방어 준비**" in t or "**특수 준비**" in t
         assert any("연습: 뒷골목 소란" in text(m) and "규칙" in text(m) for m in ch.sent)
-        assert "█" in t and "/39" in t                                   # HP 바
+        if cog._image_mode():                                            # 그림이 붙으면 글자 HP 표는 뺀다
+            assert "🟢 아군" not in t and "/39" not in t and "엣지러너" not in t
+        else:
+            assert "엣지러너" in t and "넷러너" in t and "█" in t and "/39" in t   # HP 바
         if cog._image_mode():
             assert tm.file is not None and tm.embed.image.url.endswith("board.png")
     asyncio.run(body())

@@ -69,6 +69,7 @@ class CardBattleCog(commands.Cog):
         self.gig_path = gig.DEFAULT_PATH
         self.admin_ids = _id_set("CARDBATTLE_ADMIN_IDS", "FUGITIVE_ADMIN_IDS")
         self._render_warned: Optional[str] = None
+        self._board_failed = False            # 이번 턴 메시지에 현황판 PNG 를 못 붙였다 → 글자 HP 표를 유지
 
     # ------------------------------------------------------------------ 생명주기
     async def cog_load(self):
@@ -551,30 +552,32 @@ class CardBattleCog(commands.Cog):
     # ------------------------------------------------------------------ 턴 메시지
     def _turn_embed(self) -> discord.Embed:
         st = self.state
-        emb = embeds.escape_turn(st) if st.status == E.ESCAPE else embeds.turn(st)
-        if st.status != E.ESCAPE and self._image_mode():
+        if st.status == E.ESCAPE:
+            return embeds.escape_turn(st)
+        if self._image_mode() and not self._board_failed:      # 그림이 있으면 글자 HP 표는 뺀다
+            emb = embeds.turn(st, with_board=False)
             emb.set_image(url=f"attachment://{BOARD_FILENAME}")
-        return emb
+            return emb
+        return embeds.turn(st)
 
     async def _open_turn(self, ch, report: Optional[Dict[str, Any]] = None):
-        """ROUND_OPEN 이면 (코치 →) 카드 턴 메시지(현황판 PNG 첨부), ESCAPE 면 도주 메시지."""
+        """ROUND_OPEN 이면 카드 턴 메시지(현황판 PNG 첨부) → 코치, ESCAPE 면 도주 메시지."""
         st = self.state
         if st.status == E.ESCAPE:
             msg = await ch.send(embed=embeds.escape_turn(st), view=EscapeView())
         else:
-            if st.has("tutorial") and st.script:
+            for emb in embeds.flash(st):           # 플래시백이 터졌으면 턴 메시지 바로 위에
+                await ch.send(embed=emb)
+            f = self._board_file(report)
+            self._board_failed = f is None
+            kw: Dict[str, Any] = {"embed": self._turn_embed(), "view": TurnView()}
+            if f is not None:
+                kw["file"] = f
+            msg = await ch.send(**kw)
+            if st.has("tutorial") and st.script:   # 코치는 턴 현황 아래, 맨 마지막에
                 coach = embeds.coach(st)
                 if coach.description:
                     await ch.send(embed=coach)
-            for emb in embeds.flash(st):           # 플래시백이 터졌으면 턴 메시지 바로 위에
-                await ch.send(embed=emb)
-            kw: Dict[str, Any] = {"embed": self._turn_embed(), "view": TurnView()}
-            f = self._board_file(report)
-            if f is not None:
-                kw["file"] = f
-            else:
-                kw["embed"] = embeds.turn(st)
-            msg = await ch.send(**kw)
         st.turn_message_id = msg.id
         self._save()
 
